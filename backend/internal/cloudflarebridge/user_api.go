@@ -1,6 +1,7 @@
 package cloudflarebridge
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -63,6 +64,32 @@ func (id *cloudflareRequestID) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// cloudflareOptionalRequestID distinguishes an omitted field from an explicit
+// JSON null. Group removal is not migrated, so treating null as "no change"
+// would incorrectly report a successful unsupported mutation.
+type cloudflareOptionalRequestID struct {
+	Present bool
+	Null    bool
+	Value   cloudflareRequestID
+}
+
+func (id *cloudflareOptionalRequestID) UnmarshalJSON(data []byte) error {
+	if id == nil {
+		return errors.New("nil optional id destination")
+	}
+	id.Present = true
+	if strings.TrimSpace(string(data)) == "null" {
+		id.Null = true
+		return nil
+	}
+	var value cloudflareRequestID
+	if err := value.UnmarshalJSON(data); err != nil {
+		return err
+	}
+	id.Value = value
+	return nil
+}
+
 func cloudflareIDPointer(id *int64) *cloudflareJSONID {
 	if id == nil {
 		return nil
@@ -120,6 +147,7 @@ type cloudflareAPIKeyDTO struct {
 	ID      cloudflareJSONID    `json:"id"`
 	UserID  cloudflareJSONID    `json:"user_id"`
 	GroupID *cloudflareJSONID   `json:"group_id"`
+	Status  string              `json:"status"`
 	User    *cloudflareUserDTO  `json:"user,omitempty"`
 	Group   *cloudflareGroupDTO `json:"group,omitempty"`
 }
@@ -133,6 +161,7 @@ func newCloudflareAPIKeyDTO(key *service.APIKey) *cloudflareAPIKeyDTO {
 		ID:      cloudflareJSONID(key.ID),
 		UserID:  cloudflareJSONID(key.UserID),
 		GroupID: cloudflareIDPointer(key.GroupID),
+		Status:  cloudflareAPIKeyStatusForResponse(key.Status),
 		User:    newCloudflareUserDTO(key.User),
 		Group:   newCloudflareGroupDTO(key.Group),
 	}
@@ -154,20 +183,58 @@ type cloudflareCreateAPIKeyRequest struct {
 }
 
 type cloudflareUpdateAPIKeyRequest struct {
-	Name        string    `json:"name"`
-	Status      string    `json:"status"`
-	IPWhitelist *[]string `json:"ip_whitelist"`
-	IPBlacklist *[]string `json:"ip_blacklist"`
-	ExpiresAt   *string   `json:"expires_at"`
+	Name                string                      `json:"name"`
+	Status              string                      `json:"status"`
+	GroupID             cloudflareOptionalRequestID `json:"group_id"`
+	Quota               *float64                    `json:"quota"`
+	RateLimit5h         *float64                    `json:"rate_limit_5h"`
+	RateLimit1d         *float64                    `json:"rate_limit_1d"`
+	RateLimit7d         *float64                    `json:"rate_limit_7d"`
+	ResetQuota          *bool                       `json:"reset_quota"`
+	ResetRateLimitUsage *bool                       `json:"reset_rate_limit_usage"`
+	IPWhitelist         *[]string                   `json:"ip_whitelist"`
+	IPBlacklist         *[]string                   `json:"ip_blacklist"`
+	ExpiresAt           *string                     `json:"expires_at"`
 }
 
 type cloudflareUserAPIHandler struct {
 	authService   *service.AuthService
+	authUsers     *AuthUserRepository
 	apiKeyService *service.APIKeyService
 }
 
-func newCloudflareUserAPIHandler(authService *service.AuthService, apiKeyService *service.APIKeyService) *cloudflareUserAPIHandler {
-	return &cloudflareUserAPIHandler{authService: authService, apiKeyService: apiKeyService}
+func newCloudflareUserAPIHandler(authService *service.AuthService, authUsers *AuthUserRepository, apiKeyService *service.APIKeyService) *cloudflareUserAPIHandler {
+	return &cloudflareUserAPIHandler{authService: authService, authUsers: authUsers, apiKeyService: apiKeyService}
+}
+
+// GetPublicSettingsForInjection lets the embedded frontend use exactly the
+// same deterministic configuration exposed by /api/v1/settings/public.
+func (h *cloudflareUserAPIHandler) GetPublicSettingsForInjection(context.Context) (any, error) {
+	return cloudflarePublicSettings(), nil
+}
+
+func cloudflarePublicSettings() dto.PublicSettings {
+	return dto.PublicSettings{
+		RegistrationEmailSuffixWhitelist:     []string{},
+		LoginAgreementDocuments:              []dto.LoginAgreementDocument{},
+		SiteName:                             "Sub2API",
+		APIBaseURL:                           "",
+		HideCcsImportButton:                  true,
+		TableDefaultPageSize:                 20,
+		TablePageSizeOptions:                 []int{10, 20, 50, 100},
+		CustomMenuItems:                      []dto.CustomMenuItem{},
+		CustomEndpoints:                      []dto.CustomEndpoint{},
+		OIDCOAuthProviderName:                "OIDC",
+		Version:                              "cloudflare",
+		ServerTimezone:                       "UTC",
+		ServerUTCOffset:                      "+00:00",
+		ChannelMonitorMode:                   "v2",
+		ChannelMonitorDefaultIntervalSeconds: 60,
+	}
+}
+
+func (h *cloudflareUserAPIHandler) PublicSettings(c *gin.Context) {
+	response.Success(c, cloudflarePublicSettings())
 }
 
 func decodeCloudflareJSON(c *gin.Context, target any) error {
@@ -209,6 +276,22 @@ func (h *cloudflareUserAPIHandler) Login(c *gin.Context) {
 	response.Success(c, cloudflareAuthResponse{AccessToken: token, TokenType: "Bearer", User: newCloudflareUserDTO(user)})
 }
 
+func (h *cloudflareUserAPIHandler) CurrentUser(c *gin.Context) {
+	subject, ok := authenticatedCloudflareUser(c)
+	if !ok {
+		return
+	}
+	user, err := h.authUsers.GetByID(c.Request.Context(), subject.UserID)
+	if err != nil {
+		response.Unauthorized(c, "User not authenticated")
+		return
+	}
+	response.Success(c, struct {
+		*cloudflareUserDTO
+		RunMode string `json:"run_mode"`
+	}{cloudflareUserDTO: newCloudflareUserDTO(user), RunMode: "standard"})
+}
+
 func authenticatedCloudflareUser(c *gin.Context) (middleware2.AuthSubject, bool) {
 	subject, ok := middleware2.GetAuthSubjectFromContext(c)
 	if !ok {
@@ -224,7 +307,12 @@ func (h *cloudflareUserAPIHandler) ListAPIKeys(c *gin.Context) {
 	}
 	page, pageSize := response.ParsePagination(c)
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: c.DefaultQuery("sort_by", "created_at"), SortOrder: c.DefaultQuery("sort_order", "desc")}
-	filters := service.APIKeyListFilters{Status: c.Query("status")}
+	status, ok := cloudflareAPIKeyStatusForFilter(c.Query("status"))
+	if !ok {
+		response.BadRequest(c, "Invalid API key status")
+		return
+	}
+	filters := service.APIKeyListFilters{Status: status}
 	if search := strings.TrimSpace(c.Query("search")); search != "" {
 		if len(search) > 100 {
 			search = search[:100]
@@ -313,16 +401,34 @@ func (h *cloudflareUserAPIHandler) UpdateAPIKey(c *gin.Context) {
 		return
 	}
 	var request cloudflareUpdateAPIKeyRequest
-	if err := decodeCloudflareJSON(c, &request); err != nil || request.Status != "" && request.Status != service.StatusAPIKeyActive && request.Status != service.StatusAPIKeyDisabled {
+	if err := decodeCloudflareJSON(c, &request); err != nil {
 		response.BadRequest(c, "Invalid request")
+		return
+	}
+	key, err := h.apiKeyService.GetByID(c.Request.Context(), keyID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if key.UserID != subject.UserID {
+		response.NotFound(c, "API key not found")
+		return
+	}
+	if !cloudflareUpdateNoOpsAllowed(key, request) {
+		response.BadRequest(c, "Cloudflare mode does not support changing API key group, quota, rate limits, or usage counters")
+		return
+	}
+	internalStatus, ok := cloudflareAPIKeyStatusForUpdate(request.Status)
+	if !ok {
+		response.BadRequest(c, "Invalid API key status")
 		return
 	}
 	serviceRequest := service.UpdateAPIKeyRequest{IPWhitelist: request.IPWhitelist, IPBlacklist: request.IPBlacklist}
 	if request.Name != "" {
 		serviceRequest.Name = &request.Name
 	}
-	if request.Status != "" {
-		serviceRequest.Status = &request.Status
+	if internalStatus != "" {
+		serviceRequest.Status = &internalStatus
 	}
 	if request.ExpiresAt != nil {
 		if *request.ExpiresAt == "" {
@@ -336,12 +442,67 @@ func (h *cloudflareUserAPIHandler) UpdateAPIKey(c *gin.Context) {
 			serviceRequest.ExpiresAt = &expiresAt
 		}
 	}
-	key, err := h.apiKeyService.Update(c.Request.Context(), keyID, subject.UserID, serviceRequest)
+	key, err = h.apiKeyService.Update(c.Request.Context(), keyID, subject.UserID, serviceRequest)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
 	response.Success(c, newCloudflareAPIKeyDTO(key))
+}
+
+func cloudflareAPIKeyStatusForResponse(status string) string {
+	if status == service.StatusAPIKeyDisabled {
+		return "inactive"
+	}
+	return status
+}
+
+func cloudflareAPIKeyStatusForFilter(status string) (string, bool) {
+	switch status {
+	case "", service.StatusAPIKeyActive:
+		return status, true
+	case "inactive":
+		return service.StatusAPIKeyDisabled, true
+	default:
+		return "", false
+	}
+}
+
+func cloudflareAPIKeyStatusForUpdate(status string) (string, bool) {
+	switch status {
+	case "", service.StatusAPIKeyActive:
+		return status, true
+	case "inactive":
+		return service.StatusAPIKeyDisabled, true
+	default:
+		return "", false
+	}
+}
+
+func cloudflareUpdateNoOpsAllowed(key *service.APIKey, request cloudflareUpdateAPIKeyRequest) bool {
+	if key == nil {
+		return false
+	}
+	if request.GroupID.Present {
+		if request.GroupID.Null || key.GroupID == nil || int64(request.GroupID.Value) != *key.GroupID {
+			return false
+		}
+	}
+	for _, limit := range []struct {
+		request *float64
+		current float64
+	}{
+		{request.Quota, key.Quota},
+		{request.RateLimit5h, key.RateLimit5h},
+		{request.RateLimit1d, key.RateLimit1d},
+		{request.RateLimit7d, key.RateLimit7d},
+	} {
+		if limit.request != nil && (*limit.request != 0 || limit.current != 0) {
+			return false
+		}
+	}
+	return (request.ResetQuota == nil || !*request.ResetQuota) &&
+		(request.ResetRateLimitUsage == nil || !*request.ResetRateLimitUsage)
 }
 
 func (h *cloudflareUserAPIHandler) DeleteAPIKey(c *gin.Context) {

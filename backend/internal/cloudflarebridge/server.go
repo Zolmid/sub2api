@@ -14,6 +14,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/Wei-Shaw/sub2api/internal/web"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -43,6 +44,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	gin.SetMode(runtime.Application.Server.Mode)
 	router := gin.New()
 	router.Use(middleware.Recovery())
+	router.Use(middleware.SecurityHeaders(runtime.Application.Security.CSP, nil))
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return nil, fmt.Errorf("disable trusted proxies: %w", err)
 	}
@@ -53,7 +55,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
 	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
-	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, apiKeyService)
+	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService)
 	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
 	forwarder := service.NewCloudflareVerticalSliceOpenAIGatewayService(runtime.Application, upstream)
 	handler := &gatewayHandler{
@@ -67,6 +69,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	})
 
 	v1 := router.Group("/api/v1")
+	v1.GET("/settings/public", userAPIHandler.PublicSettings)
 	v1.POST("/auth/login", userAPIHandler.Login)
 	authenticated := v1.Group("")
 	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
@@ -77,12 +80,24 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	keys.PUT("/:id", userAPIHandler.UpdateAPIKey)
 	keys.DELETE("/:id", userAPIHandler.DeleteAPIKey)
 	authenticated.GET("/groups/available", userAPIHandler.GetAvailableGroups)
+	authenticated.GET("/auth/me", userAPIHandler.CurrentUser)
 
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))
 	gateway.Use(middleware.ClientRequestID())
 	gateway.Use(gin.HandlerFunc(apiKeyAuthMiddleware))
 	gateway.POST("/chat/completions", handler.chatCompletions)
+
+	// The embedded middleware deliberately bypasses API and gateway paths, then
+	// serves static assets and SPA fallbacks. The non-embed build remains useful
+	// for traditional unit checks and does not install this composition layer.
+	if web.HasEmbeddedFrontend() {
+		frontend, err := web.NewFrontendServer(userAPIHandler)
+		if err != nil {
+			return nil, fmt.Errorf("initialize embedded frontend: %w", err)
+		}
+		router.Use(frontend.Middleware())
+	}
 
 	return router, nil
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,6 +36,8 @@ func TestRuntimeConfigFixtureUsesOnlyVirtualMockHost(t *testing.T) {
 	runtime, err := LoadRuntimeConfigFromEnv()
 	require.NoError(t, err)
 	require.Equal(t, []string{"mock.upstream"}, runtime.AllowedHosts)
+	require.True(t, runtime.Application.Security.CSP.Enabled)
+	require.Equal(t, config.DefaultCSPPolicy, runtime.Application.Security.CSP.Policy)
 	require.True(t, runtime.Application.Security.URLAllowlist.Enabled)
 	require.True(t, runtime.Application.Security.URLAllowlist.AllowInsecureHTTP)
 	require.True(t, runtime.Application.Security.URLAllowlist.AllowPrivateHosts)

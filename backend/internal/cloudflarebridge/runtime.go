@@ -103,6 +103,10 @@ func LoadRuntimeConfigFromEnv() (*RuntimeConfig, error) {
 			TrustedProxiesConfigured: true,
 		},
 		Security: config.SecurityConfig{
+			CSP: config.CSPConfig{
+				Enabled: true,
+				Policy:  config.DefaultCSPPolicy,
+			},
 			URLAllowlist: config.URLAllowlistConfig{
 				Enabled:       true,
 				UpstreamHosts: allowedHosts,

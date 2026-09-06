@@ -3,9 +3,9 @@ package cloudflarebridge
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
@@ -34,17 +34,14 @@ func (r *APIKeyRepository) management() (APIKeyManagementControlPlane, error) {
 }
 
 func newPersistentID() (int64, error) {
-	for range 4 {
-		var value [8]byte
-		if _, err := rand.Read(value[:]); err != nil {
-			return 0, fmt.Errorf("generate persistent id: %w", err)
-		}
-		id := int64(binary.BigEndian.Uint64(value[:]) & uint64(^uint64(0)>>1))
-		if id > 0 {
-			return id, nil
-		}
+	// Browser-created records must remain exactly representable by JavaScript
+	// Number. Imported records retain their existing int64 IDs and are encoded
+	// as strings by the HTTP adapter when needed.
+	value, err := rand.Int(rand.Reader, big.NewInt(maxJavaScriptSafeInteger))
+	if err != nil {
+		return 0, fmt.Errorf("generate persistent id: %w", err)
 	}
-	return 0, errors.New("generate persistent id: exhausted retries")
+	return value.Int64() + 1, nil
 }
 
 func supportsManagedAPIKeyCreate(key *service.APIKey) bool {

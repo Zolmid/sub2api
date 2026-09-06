@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -447,4 +448,146 @@ func TestCloudflareJSONIDUsesNumbersOnlyInsideJavaScriptSafeRange(t *testing.T) 
 	require.NoError(t, json.Unmarshal([]byte(`"9007199254740993"`), &accepted))
 	require.Equal(t, int64(9007199254740993), int64(accepted))
 	require.Error(t, json.Unmarshal([]byte(`9007199254740993`), &accepted))
+}
+
+func TestCloudflarePersistentIDsStayWithinBrowserSafeRange(t *testing.T) {
+	for range 256 {
+		id, err := newPersistentID()
+		require.NoError(t, err)
+		require.Greater(t, id, int64(0))
+		require.LessOrEqual(t, id, maxJavaScriptSafeInteger)
+	}
+}
+
+func TestCloudflarePublicSettingsAreTruthfulAndFrontendCompatible(t *testing.T) {
+	handler, err := NewHandler(testRuntimeConfig(t), testControlPlane(), &fakeHTTPUpstream{})
+	require.NoError(t, err)
+
+	settings := callJSON(t, handler, http.MethodGet, "/api/v1/settings/public", "", "")
+	require.Equal(t, http.StatusOK, settings.Code, settings.Body.String())
+	require.Equal(t, "nosniff", settings.Header().Get("X-Content-Type-Options"))
+	require.Contains(t, settings.Header().Get("Content-Security-Policy"), "'nonce-")
+	var envelope struct {
+		Code int `json:"code"`
+		Data struct {
+			RegistrationEnabled  bool     `json:"registration_enabled"`
+			PasswordResetEnabled bool     `json:"password_reset_enabled"`
+			PaymentEnabled       bool     `json:"payment_enabled"`
+			PluginEnabled        bool     `json:"plugin_management_enabled"`
+			ModelPlazaEnabled    bool     `json:"model_plaza_enabled"`
+			ChannelEnabled       bool     `json:"channel_monitor_enabled"`
+			AffiliateEnabled     bool     `json:"affiliate_enabled"`
+			RiskControlEnabled   bool     `json:"risk_control_enabled"`
+			Suffixes             []string `json:"registration_email_suffix_whitelist"`
+			TableOptions         []int    `json:"table_page_size_options"`
+			MenuItems            []any    `json:"custom_menu_items"`
+			Endpoints            []any    `json:"custom_endpoints"`
+			Timezone             string   `json:"server_timezone"`
+			UTCOffset            string   `json:"server_utc_offset"`
+			APIBaseURL           string   `json:"api_base_url"`
+			HideCCSImport        bool     `json:"hide_ccs_import_button"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(settings.Body.Bytes(), &envelope))
+	require.Equal(t, 0, envelope.Code)
+	require.False(t, envelope.Data.RegistrationEnabled)
+	require.False(t, envelope.Data.PasswordResetEnabled)
+	require.False(t, envelope.Data.PaymentEnabled)
+	require.False(t, envelope.Data.PluginEnabled)
+	require.False(t, envelope.Data.ModelPlazaEnabled)
+	require.False(t, envelope.Data.ChannelEnabled)
+	require.False(t, envelope.Data.AffiliateEnabled)
+	require.False(t, envelope.Data.RiskControlEnabled)
+	require.NotNil(t, envelope.Data.Suffixes)
+	require.Equal(t, []int{10, 20, 50, 100}, envelope.Data.TableOptions)
+	require.NotNil(t, envelope.Data.MenuItems)
+	require.NotNil(t, envelope.Data.Endpoints)
+	require.Equal(t, "UTC", envelope.Data.Timezone)
+	require.Equal(t, "+00:00", envelope.Data.UTCOffset)
+	require.Empty(t, envelope.Data.APIBaseURL)
+	require.True(t, envelope.Data.HideCCSImport)
+}
+
+func TestCloudflareCurrentUserUsesJWTSubjectAndFailsClosed(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+	token := loginToken(t, handler, "user@example.test", password)
+
+	current := callJSON(t, handler, http.MethodGet, "/api/v1/auth/me", token, "")
+	require.Equal(t, http.StatusOK, current.Code, current.Body.String())
+	var envelope struct {
+		Data struct {
+			ID      string  `json:"id"`
+			Balance float64 `json:"balance"`
+			RunMode string  `json:"run_mode"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(current.Body.Bytes(), &envelope))
+	require.Equal(t, strconv.FormatInt(userID, 10), envelope.Data.ID)
+	require.Equal(t, 2.5, envelope.Data.Balance)
+	require.Equal(t, "standard", envelope.Data.RunMode)
+
+	missing := callJSON(t, handler, http.MethodGet, "/api/v1/auth/me", "", "")
+	require.Equal(t, http.StatusUnauthorized, missing.Code, missing.Body.String())
+	invalid := callJSON(t, handler, http.MethodGet, "/api/v1/auth/me", "not-a-token", "")
+	require.Equal(t, http.StatusUnauthorized, invalid.Code, invalid.Body.String())
+}
+
+func TestCloudflareAPIKeyHTTPStatusAndNoOpCompatibility(t *testing.T) {
+	control, password, _, otherID := newUserAPIControlPlane(t)
+	groupID := int64(9007199254741097)
+	control.keys[9007199254740995].Status = service.StatusAPIKeyDisabled
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+	token := loginToken(t, handler, "user@example.test", password)
+
+	list := callJSON(t, handler, http.MethodGet, "/api/v1/keys?status=inactive", token, "")
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	var listEnvelope struct {
+		Data struct {
+			Items []struct {
+				Status string `json:"status"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &listEnvelope))
+	require.Len(t, listEnvelope.Data.Items, 1)
+	require.Equal(t, "inactive", listEnvelope.Data.Items[0].Status)
+
+	path := "/api/v1/keys/9007199254740995"
+	noOp := callJSON(t, handler, http.MethodPut, path, token, "{\"status\":\"active\",\"group_id\":\"9007199254741097\",\"quota\":0,\"rate_limit_5h\":0,\"rate_limit_1d\":0,\"rate_limit_7d\":0,\"reset_quota\":false,\"reset_rate_limit_usage\":false}")
+	require.Equal(t, http.StatusOK, noOp.Code, noOp.Body.String())
+	var noOpEnvelope struct {
+		Data struct {
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(noOp.Body.Bytes(), &noOpEnvelope))
+	require.Equal(t, service.StatusAPIKeyActive, noOpEnvelope.Data.Status)
+
+	inactive := callJSON(t, handler, http.MethodPut, path, token, "{\"status\":\"inactive\"}")
+	require.Equal(t, http.StatusOK, inactive.Code, inactive.Body.String())
+	stored, err := control.GetManagedAPIKey(context.Background(), 9007199254740995)
+	require.NoError(t, err)
+	require.Equal(t, service.StatusAPIKeyDisabled, stored.Status)
+
+	for _, payload := range []string{
+		"{\"group_id\":\"1\"}",
+		"{\"group_id\":null}",
+		"{\"quota\":1}",
+		"{\"rate_limit_1d\":1}",
+		"{\"reset_quota\":true}",
+		"{\"reset_rate_limit_usage\":true}",
+	} {
+		result := callJSON(t, handler, http.MethodPut, path, token, payload)
+		require.Equal(t, http.StatusBadRequest, result.Code, payload+": "+result.Body.String())
+	}
+
+	foreign := callJSON(t, handler, http.MethodPut, "/api/v1/keys/9007199254740996", token, "{\"group_id\":\"9007199254741097\"}")
+	require.Equal(t, http.StatusNotFound, foreign.Code, foreign.Body.String())
+	foreignKey, err := control.GetManagedAPIKey(context.Background(), 9007199254740996)
+	require.NoError(t, err)
+	require.Equal(t, otherID, foreignKey.UserID)
+	require.Equal(t, groupID, *foreignKey.GroupID)
 }

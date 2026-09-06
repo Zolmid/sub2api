@@ -27,6 +27,7 @@ type userAPIControlPlane struct {
 	mu            sync.Mutex
 	users         map[int64]*service.User
 	groups        map[int64]*service.Group
+	accounts      map[int64]*ManagedAccount
 	keys          map[int64]*service.APIKey
 	raw           map[string]int64
 	nextCreatedID int64
@@ -117,6 +118,41 @@ func (f *userAPIControlPlane) ListManagedGroups(context.Context) ([]service.Grou
 		groups = append(groups, *group)
 	}
 	return groups, nil
+}
+
+func (f *userAPIControlPlane) GetManagedAccount(_ context.Context, id int64) (*ManagedAccount, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	account := f.accounts[id]
+	if account == nil || account.DeletedAt != nil {
+		return nil, service.ErrAccountNotFound
+	}
+	copy := *account
+	copy.Extra = make(map[string]any, len(account.Extra))
+	for key, value := range account.Extra {
+		copy.Extra[key] = value
+	}
+	copy.GroupIDs = append([]int64(nil), account.GroupIDs...)
+	return &copy, nil
+}
+
+func (f *userAPIControlPlane) ListManagedAccounts(context.Context) ([]ManagedAccount, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	accounts := make([]ManagedAccount, 0, len(f.accounts))
+	for _, account := range f.accounts {
+		if account.DeletedAt != nil {
+			continue
+		}
+		copy := *account
+		copy.Extra = make(map[string]any, len(account.Extra))
+		for key, value := range account.Extra {
+			copy.Extra[key] = value
+		}
+		copy.GroupIDs = append([]int64(nil), account.GroupIDs...)
+		accounts = append(accounts, copy)
+	}
+	return accounts, nil
 }
 
 func (f *userAPIControlPlane) CreateManagedAPIKey(_ context.Context, key *service.APIKey) (*service.APIKey, error) {
@@ -233,6 +269,26 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 		fakeControlPlane: testControlPlane(),
 		users:            map[int64]*service.User{userID: user, otherID: other},
 		groups:           map[int64]*service.Group{groupID: group},
+		accounts: map[int64]*ManagedAccount{
+			9007199254741993: {
+				ID: 9007199254741993, Name: "zeta", Platform: service.PlatformOpenAI,
+				Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
+				Priority: 3, MaxConcurrency: 2, Extra: map[string]any{"privacy_mode": "training_off", "api_key": "must-never-leave-d1"},
+				GroupIDs: []int64{groupID}, CreatedAt: time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC),
+			},
+			9007199254741994: {
+				ID: 9007199254741994, Name: "alpha", Platform: service.PlatformOpenAI,
+				Type: service.AccountTypeAPIKey, Status: service.StatusDisabled, Schedulable: false,
+				Priority: 1, MaxConcurrency: 1, Extra: map[string]any{}, GroupIDs: []int64{},
+				CreatedAt: time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 9, 6, 4, 0, 0, 0, time.UTC),
+			},
+			9007199254741995: {
+				ID: 9007199254741995, Name: "tombstone", Platform: service.PlatformOpenAI,
+				Type: service.AccountTypeAPIKey, Status: service.StatusDisabled, Schedulable: false,
+				Priority: 0, MaxConcurrency: 1, Extra: map[string]any{}, GroupIDs: []int64{groupID},
+				CreatedAt: time.Date(2026, 9, 6, 5, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 9, 6, 6, 0, 0, 0, time.UTC), DeletedAt: ptrTime(time.Date(2026, 9, 6, 7, 0, 0, 0, time.UTC)),
+			},
+		},
 		keys: map[int64]*service.APIKey{
 			9007199254740995: {ID: 9007199254740995, UserID: userID, GroupID: &groupID, Name: "mine", Status: service.StatusActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
 			9007199254740996: {ID: 9007199254740996, UserID: otherID, GroupID: &groupID, Name: "other", Status: service.StatusActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
@@ -241,6 +297,8 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 		nextCreatedID: 9007199254741098,
 	}, password, userID, otherID
 }
+
+func ptrTime(value time.Time) *time.Time { return &value }
 
 func callJSON(t *testing.T, client http.Handler, method, path, token string, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -568,9 +626,13 @@ func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(
 
 	unauthenticated := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users", "", "")
 	require.Equal(t, http.StatusUnauthorized, unauthenticated.Code, unauthenticated.Body.String())
+	unauthenticatedAccounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts", "", "")
+	require.Equal(t, http.StatusUnauthorized, unauthenticatedAccounts.Code, unauthenticatedAccounts.Body.String())
 	ordinaryToken := loginToken(t, handler, "other@example.test", "other-password")
 	ordinary := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users", ordinaryToken, "")
 	require.Equal(t, http.StatusForbidden, ordinary.Code, ordinary.Body.String())
+	ordinaryAccounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts", ordinaryToken, "")
+	require.Equal(t, http.StatusForbidden, ordinaryAccounts.Code, ordinaryAccounts.Body.String())
 	adminToken := loginToken(t, handler, "user@example.test", password)
 
 	users := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?page=1&page_size=1&role=admin&include_subscriptions=true&sort_by=created_at&sort_order=desc", adminToken, "")
@@ -624,6 +686,65 @@ func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(
 	apiKeyResponse := httptest.NewRecorder()
 	handler.ServeHTTP(apiKeyResponse, request)
 	require.Equal(t, http.StatusUnauthorized, apiKeyResponse.Code, apiKeyResponse.Body.String())
+
+	// lite and include_scheduler_score are accepted UI defaults. The D1 slice
+	// does not fabricate the omitted expanded fields or a scheduler score.
+	accounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=1&lite=1&include_scheduler_score=0&sort_by=name&sort_order=asc", adminToken, "")
+	require.Equal(t, http.StatusOK, accounts.Code, accounts.Body.String())
+	var accountEnvelope map[string]any
+	require.NoError(t, json.Unmarshal(accounts.Body.Bytes(), &accountEnvelope))
+	accountData := accountEnvelope["data"].(map[string]any)
+	accountItems := accountData["items"].([]any)
+	require.Equal(t, int64(2), int64(accountData["total"].(float64)))
+	accountItem := accountItems[0].(map[string]any)
+	require.Equal(t, "9007199254741994", accountItem["id"])
+	require.Equal(t, "inactive", accountItem["status"])
+	require.NotContains(t, accountItem, "credentials")
+	require.NotContains(t, accountItem, "credential_envelope")
+	secondPage := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?page=2&page_size=1&lite=1&include_scheduler_score=0&sort_by=name&sort_order=asc", adminToken, "")
+	require.Equal(t, http.StatusOK, secondPage.Code, secondPage.Body.String())
+	var secondPageEnvelope map[string]any
+	require.NoError(t, json.Unmarshal(secondPage.Body.Bytes(), &secondPageEnvelope))
+	secondPageItems := secondPageEnvelope["data"].(map[string]any)["items"].([]any)
+	require.Len(t, secondPageItems, 1)
+	require.Equal(t, "9007199254741993", secondPageItems[0].(map[string]any)["id"])
+
+	detail := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741993", adminToken, "")
+	require.Equal(t, http.StatusOK, detail.Code, detail.Body.String())
+	var detailEnvelope map[string]any
+	require.NoError(t, json.Unmarshal(detail.Body.Bytes(), &detailEnvelope))
+	detailData := detailEnvelope["data"].(map[string]any)
+	require.Equal(t, "9007199254741993", detailData["id"])
+	require.NotContains(t, detailData, "credentials")
+	require.NotContains(t, detailData, "credential_envelope")
+	require.NotContains(t, detailData["extra"].(map[string]any), "api_key")
+
+	filtered := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?status=active&group=9007199254741097&privacy_mode=training_off&search=zet&lite=1&include_scheduler_score=0", adminToken, "")
+	require.Equal(t, http.StatusOK, filtered.Code, filtered.Body.String())
+	unsupportedGroup := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&group=not-a-decimal", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedGroup.Code, unsupportedGroup.Body.String())
+	overflowGroup := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&group=9223372036854775808", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, overflowGroup.Code, overflowGroup.Body.String())
+	unsupportedFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&status=rate_limited", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedFilter.Code, unsupportedFilter.Body.String())
+	unsupportedPrivacy := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&privacy_mode=secret_probe", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedPrivacy.Code, unsupportedPrivacy.Body.String())
+	unsupportedAccountSort := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&sort_by=last_used_at", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedAccountSort.Code, unsupportedAccountSort.Body.String())
+	duplicateFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&lite=0", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, duplicateFilter.Code, duplicateFilter.Body.String())
+	fullProjection := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=0", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, fullProjection.Code, fullProjection.Body.String())
+	missingProjection := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?include_scheduler_score=0", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, missingProjection.Code, missingProjection.Body.String())
+	unsupportedScheduler := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&include_scheduler_score=1", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedScheduler.Code, unsupportedScheduler.Body.String())
+	invalidPage := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&page=0", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, invalidPage.Code, invalidPage.Body.String())
+	tombstone := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741995", adminToken, "")
+	require.Equal(t, http.StatusNotFound, tombstone.Code, tombstone.Body.String())
+	accountMutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/accounts", adminToken, "{}")
+	require.Equal(t, http.StatusNotFound, accountMutation.Code, accountMutation.Body.String())
 }
 
 func TestCloudflareSetupStatusIsCompletedAndReadOnly(t *testing.T) {

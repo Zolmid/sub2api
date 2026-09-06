@@ -16,6 +16,7 @@ const PAGE_MAX = 100;
 const OPERATION_MAX = 128;
 const statuses = new Set(["active", "disabled"]);
 const roles = new Set(["user", "admin"]);
+const readablePrivacyModes = new Set(["training_off", "training_set_failed", "training_set_cf_blocked"]);
 
 type User = {
   id: string; email: string; username: string; notes: string; status: string;
@@ -113,6 +114,25 @@ function accountRow(row: Record<string, unknown>, groupIDs: string[]): Account |
     created_at: String(row.created_at), updated_at: String(row.updated_at),
     deleted_at: row.deleted_at === null ? null : String(row.deleted_at),
   };
+}
+
+function accountReadProjection(account: Account): Account {
+  const privacyMode = account.extra.privacy_mode;
+  const extra = typeof privacyMode === "string" && readablePrivacyModes.has(privacyMode)
+    ? { privacy_mode: privacyMode }
+    : {};
+  return {
+    id: account.id, name: account.name, platform: account.platform, type: account.type,
+    status: account.status, schedulable: account.schedulable, priority: account.priority,
+    max_concurrency: account.max_concurrency, extra, group_ids: account.group_ids,
+    created_at: account.created_at, updated_at: account.updated_at, deleted_at: account.deleted_at,
+  };
+}
+
+function accountOperationReadProjection(response: Record<string, unknown>): Record<string, unknown> | null {
+  const account = response.account;
+  if (!isObject(account) || !isObject(account.extra) || !Array.isArray(account.group_ids)) return null;
+  return { account: accountReadProjection(account as Account) };
 }
 
 async function first(env: Env, query: string, value: string): Promise<Record<string, unknown> | null> {
@@ -224,7 +244,7 @@ async function get(env: Env, route: string, body: Record<string, unknown>): Prom
   if (route.includes("/users/")) { const user = await getUser(env, body.id); return user ? json({ user }) : error("NOT_FOUND", 404); }
   if (route.includes("/groups/")) { const group = await getGroup(env, body.id); return group ? json({ group }) : error("NOT_FOUND", 404); }
   if (route.includes("/api-keys/")) { const api_key = await getKey(env, body.id); return api_key ? json({ api_key }) : error("NOT_FOUND", 404); }
-  const account = await getAccount(env, body.id); return account ? json({ account }) : error("NOT_FOUND", 404);
+  const account = await getAccount(env, body.id); return account ? json({ account: accountReadProjection(account) }) : error("NOT_FOUND", 404);
 }
 
 const pageQuery = (table: string, columns: string, where = "") =>
@@ -250,7 +270,9 @@ async function list(env: Env, route: string, body: Record<string, unknown>): Pro
     return json({ api_keys, next_cursor: rows.results.length > size ? api_keys.at(-1)?.id ?? null : null });
   }
   const rows = await env.DB.prepare(pageQuery("accounts", "id", " AND type='apikey'")).bind(cursor,cursor,cursor,size+1).all<{ id: string }>();
-  const accounts = (await Promise.all(rows.results.slice(0,size).map((row) => getAccount(env,row.id)))).filter((item): item is Account => item !== null);
+  const loaded = await Promise.all(rows.results.slice(0,size).map((row) => getAccount(env,row.id)));
+  if (loaded.some((item) => item === null)) return error("CONTROL_PLANE_UNAVAILABLE",503);
+  const accounts = (loaded as Account[]).map(accountReadProjection);
   return json({ accounts, next_cursor: rows.results.length > size ? accounts.at(-1)?.id ?? null : null });
 }
 
@@ -322,12 +344,12 @@ async function keyMutation(env: Env, route: string, body: Record<string, unknown
 
 async function accountMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   const create=route.endsWith("/create");const remove=route.endsWith("/delete");const keys=create?["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"]:remove?["operation_id","id"]:["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"];
-  if(!only(body,keys)||!id(body.id))return error("INVALID_REQUEST");const credentials=body.credentials;const fingerprint=credentials===undefined?body:{...body,credentials:"sha256:"+await sha256(canonical(credentials))};const prior=await lookupOperation(env,route,operation,fingerprint);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getAccount(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,fingerprint,{account:old});return error("CONFLICT",409);}const stamp=now();const groups=stringArray(body.group_ids??old?.group_ids,100,true);
-  if(remove){const account:Account={...old!,status:"disabled",schedulable:false,deleted_at:stamp,updated_at:stamp};return replyMutation(env,route,operation,body,{account},[env.DB.prepare("UPDATE accounts SET status='disabled',schedulable=0,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(stamp,stamp,account.id)]);}
+  if(!only(body,keys)||!id(body.id))return error("INVALID_REQUEST");const credentials=body.credentials;const fingerprint=credentials===undefined?body:{...body,credentials:"sha256:"+await sha256(canonical(credentials))};const prior=await lookupOperation(env,route,operation,fingerprint);if(prior){if(prior.kind!=="replay")return error("CONFLICT",409);const safe=accountOperationReadProjection(prior.response);return safe?json(safe):error("CONTROL_PLANE_UNAVAILABLE",503);}const old=await getAccount(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,fingerprint,{account:accountReadProjection(old)});return error("CONFLICT",409);}const stamp=now();const groups=stringArray(body.group_ids??old?.group_ids,100,true);
+  if(remove){const account:Account={...old!,status:"disabled",schedulable:false,deleted_at:stamp,updated_at:stamp};return replyMutation(env,route,operation,body,{account:accountReadProjection(account)},[env.DB.prepare("UPDATE accounts SET status='disabled',schedulable=0,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(stamp,stamp,account.id)]);}
   const account:Account={id:body.id,name:(body.name??old?.name)as string,platform:(body.platform??old?.platform)as string,type:"apikey",status:(body.status??old?.status)as string,schedulable:(body.schedulable??old?.schedulable)as boolean,priority:(body.priority??old?.priority)as number,max_concurrency:(body.max_concurrency??old?.max_concurrency)as number,extra:(body.extra??old?.extra)as Record<string,unknown>,group_ids:groups??[],created_at:old?.created_at??stamp,updated_at:stamp,deleted_at:old?.deleted_at??null};
   if(!isBoundedString(account.name,100)||account.platform!=="openai"||!status(account.status)||typeof account.schedulable!=="boolean"||!Number.isInteger(account.priority)||account.priority<-100000||account.priority>100000||!Number.isInteger(account.max_concurrency)||account.max_concurrency<1||account.max_concurrency>100000||!isObject(account.extra)||!groups||groups.length===0||!(await groupsExist(env,groups,true))||(create&&credentials===undefined))return error("INVALID_REQUEST");account.group_ids=groups;
   const runtime=env as unknown as CredentialRuntime;const encrypted=credentials===undefined?undefined:await encryptAPIKeyCredentials(credentials,runtime);if(credentials!==undefined&&!encrypted)return error("INVALID_REQUEST");
   const statements:D1PreparedStatement[]=create?[env.DB.prepare("INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(account.id,account.name,account.platform,"apikey",account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted,sqlJSON(account.extra),account.created_at,account.updated_at,account.deleted_at)]:[env.DB.prepare("UPDATE accounts SET name=?,platform=?,status=?,schedulable=?,priority=?,max_concurrency=?,credential_envelope=COALESCE(?,credential_envelope),extra_json=?,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(account.name,account.platform,account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted??null,sqlJSON(account.extra),account.updated_at,account.deleted_at,account.id),env.DB.prepare("DELETE FROM account_groups WHERE account_id=? AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,operation)];
   for(const groupID of groups)statements.push(env.DB.prepare("INSERT INTO account_groups(account_id,group_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,groupID,operation));
-  return replyMutation(env,route,operation,fingerprint,{account},statements);
+  return replyMutation(env,route,operation,fingerprint,{account:accountReadProjection(account)},statements);
 }

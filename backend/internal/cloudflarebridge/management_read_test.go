@@ -188,6 +188,55 @@ func TestHTTPControlPlaneManagedUserListPaginatesAndSkipsTombstones(t *testing.T
 	require.Equal(t, int32(2), calls.Load())
 }
 
+func TestHTTPControlPlaneManagedAccountsPreserveUnsafeIDsAndSkipTombstones(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		switch calls.Add(1) {
+		case 1:
+			require.Equal(t, "/v1/manage/accounts/get", r.URL.Path)
+			require.JSONEq(t, "{\"id\":\"9007199254741993\"}", string(body))
+			_, _ = io.WriteString(w, "{\"account\":{\"id\":\"9007199254741993\",\"name\":\"safe\",\"platform\":\"openai\",\"type\":\"apikey\",\"status\":\"active\",\"schedulable\":true,\"priority\":2,\"max_concurrency\":3,\"extra\":{\"privacy_mode\":\"training_off\"},\"group_ids\":[\"9007199254741097\"],\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}}")
+		case 2:
+			require.Equal(t, "/v1/manage/accounts/list", r.URL.Path)
+			require.JSONEq(t, "{\"cursor\":\"0\",\"limit\":100}", string(body))
+			_, _ = io.WriteString(w, "{\"accounts\":[{\"id\":\"41\",\"name\":\"deleted\",\"platform\":\"openai\",\"type\":\"apikey\",\"status\":\"disabled\",\"schedulable\":false,\"priority\":0,\"max_concurrency\":1,\"extra\":{},\"group_ids\":[],\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":\"2026-09-06T02:03:04Z\"}],\"next_cursor\":\"41\"}")
+		case 3:
+			require.Equal(t, "/v1/manage/accounts/list", r.URL.Path)
+			require.JSONEq(t, "{\"cursor\":\"41\",\"limit\":100}", string(body))
+			_, _ = io.WriteString(w, "{\"accounts\":[{\"id\":\"9007199254741993\",\"name\":\"safe\",\"platform\":\"openai\",\"type\":\"apikey\",\"status\":\"active\",\"schedulable\":true,\"priority\":2,\"max_concurrency\":3,\"extra\":{\"privacy_mode\":\"training_off\"},\"group_ids\":[\"9007199254741097\"],\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}],\"next_cursor\":null}")
+		default:
+			t.Fatal("unexpected control-plane call")
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	account, err := client.GetManagedAccount(context.Background(), 9007199254741993)
+	require.NoError(t, err)
+	require.Equal(t, int64(9007199254741993), account.ID)
+	require.Equal(t, []int64{9007199254741097}, account.GroupIDs)
+	require.Equal(t, "training_off", account.Extra["privacy_mode"])
+	accounts, err := client.ListManagedAccounts(context.Background())
+	require.NoError(t, err)
+	require.Len(t, accounts, 1)
+	require.Equal(t, int64(9007199254741993), accounts[0].ID)
+	require.Equal(t, int32(3), calls.Load())
+}
+
+func TestHTTPControlPlaneManagedAccountRejectsMalformedPage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "{\"accounts\":[{\"id\":\"42\",\"name\":\"bad\",\"platform\":\"openai\",\"type\":\"apikey\",\"status\":\"active\",\"schedulable\":true,\"priority\":0,\"max_concurrency\":1,\"extra\":{},\"group_ids\":[\"01\"],\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}],\"next_cursor\":null}")
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.ListManagedAccounts(context.Background())
+	require.ErrorContains(t, err, "account group id")
+}
+
 func TestManagedReadersFailClosedWithoutManagementCapability(t *testing.T) {
 	control := &fakeControlPlane{}
 	_, err := NewManagedUserReader(control).GetByID(context.Background(), 1)

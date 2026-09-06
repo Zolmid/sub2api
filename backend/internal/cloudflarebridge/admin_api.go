@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
@@ -28,6 +29,73 @@ func (h *cloudflareAdminAPIHandler) management() (AdminListControlPlane, error) 
 		return nil, ErrNotMigrated
 	}
 	return management, nil
+}
+
+func (h *cloudflareAdminAPIHandler) accounts() (AdminAccountReadControlPlane, error) {
+	accounts, ok := h.control.(AdminAccountReadControlPlane)
+	if !ok {
+		return nil, ErrNotMigrated
+	}
+	return accounts, nil
+}
+
+// cloudflareAdminAccountDTO only represents fields persisted by the Worker.
+// Do not embed dto.Account here: its defaults would suggest runtime, billing,
+// expiry, or credential facts that the D1 account row does not contain.
+type cloudflareAdminAccountDTO struct {
+	ID          cloudflareJSONID   `json:"id"`
+	Name        string             `json:"name"`
+	Platform    string             `json:"platform"`
+	Type        string             `json:"type"`
+	Status      string             `json:"status"`
+	Schedulable bool               `json:"schedulable"`
+	Concurrency int                `json:"concurrency"`
+	Priority    int                `json:"priority"`
+	Extra       map[string]any     `json:"extra"`
+	GroupIDs    []cloudflareJSONID `json:"group_ids"`
+	CreatedAt   string             `json:"created_at"`
+	UpdatedAt   string             `json:"updated_at"`
+}
+
+func newCloudflareAdminAccountDTO(account *ManagedAccount) *cloudflareAdminAccountDTO {
+	if account == nil {
+		return nil
+	}
+	return &cloudflareAdminAccountDTO{
+		ID: cloudflareJSONID(account.ID), Name: account.Name, Platform: account.Platform, Type: account.Type,
+		Status: cloudflareAdminAccountStatus(account.Status), Schedulable: account.Schedulable,
+		Concurrency: account.MaxConcurrency, Priority: account.Priority, Extra: cloudflareAdminAccountExtra(account.Extra),
+		GroupIDs: cloudflareIDList(account.GroupIDs), CreatedAt: account.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt: account.UpdatedAt.Format(time.RFC3339Nano),
+	}
+}
+
+// extra is not a credential store in this response. The Worker schema allows
+// arbitrary JSON here, so returning it wholesale could expose credential
+// material accidentally placed in the legacy-shaped field. privacy_mode is
+// the only currently supported AccountsView extra value and is safe to expose.
+func cloudflareAdminAccountExtra(extra map[string]any) map[string]any {
+	mode, ok := extra["privacy_mode"].(string)
+	if !ok || !cloudflareKnownOpenAIPrivacyMode(mode) {
+		return map[string]any{}
+	}
+	return map[string]any{"privacy_mode": mode}
+}
+
+func cloudflareKnownOpenAIPrivacyMode(mode string) bool {
+	switch mode {
+	case service.PrivacyModeTrainingOff, service.PrivacyModeFailed, service.PrivacyModeCFBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloudflareAdminAccountStatus(status string) string {
+	if status == service.StatusDisabled {
+		return "inactive"
+	}
+	return status
 }
 
 type cloudflareAdminUserDTO struct {
@@ -214,6 +282,261 @@ func cloudflareAdminOptionalBool(c *gin.Context, name string) (*bool, bool) {
 	}
 	value := values[0] == "true"
 	return &value, true
+}
+
+func cloudflareAdminAccountProjectionFlags(c *gin.Context) bool {
+	lite, exists := c.GetQueryArray("lite")
+	if !exists || len(lite) != 1 || lite[0] != "1" {
+		response.BadRequest(c, "Cloudflare account lists currently require lite=1")
+		return false
+	}
+	scheduler, exists := c.GetQueryArray("include_scheduler_score")
+	if !exists || len(scheduler) == 1 && (scheduler[0] == "" || scheduler[0] == "0") {
+		return true
+	}
+	if len(scheduler) == 1 && scheduler[0] == "1" {
+		response.BadRequest(c, "Scheduler scores are not migrated in Cloudflare mode")
+		return false
+	}
+	response.BadRequest(c, "Invalid include_scheduler_score")
+	return false
+}
+
+func cloudflareAdminAccountQueryOK(c *gin.Context) bool {
+	allowed := map[string]bool{
+		"page": true, "page_size": true, "platform": true, "type": true, "status": true,
+		"privacy_mode": true, "group": true, "search": true, "lite": true,
+		"include_scheduler_score": true, "sort_by": true, "sort_order": true,
+	}
+	for name, values := range c.Request.URL.Query() {
+		if allowed[name] {
+			continue
+		}
+		if len(values) != 1 || strings.TrimSpace(values[0]) != "" {
+			response.BadRequest(c, name+" is not migrated in Cloudflare mode")
+			return false
+		}
+	}
+	return true
+}
+
+func cloudflareAdminAccountDetailQueryOK(c *gin.Context) bool {
+	if len(c.Request.URL.Query()) == 0 {
+		return true
+	}
+	response.BadRequest(c, "Account detail query parameters are not migrated in Cloudflare mode")
+	return false
+}
+
+func cloudflareAdminAccountGroup(c *gin.Context) (string, bool) {
+	values, exists := c.GetQueryArray("group")
+	if !exists || len(values) == 1 && values[0] == "" {
+		return "", true
+	}
+	if len(values) != 1 {
+		response.BadRequest(c, "Invalid group")
+		return "", false
+	}
+	value := values[0]
+	if value == "ungrouped" {
+		return value, true
+	}
+	if isCanonicalPositiveDecimal(value) {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			return value, true
+		}
+	}
+	response.BadRequest(c, "Invalid group")
+	return "", false
+}
+
+func cloudflareAdminAccountPrivacyMode(c *gin.Context) (string, bool) {
+	values, exists := c.GetQueryArray("privacy_mode")
+	if !exists || len(values) == 1 && values[0] == "" {
+		return "", true
+	}
+	if len(values) != 1 || (values[0] != service.AccountPrivacyModeUnsetFilter && !cloudflareKnownOpenAIPrivacyMode(values[0])) {
+		response.BadRequest(c, "Invalid privacy_mode")
+		return "", false
+	}
+	return values[0], true
+}
+
+func (h *cloudflareAdminAPIHandler) ListAccounts(c *gin.Context) {
+	if !cloudflareAdminAccountQueryOK(c) || !cloudflareAdminAccountProjectionFlags(c) {
+		return
+	}
+	page, pageSize, ok := cloudflareAdminPage(c)
+	if !ok {
+		return
+	}
+	platform, ok := cloudflareAdminEnum(c, "platform", service.PlatformOpenAI)
+	if !ok {
+		return
+	}
+	accountType, ok := cloudflareAdminEnum(c, "type", service.AccountTypeAPIKey)
+	if !ok {
+		return
+	}
+	status, ok := cloudflareAdminEnum(c, "status", service.StatusActive, "inactive")
+	if !ok {
+		return
+	}
+	group, ok := cloudflareAdminAccountGroup(c)
+	if !ok {
+		return
+	}
+	privacyMode, ok := cloudflareAdminAccountPrivacyMode(c)
+	if !ok {
+		return
+	}
+	search, ok := cloudflareAdminSearch(c)
+	if !ok {
+		return
+	}
+	sortBy, sortOrder, ok := cloudflareAdminSort(c, "name", "asc", "id", "name", "status", "schedulable", "priority", "created_at")
+	if !ok {
+		return
+	}
+	accounts, err := h.accounts()
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	items, err := accounts.ListManagedAccounts(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	filtered := make([]ManagedAccount, 0, len(items))
+	for _, account := range items {
+		if (platform != "" && account.Platform != platform) || (accountType != "" && account.Type != accountType) ||
+			(status != "" && cloudflareAdminAccountStatus(account.Status) != status) ||
+			(search != "" && !strings.Contains(strings.ToLower(account.Name), search)) ||
+			(group == "ungrouped" && len(account.GroupIDs) != 0) ||
+			(group != "" && group != "ungrouped" && !cloudflareAccountHasGroup(account.GroupIDs, group)) ||
+			!cloudflareAccountMatchesPrivacyMode(account.Extra, privacyMode) {
+			continue
+		}
+		filtered = append(filtered, account)
+	}
+	sortCloudflareAccounts(filtered, sortBy, sortOrder)
+	response.Paginated(c, paginateCloudflareAccounts(filtered, page, pageSize), int64(len(filtered)), page, pageSize)
+}
+
+func cloudflareAccountHasGroup(ids []int64, expected string) bool {
+	for _, id := range ids {
+		if strconv.FormatInt(id, 10) == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func cloudflareAccountMatchesPrivacyMode(extra map[string]any, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	actual, _ := extra["privacy_mode"].(string)
+	if expected == service.AccountPrivacyModeUnsetFilter {
+		return strings.TrimSpace(actual) == ""
+	}
+	return actual == expected
+}
+
+func sortCloudflareAccounts(accounts []ManagedAccount, sortBy, sortOrder string) {
+	compare := func(i, j int) int {
+		left, right := accounts[i], accounts[j]
+		var leftValue, rightValue string
+		switch sortBy {
+		case "id":
+			if left.ID < right.ID {
+				return -1
+			}
+			if left.ID > right.ID {
+				return 1
+			}
+			return 0
+		case "status":
+			leftValue, rightValue = cloudflareAdminAccountStatus(left.Status), cloudflareAdminAccountStatus(right.Status)
+		case "schedulable":
+			leftValue, rightValue = strconv.FormatBool(left.Schedulable), strconv.FormatBool(right.Schedulable)
+		case "priority":
+			if left.Priority < right.Priority {
+				return -1
+			}
+			if left.Priority > right.Priority {
+				return 1
+			}
+		case "created_at":
+			if left.CreatedAt.Before(right.CreatedAt) {
+				return -1
+			}
+			if right.CreatedAt.Before(left.CreatedAt) {
+				return 1
+			}
+		default:
+			leftValue, rightValue = strings.ToLower(left.Name), strings.ToLower(right.Name)
+		}
+		if leftValue < rightValue {
+			return -1
+		}
+		if leftValue > rightValue {
+			return 1
+		}
+		// A canonical-ID tie breaker keeps page boundaries deterministic.
+		if left.ID < right.ID {
+			return -1
+		}
+		if left.ID > right.ID {
+			return 1
+		}
+		return 0
+	}
+	sort.SliceStable(accounts, func(i, j int) bool {
+		comparison := compare(i, j)
+		if sortOrder == "desc" {
+			return comparison > 0
+		}
+		return comparison < 0
+	})
+}
+
+func paginateCloudflareAccounts(accounts []ManagedAccount, page, pageSize int) []*cloudflareAdminAccountDTO {
+	start := (page - 1) * pageSize
+	if start >= len(accounts) {
+		return []*cloudflareAdminAccountDTO{}
+	}
+	end := start + pageSize
+	if end > len(accounts) {
+		end = len(accounts)
+	}
+	items := make([]*cloudflareAdminAccountDTO, 0, end-start)
+	for i := start; i < end; i++ {
+		items = append(items, newCloudflareAdminAccountDTO(&accounts[i]))
+	}
+	return items
+}
+
+func (h *cloudflareAdminAPIHandler) GetAccount(c *gin.Context) {
+	if !cloudflareAdminAccountDetailQueryOK(c) {
+		return
+	}
+	id, ok := cloudflareAdminIDParam(c, "id")
+	if !ok {
+		return
+	}
+	accounts, err := h.accounts()
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	account, err := accounts.GetManagedAccount(c.Request.Context(), id)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, newCloudflareAdminAccountDTO(account))
 }
 
 func (h *cloudflareAdminAPIHandler) ListUsers(c *gin.Context) {

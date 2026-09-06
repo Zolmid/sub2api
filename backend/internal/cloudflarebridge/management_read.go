@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -34,6 +35,35 @@ type AdminListControlPlane interface {
 	ManagementReadControlPlane
 	ListManagedUsers(context.Context) ([]service.User, error)
 	ListManagedGroups(context.Context) ([]service.Group, error)
+}
+
+// AdminAccountReadControlPlane is deliberately independent from the legacy
+// AccountRepository and AdminService graphs. The Worker owns only this narrow
+// D1-backed account projection, so it cannot honestly implement the rest of
+// the traditional account contract (credentials, runtime state, billing, or
+// scheduler observations).
+type AdminAccountReadControlPlane interface {
+	GetManagedAccount(context.Context, int64) (*ManagedAccount, error)
+	ListManagedAccounts(context.Context) ([]ManagedAccount, error)
+}
+
+// ManagedAccount contains precisely the non-secret account fields persisted
+// by the Worker management schema. IDs remain int64 in Go after the private
+// wire decoder has validated their canonical decimal representation.
+type ManagedAccount struct {
+	ID             int64
+	Name           string
+	Platform       string
+	Type           string
+	Status         string
+	Schedulable    bool
+	Priority       int
+	MaxConcurrency int
+	Extra          map[string]any
+	GroupIDs       []int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeletedAt      *time.Time
 }
 
 // ManagedUserReader adapts the private Worker management protocol to the
@@ -110,6 +140,22 @@ type managedGroupWire struct {
 	CreatedAt        string  `json:"created_at"`
 	UpdatedAt        string  `json:"updated_at"`
 	DeletedAt        *string `json:"deleted_at"`
+}
+
+type managedAccountWire struct {
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Platform       string         `json:"platform"`
+	Type           string         `json:"type"`
+	Status         string         `json:"status"`
+	Schedulable    bool           `json:"schedulable"`
+	Priority       int            `json:"priority"`
+	MaxConcurrency int            `json:"max_concurrency"`
+	Extra          map[string]any `json:"extra"`
+	GroupIDs       []string       `json:"group_ids"`
+	CreatedAt      string         `json:"created_at"`
+	UpdatedAt      string         `json:"updated_at"`
+	DeletedAt      *string        `json:"deleted_at"`
 }
 
 func canonicalUnsignedDecimal(value string) bool {
@@ -235,6 +281,49 @@ func decodeManagedGroup(wire managedGroupWire) (*service.Group, bool, error) {
 	}, deletedAt != nil, nil
 }
 
+func decodeManagedAccount(wire managedAccountWire) (*ManagedAccount, bool, error) {
+	id, err := parsePositiveID("account id", wire.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	createdAt, err := requiredWireTime("account creation timestamp", wire.CreatedAt)
+	if err != nil {
+		return nil, false, err
+	}
+	updatedAt, err := requiredWireTime("account update timestamp", wire.UpdatedAt)
+	if err != nil {
+		return nil, false, err
+	}
+	deletedAt, err := parseOptionalTime(wire.DeletedAt)
+	if err != nil {
+		return nil, false, errors.New("invalid account deletion timestamp")
+	}
+	if strings.TrimSpace(wire.Name) == "" || len(wire.Name) > 100 || wire.Platform != service.PlatformOpenAI ||
+		wire.Type != service.AccountTypeAPIKey || (wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
+		wire.Priority < -100000 || wire.Priority > 100000 || wire.MaxConcurrency < 1 || wire.MaxConcurrency > 100000 ||
+		wire.Extra == nil || len(wire.GroupIDs) > 100 {
+		return nil, false, errors.New("invalid managed account response")
+	}
+	groupIDs := make([]int64, 0, len(wire.GroupIDs))
+	seen := make(map[int64]struct{}, len(wire.GroupIDs))
+	for _, rawID := range wire.GroupIDs {
+		groupID, err := parsePositiveID("account group id", rawID)
+		if err != nil {
+			return nil, false, err
+		}
+		if _, exists := seen[groupID]; exists {
+			return nil, false, errors.New("invalid managed account response: duplicate group")
+		}
+		seen[groupID] = struct{}{}
+		groupIDs = append(groupIDs, groupID)
+	}
+	return &ManagedAccount{
+		ID: id, Name: wire.Name, Platform: wire.Platform, Type: wire.Type, Status: wire.Status,
+		Schedulable: wire.Schedulable, Priority: wire.Priority, MaxConcurrency: wire.MaxConcurrency,
+		Extra: wire.Extra, GroupIDs: groupIDs, CreatedAt: createdAt, UpdatedAt: updatedAt, DeletedAt: deletedAt,
+	}, deletedAt != nil, nil
+}
+
 func ensureManagedGroupInCurrentSlice(group *service.Group) error {
 	if group == nil || group.Platform != service.PlatformOpenAI || group.SubscriptionType != service.SubscriptionTypeStandard {
 		return ErrNotMigrated
@@ -309,6 +398,31 @@ func (c *HTTPControlPlane) GetManagedGroup(ctx context.Context, id int64) (*serv
 	return group, nil
 }
 
+func (c *HTTPControlPlane) GetManagedAccount(ctx context.Context, id int64) (*ManagedAccount, error) {
+	if id < 1 {
+		return nil, service.ErrAccountNotFound
+	}
+	var response struct {
+		Account managedAccountWire `json:"account"`
+	}
+	if err := c.post(ctx, "/v1/manage/accounts/get", struct {
+		ID string `json:"id"`
+	}{ID: strconv.FormatInt(id, 10)}, &response); err != nil {
+		return nil, mapManagedReadError(err, service.ErrAccountNotFound)
+	}
+	account, deleted, err := decodeManagedAccount(response.Account)
+	if err != nil {
+		return nil, fmt.Errorf("invalid managed account response: %w", err)
+	}
+	if account.ID != id {
+		return nil, errors.New("invalid managed account response: identity mismatch")
+	}
+	if deleted {
+		return nil, service.ErrAccountNotFound
+	}
+	return account, nil
+}
+
 func (c *HTTPControlPlane) ListActiveManagedGroups(ctx context.Context) ([]service.Group, error) {
 	return c.listManagedGroups(ctx, true)
 }
@@ -370,6 +484,61 @@ func (c *HTTPControlPlane) ListManagedUsers(ctx context.Context) ([]service.User
 
 func (c *HTTPControlPlane) ListManagedGroups(ctx context.Context) ([]service.Group, error) {
 	return c.listManagedGroups(ctx, false)
+}
+
+func (c *HTTPControlPlane) ListManagedAccounts(ctx context.Context) ([]ManagedAccount, error) {
+	cursor := "0"
+	accounts := make([]ManagedAccount, 0)
+	seen := make(map[int64]struct{})
+	for page := 0; page < 100; page++ {
+		var response struct {
+			Accounts   []managedAccountWire `json:"accounts"`
+			NextCursor *string              `json:"next_cursor"`
+		}
+		request := struct {
+			Cursor string `json:"cursor"`
+			Limit  int    `json:"limit"`
+		}{Cursor: cursor, Limit: managedListPageSize}
+		if err := c.post(ctx, "/v1/manage/accounts/list", request, &response); err != nil {
+			return nil, err
+		}
+		if response.Accounts == nil {
+			return nil, errors.New("invalid managed account list response: accounts array is required")
+		}
+		if len(response.Accounts) > managedListPageSize {
+			return nil, errors.New("invalid managed account list response: page too large")
+		}
+		previousID := cursor
+		for _, wire := range response.Accounts {
+			if !isCanonicalPositiveDecimal(wire.ID) || !decimalStringGreater(wire.ID, previousID) {
+				return nil, errors.New("invalid managed account list response: account order did not advance")
+			}
+			previousID = wire.ID
+			account, deleted, err := decodeManagedAccount(wire)
+			if err != nil {
+				return nil, fmt.Errorf("invalid managed account list response: %w", err)
+			}
+			if _, exists := seen[account.ID]; exists {
+				return nil, errors.New("invalid managed account list response: duplicate account")
+			}
+			seen[account.ID] = struct{}{}
+			if !deleted {
+				accounts = append(accounts, *account)
+			}
+		}
+		if response.NextCursor == nil {
+			return accounts, nil
+		}
+		next := *response.NextCursor
+		if !isCanonicalPositiveDecimal(next) || !decimalStringGreater(next, cursor) {
+			return nil, errors.New("invalid managed account list response: cursor did not advance")
+		}
+		if len(response.Accounts) == 0 || next != previousID {
+			return nil, errors.New("invalid managed account list response: cursor does not match page")
+		}
+		cursor = next
+	}
+	return nil, errors.New("invalid managed account list response: too many pages")
 }
 
 func (c *HTTPControlPlane) listManagedGroups(ctx context.Context, activeOnly bool) ([]service.Group, error) {
@@ -450,5 +619,6 @@ func decimalStringGreater(left, right string) bool {
 }
 
 var _ ManagementReadControlPlane = (*HTTPControlPlane)(nil)
+var _ AdminAccountReadControlPlane = (*HTTPControlPlane)(nil)
 var _ service.APIKeyUserReader = (*ManagedUserReader)(nil)
 var _ service.APIKeyGroupReader = (*ManagedGroupReader)(nil)

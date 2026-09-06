@@ -43,7 +43,32 @@ describe("Stage C private management control plane", () => {
   it("encrypts Worker-managed credentials and excludes secrets from operation responses", async () => {
     const scope = await createScope("credentials"); const rawKey = "WorkerManagedKey_123456"; const upstreamKey = "upstream-secret-" + id(); const baseURL = "https://mock.upstream";
     expect((await call("/v1/manage/api-keys/create", { operation_id: "credentials-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
-    expect((await call("/v1/manage/accounts/create", { operation_id: "credentials-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: upstreamKey, base_url: baseURL }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);
+    const accountCreateRequest = { operation_id: "credentials-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: upstreamKey, base_url: baseURL }, extra: { privacy_mode: "training_off", api_key: upstreamKey, base_url: baseURL }, group_ids: [scope.groupID] };
+    const accountCreate = await call("/v1/manage/accounts/create", accountCreateRequest);
+    expect(accountCreate.status).toBe(200);
+    const accountCreateRead = await accountCreate.json<{ account: { extra: Record<string, unknown> } }>();
+    expect(accountCreateRead.account.extra).toEqual({ privacy_mode: "training_off" });
+    const legacySecret = "legacy-operation-secret-" + id();
+    await env.DB.prepare("UPDATE management_operations SET response_json=? WHERE operation_id='credentials-account'").bind(JSON.stringify({ secret: legacySecret, account: { ...accountCreateRead.account, credentials: { api_key: legacySecret }, credential_envelope: legacySecret, extra: { privacy_mode: "training_off", api_key: legacySecret } } })).run();
+    const accountCreateReplay = await call("/v1/manage/accounts/create", accountCreateRequest);
+    expect(accountCreateReplay.status).toBe(200);
+    const accountCreateReplayRead = await accountCreateReplay.json<{ account: { extra: Record<string, unknown> } }>();
+    expect(accountCreateReplayRead.account.extra).toEqual({ privacy_mode: "training_off" });
+    expect(JSON.stringify(accountCreateReplayRead)).not.toContain(legacySecret);
+    await env.DB.prepare("UPDATE management_operations SET response_json=? WHERE operation_id='credentials-account'").bind(JSON.stringify(accountCreateRead)).run();
+    const accountGet = await call("/v1/manage/accounts/get", { id: scope.accountID });
+    expect(accountGet.status).toBe(200);
+    const accountRead = await accountGet.json<Record<string, unknown>>();
+    expect(accountRead).toMatchObject({ account: { id: scope.accountID, type: "apikey", extra: { privacy_mode: "training_off" }, group_ids: [scope.groupID] } });
+    expect(JSON.stringify(accountRead)).not.toContain(upstreamKey);
+    expect(JSON.stringify(accountRead)).not.toContain(baseURL);
+    expect(JSON.stringify(accountRead)).not.toContain("credential_envelope");
+    const accountList = await call("/v1/manage/accounts/list", { cursor: "0", limit: 1 });
+    expect(accountList.status).toBe(200);
+    const accountListRead = await accountList.json<Record<string, unknown>>();
+    expect(JSON.stringify(accountListRead)).not.toContain(upstreamKey);
+    expect(JSON.stringify(accountListRead)).not.toContain(baseURL);
+    expect(JSON.stringify(accountListRead)).not.toContain("credential_envelope");
     const encrypted = await env.DB.prepare("SELECT credential_envelope FROM accounts WHERE id=?").bind(scope.accountID).first("credential_envelope") as string;
     expect(encrypted).toMatch(/^aes-gcm:v1:/); expect(encrypted).not.toContain(upstreamKey); expect(encrypted).not.toContain(baseURL);
     const admission = await call("/v1/requests/admit", { request_id: "managed-admission-" + id(), api_key_id: scope.keyID, group_id: scope.groupID, model: "fixture-model", lease_ttl_seconds: 30 });
@@ -51,6 +76,19 @@ describe("Stage C private management control plane", () => {
     const rows = await env.DB.prepare("SELECT response_json FROM management_operations").all<{ response_json: string }>();
     for (const row of rows.results) { expect(row.response_json).not.toContain("password-hash-for-credentials"); expect(row.response_json).not.toContain("test-only-cloudflare-jwt-secret-32-bytes"); expect(row.response_json).not.toContain(rawKey); expect(row.response_json).not.toContain(upstreamKey); expect(row.response_json).not.toContain(baseURL); }
     expect((await call("/v1/manage/accounts/create", { operation_id: "no-secret", id: id(), name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credentials: { api_key: "x", base_url: baseURL }, extra: {}, group_ids: [scope.groupID] }, undefined, env)).status).toBe(400);
+    expect((await call("/v1/manage/accounts/delete", { operation_id: "delete-account-read", id: scope.accountID })).status).toBe(200);
+    const tombstoneGet = await call("/v1/manage/accounts/get", { id: scope.accountID });
+    expect(tombstoneGet.status).toBe(200);
+    const tombstoneRead = await tombstoneGet.json<{ account: { deleted_at: string | null; status: string } }>();
+    expect(tombstoneRead.account.status).toBe("disabled");
+    expect(tombstoneRead.account.deleted_at).not.toBeNull();
+    expect(JSON.stringify(tombstoneRead)).not.toContain(upstreamKey);
+    const tombstoneList = await call("/v1/manage/accounts/list", { cursor: "0", limit: 1 });
+    expect(tombstoneList.status).toBe(200);
+    const tombstoneListRead = JSON.stringify(await tombstoneList.json());
+    expect(tombstoneListRead).not.toContain(upstreamKey);
+    expect(tombstoneListRead).not.toContain(baseURL);
+    expect(tombstoneListRead).not.toContain("credential_envelope");
   });
 
   it("makes tombstones terminal and owner-scoped revoke atomically releases the credential hash", async () => {

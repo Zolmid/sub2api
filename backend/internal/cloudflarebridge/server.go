@@ -96,6 +96,8 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	admin.GET("/groups", adminAPIHandler.ListGroups)
 	admin.GET("/groups/all", adminAPIHandler.ListAllGroups)
 	admin.GET("/groups/:id", adminAPIHandler.GetGroup)
+	admin.GET("/accounts", adminAPIHandler.ListAccounts)
+	admin.GET("/accounts/:id", adminAPIHandler.GetAccount)
 
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))

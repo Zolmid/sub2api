@@ -1,0 +1,135 @@
+//go:build unit
+
+package cloudflarebridge
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/stretchr/testify/require"
+)
+
+func TestHTTPControlPlaneGetManagedUserUsesNonSecretDecimalContract(t *testing.T) {
+	var requestBody string
+	var requestPath string
+	var version string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		version = r.Header.Get("X-Sub2API-Bridge-Version")
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		requestBody = string(body)
+		_, _ = io.WriteString(w, `{"user":{"id":"9007199254740993","email":"reader@example.test","username":"reader","notes":"safe","status":"active","role":"user","concurrency":3,"rpm_limit":9,"balance_microusd":"9007199254740993000000","allowed_group_ids":["9007199254740994"],"restrict_public_groups":true,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	user, err := client.GetManagedUser(context.Background(), 9007199254740993)
+	require.NoError(t, err)
+	require.Equal(t, "/v1/manage/users/get", requestPath)
+	require.JSONEq(t, `{"id":"9007199254740993"}`, requestBody)
+	require.Equal(t, ProtocolVersion, version)
+	require.Equal(t, int64(9007199254740993), user.ID)
+	require.Equal(t, []int64{9007199254740994}, user.AllowedGroups)
+	require.Equal(t, float64(1), user.Balance)
+	require.Empty(t, user.PasswordHash)
+	require.False(t, user.TokenVersionResolved)
+	require.True(t, user.RestrictPublicGroups)
+}
+
+func TestHTTPControlPlaneGetManagedUserTreatsTombstoneAsNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"user":{"id":"41","email":"deleted@example.test","username":"","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}}`)
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.GetManagedUser(context.Background(), 41)
+	require.ErrorIs(t, err, service.ErrUserNotFound)
+}
+
+func TestHTTPControlPlaneListActiveManagedGroupsPaginatesAndFilters(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		switch calls.Add(1) {
+		case 1:
+			require.JSONEq(t, `{"cursor":"0","limit":100}`, string(body))
+			_, _ = io.WriteString(w, `{"groups":[{"id":"9007199254740993","name":"active","platform":"openai","status":"active","is_exclusive":false,"subscription_type":"standard","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null},{"id":"9007199254740994","name":"disabled-subscription","platform":"openai","status":"disabled","is_exclusive":false,"subscription_type":"subscription","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}],"next_cursor":"9007199254740994"}`)
+		case 2:
+			require.JSONEq(t, `{"cursor":"9007199254740994","limit":100}`, string(body))
+			_, _ = io.WriteString(w, `{"groups":[{"id":"9007199254740995","name":"deleted","platform":"openai","status":"disabled","is_exclusive":false,"subscription_type":"standard","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}],"next_cursor":null}`)
+		default:
+			t.Fatal("unexpected extra page")
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	groups, err := client.ListActiveManagedGroups(context.Background())
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.Equal(t, int64(9007199254740993), groups[0].ID)
+	require.True(t, groups[0].Hydrated)
+	require.Equal(t, int32(2), calls.Load())
+}
+
+func TestHTTPControlPlaneManagedGroupFailsClosedOutsideCurrentSlice(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"group":{"id":"42","name":"subscription","platform":"openai","status":"active","is_exclusive":false,"subscription_type":"subscription","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.GetManagedGroup(context.Background(), 42)
+	require.ErrorIs(t, err, ErrNotMigrated)
+}
+
+func TestHTTPControlPlaneManagedGroupListRejectsNonAdvancingCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"groups":[],"next_cursor":"0"}`)
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.ListActiveManagedGroups(context.Background())
+	require.ErrorContains(t, err, "cursor did not advance")
+}
+
+func TestHTTPControlPlaneManagedGroupListRejectsMissingArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"next_cursor":null}`)
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.ListActiveManagedGroups(context.Background())
+	require.ErrorContains(t, err, "groups array is required")
+}
+
+func TestHTTPControlPlaneManagedGroupListRejectsOutOfOrderRows(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"groups":[{"id":"42","name":"first","platform":"openai","status":"active","is_exclusive":false,"subscription_type":"standard","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null},{"id":"41","name":"second","platform":"openai","status":"active","is_exclusive":false,"subscription_type":"standard","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}],"next_cursor":null}`)
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.ListActiveManagedGroups(context.Background())
+	require.ErrorContains(t, err, "group order did not advance")
+}
+
+func TestManagedReadersFailClosedWithoutManagementCapability(t *testing.T) {
+	control := &fakeControlPlane{}
+	_, err := NewManagedUserReader(control).GetByID(context.Background(), 1)
+	require.ErrorIs(t, err, ErrNotMigrated)
+	_, err = NewManagedGroupReader(control).ListActive(context.Background())
+	require.ErrorIs(t, err, ErrNotMigrated)
+}

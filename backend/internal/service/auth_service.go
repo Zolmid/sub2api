@@ -72,7 +72,7 @@ type JWTClaims struct {
 // AuthService 认证服务
 type AuthService struct {
 	entClient             *dbent.Client
-	userRepo              UserRepository
+	userRepo              AuthUserRepository
 	redeemRepo            RedeemCodeRepository
 	refreshTokenCache     RefreshTokenCache
 	cfg                   *config.Config
@@ -86,6 +86,21 @@ type AuthService struct {
 	affiliateService      *AffiliateService
 	defaultSubAssigner    DefaultSubscriptionAssigner
 	userPlatformQuotaRepo UserPlatformQuotaRepository
+}
+
+// AuthUserRepository is the persistence subset used by AuthService. Keeping
+// this boundary narrower than the administrative UserRepository allows an
+// alternate deployment to preserve the existing authentication business logic
+// without implementing unrelated avatar, balance, listing, and bulk-edit APIs.
+type AuthUserRepository interface {
+	Create(ctx context.Context, user *User) error
+	CreateWithEmailAliasGuard(ctx context.Context, user *User) error
+	GetByID(ctx context.Context, id int64) (*User, error)
+	GetByEmail(ctx context.Context, email string) (*User, error)
+	Update(ctx context.Context, user *User, fields UserUpdateFields) error
+	Delete(ctx context.Context, id int64) error
+	ExistsByEmail(ctx context.Context, email string) (bool, error)
+	ExistsByEmailAlias(ctx context.Context, email string) (bool, error)
 }
 
 type CaptchaProof struct {
@@ -109,7 +124,7 @@ type signupGrantPlan struct {
 // NewAuthService 创建认证服务实例
 func NewAuthService(
 	entClient *dbent.Client,
-	userRepo UserRepository,
+	userRepo AuthUserRepository,
 	redeemRepo RedeemCodeRepository,
 	refreshTokenCache RefreshTokenCache,
 	cfg *config.Config,

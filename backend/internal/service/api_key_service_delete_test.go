@@ -47,6 +47,17 @@ type apiKeyRepoStub struct {
 	touchedUsedAts         []time.Time
 }
 
+type ownerDeletingAPIKeyRepoStub struct {
+	*apiKeyRepoStub
+	ownerDeleteCalls [][2]int64
+	ownerDeleteErr   error
+}
+
+func (s *ownerDeletingAPIKeyRepoStub) DeleteWithAuditForOwner(_ context.Context, id, userID int64) error {
+	s.ownerDeleteCalls = append(s.ownerDeleteCalls, [2]int64{id, userID})
+	return s.ownerDeleteErr
+}
+
 // 以下方法在本测试中不应被调用，使用 panic 确保测试失败时能快速定位问题
 
 func (s *apiKeyRepoStub) Create(ctx context.Context, key *APIKey) error {
@@ -351,6 +362,43 @@ func TestApiKeyService_Delete_NotFound(t *testing.T) {
 	require.Empty(t, repo.deletedIDs)
 	require.Empty(t, cache.invalidated)
 	require.Empty(t, cache.deleteAuthKeys)
+}
+
+func TestAPIKeyService_Delete_UsesAtomicOwnerDeleteWithoutRawKeyCache(t *testing.T) {
+	repo := &ownerDeletingAPIKeyRepoStub{apiKeyRepoStub: &apiKeyRepoStub{}}
+	svc := &APIKeyService{apiKeyRepo: repo}
+	svc.lastUsedTouchL1.Store(int64(42), time.Now())
+
+	err := svc.Delete(context.Background(), 42, 7)
+	require.NoError(t, err)
+	require.Equal(t, [][2]int64{{42, 7}}, repo.ownerDeleteCalls)
+	_, exists := svc.lastUsedTouchL1.Load(int64(42))
+	require.False(t, exists)
+}
+
+func TestAPIKeyService_Delete_AtomicOwnerDeletePropagatesAuthorizationFailure(t *testing.T) {
+	repo := &ownerDeletingAPIKeyRepoStub{
+		apiKeyRepoStub: &apiKeyRepoStub{},
+		ownerDeleteErr: ErrInsufficientPerms,
+	}
+	svc := &APIKeyService{apiKeyRepo: repo}
+
+	err := svc.Delete(context.Background(), 42, 8)
+	require.ErrorIs(t, err, ErrInsufficientPerms)
+	require.Equal(t, [][2]int64{{42, 8}}, repo.ownerDeleteCalls)
+}
+
+func TestAPIKeyService_Delete_DoesNotUseHashOnlyCapabilityWithRawKeyCache(t *testing.T) {
+	base := &apiKeyRepoStub{apiKey: &APIKey{ID: 42, UserID: 7, Key: "k"}}
+	repo := &ownerDeletingAPIKeyRepoStub{apiKeyRepoStub: base}
+	cache := &apiKeyCacheStub{}
+	svc := &APIKeyService{apiKeyRepo: repo, cache: cache}
+
+	err := svc.Delete(context.Background(), 42, 7)
+	require.NoError(t, err)
+	require.Empty(t, repo.ownerDeleteCalls)
+	require.Equal(t, []int64{42}, base.deletedIDs)
+	require.Equal(t, []string{svc.authCacheKey("k")}, cache.deleteAuthKeys)
 }
 
 func TestAPIKeyService_List_FillsCurrentConcurrency(t *testing.T) {

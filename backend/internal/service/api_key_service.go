@@ -121,6 +121,16 @@ type APIKeyRepository interface {
 	GetRateLimitData(ctx context.Context, id int64) (*APIKeyRateLimitData, error)
 }
 
+// APIKeyOwnerDeleteRepository is an optional repository capability for
+// backends that intentionally never persist or return the raw API-key secret.
+// The ownership check and tombstone write must happen in one backend atomic
+// operation. APIKeyService uses this path only when no raw-key auth cache is
+// configured, because such a cache would otherwise require the deleted secret
+// in order to invalidate its entry.
+type APIKeyOwnerDeleteRepository interface {
+	DeleteWithAuditForOwner(ctx context.Context, id, userID int64) error
+}
+
 type apiKeyAllByUserIDLister interface {
 	ListAllByUserID(ctx context.Context, userID int64, filters APIKeyListFilters) ([]APIKey, error)
 }
@@ -915,6 +925,14 @@ func (s *APIKeyService) Update(ctx context.Context, id int64, userID int64, req 
 
 // Delete 删除API Key
 func (s *APIKeyService) Delete(ctx context.Context, id int64, userID int64) error {
+	if repository, ok := s.apiKeyRepo.(APIKeyOwnerDeleteRepository); ok && s.cache == nil {
+		if err := repository.DeleteWithAuditForOwner(ctx, id, userID); err != nil {
+			return fmt.Errorf("delete api key: %w", err)
+		}
+		s.lastUsedTouchL1.Delete(id)
+		return nil
+	}
+
 	key, ownerID, err := s.apiKeyRepo.GetKeyAndOwnerID(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get api key: %w", err)

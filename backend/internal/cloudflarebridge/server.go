@@ -56,7 +56,9 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
 	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
 	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService)
+	adminAPIHandler := newCloudflareAdminAPIHandler(control)
 	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
+	adminAuthMiddleware := middleware.NewAdminAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil)
 	forwarder := service.NewCloudflareVerticalSliceOpenAIGatewayService(runtime.Application, upstream)
 	handler := &gatewayHandler{
 		control:         control,
@@ -66,6 +68,12 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "deployment_mode": DeploymentModeValue})
+	})
+	router.GET("/setup/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{"needs_setup": false, "step": "completed"},
+		})
 	})
 
 	v1 := router.Group("/api/v1")
@@ -81,6 +89,13 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	keys.DELETE("/:id", userAPIHandler.DeleteAPIKey)
 	authenticated.GET("/groups/available", userAPIHandler.GetAvailableGroups)
 	authenticated.GET("/auth/me", userAPIHandler.CurrentUser)
+	admin := v1.Group("/admin")
+	admin.Use(gin.HandlerFunc(adminAuthMiddleware))
+	admin.GET("/users", adminAPIHandler.ListUsers)
+	admin.GET("/users/:id", adminAPIHandler.GetUser)
+	admin.GET("/groups", adminAPIHandler.ListGroups)
+	admin.GET("/groups/all", adminAPIHandler.ListAllGroups)
+	admin.GET("/groups/:id", adminAPIHandler.GetGroup)
 
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))

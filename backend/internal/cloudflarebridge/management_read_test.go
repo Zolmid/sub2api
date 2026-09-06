@@ -93,6 +93,7 @@ func TestHTTPControlPlaneListActiveManagedGroupsPaginatesAndFilters(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 	require.Equal(t, int64(9007199254740993), groups[0].ID)
+	require.Equal(t, float64(1), groups[0].RateMultiplier)
 	require.True(t, groups[0].Hydrated)
 	require.Equal(t, int32(2), calls.Load())
 }
@@ -139,6 +140,52 @@ func TestHTTPControlPlaneManagedGroupListRejectsOutOfOrderRows(t *testing.T) {
 	require.NoError(t, err)
 	_, err = client.ListActiveManagedGroups(context.Background())
 	require.ErrorContains(t, err, "group order did not advance")
+}
+
+func TestHTTPControlPlaneManagedUserListFailsClosedOnMalformedPages(t *testing.T) {
+	for _, body := range []string{
+		"{\"next_cursor\":null}",
+		"{\"users\":[],\"next_cursor\":\"0\"}",
+		"{\"users\":[{\"id\":\"42\",\"email\":\"a@example.test\",\"username\":\"a\",\"notes\":\"\",\"status\":\"active\",\"role\":\"operator\",\"concurrency\":1,\"rpm_limit\":0,\"balance_microusd\":\"0\",\"allowed_group_ids\":[],\"restrict_public_groups\":false,\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}],\"next_cursor\":null}",
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		client, err := NewHTTPControlPlane(server.URL, server.Client())
+		require.NoError(t, err)
+		_, err = client.ListManagedUsers(context.Background())
+		require.Error(t, err, body)
+		server.Close()
+	}
+}
+
+func TestHTTPControlPlaneManagedUserListPaginatesAndSkipsTombstones(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		switch calls.Add(1) {
+		case 1:
+			require.JSONEq(t, `{"cursor":"0","limit":100}`, string(body))
+			_, _ = io.WriteString(w, `{"users":[{"id":"42","email":"first@example.test","username":"first","notes":"","status":"active","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"1000000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null},{"id":"43","email":"deleted@example.test","username":"deleted","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}],"next_cursor":"43"}`)
+		case 2:
+			require.JSONEq(t, `{"cursor":"43","limit":100}`, string(body))
+			_, _ = io.WriteString(w, `{"users":[{"id":"9007199254740993","email":"second@example.test","username":"second","notes":"admin note","status":"active","role":"admin","concurrency":2,"rpm_limit":3,"balance_microusd":"2500000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}],"next_cursor":null}`)
+		default:
+			t.Fatal("unexpected extra page")
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	users, err := client.ListManagedUsers(context.Background())
+	require.NoError(t, err)
+	require.Len(t, users, 2)
+	require.Equal(t, int64(42), users[0].ID)
+	require.Equal(t, int64(9007199254740993), users[1].ID)
+	require.Equal(t, 2.5, users[1].Balance)
+	require.Equal(t, int32(2), calls.Load())
 }
 
 func TestManagedReadersFailClosedWithoutManagementCapability(t *testing.T) {

@@ -76,6 +76,13 @@ func (*AuthUserRepository) ExistsByEmailAlias(context.Context, string) (bool, er
 	return false, ErrNotMigrated
 }
 
+// GetFirstAdmin exists solely to satisfy middleware.AdminUserReader. The
+// Cloudflare slice has no settings persistence, so admin API-key
+// authentication must fail closed and must not select an administrator.
+func (*AuthUserRepository) GetFirstAdmin(context.Context) (*service.User, error) {
+	return nil, ErrNotMigrated
+}
+
 type authUserWire struct {
 	ID                   string   `json:"id"`
 	Email                string   `json:"email"`

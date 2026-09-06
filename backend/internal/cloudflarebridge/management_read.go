@@ -27,6 +27,15 @@ type ManagementReadControlPlane interface {
 	ListActiveManagedGroups(context.Context) ([]service.Group, error)
 }
 
+// AdminListControlPlane is intentionally separate from ManagementReadControlPlane.
+// The existing three-method interface remains the narrow contract used by the
+// user/API-key slice; only the administrator read handler needs full lists.
+type AdminListControlPlane interface {
+	ManagementReadControlPlane
+	ListManagedUsers(context.Context) ([]service.User, error)
+	ListManagedGroups(context.Context) ([]service.Group, error)
+}
+
 // ManagedUserReader adapts the private Worker management protocol to the
 // narrow user dependency consumed by APIKeyService. It must not be used as a
 // JWT reader: this response intentionally contains neither password hashes nor
@@ -216,6 +225,7 @@ func decodeManagedGroup(wire managedGroupWire) (*service.Group, bool, error) {
 		ID:               id,
 		Name:             wire.Name,
 		Platform:         wire.Platform,
+		RateMultiplier:   1,
 		Status:           wire.Status,
 		IsExclusive:      wire.IsExclusive,
 		SubscriptionType: wire.SubscriptionType,
@@ -300,6 +310,69 @@ func (c *HTTPControlPlane) GetManagedGroup(ctx context.Context, id int64) (*serv
 }
 
 func (c *HTTPControlPlane) ListActiveManagedGroups(ctx context.Context) ([]service.Group, error) {
+	return c.listManagedGroups(ctx, true)
+}
+
+func (c *HTTPControlPlane) ListManagedUsers(ctx context.Context) ([]service.User, error) {
+	cursor := "0"
+	users := make([]service.User, 0)
+	seen := make(map[int64]struct{})
+	for page := 0; page < 100; page++ {
+		var response struct {
+			Users      []managedUserWire `json:"users"`
+			NextCursor *string           `json:"next_cursor"`
+		}
+		request := struct {
+			Cursor string `json:"cursor"`
+			Limit  int    `json:"limit"`
+		}{Cursor: cursor, Limit: managedListPageSize}
+		if err := c.post(ctx, "/v1/manage/users/list", request, &response); err != nil {
+			return nil, err
+		}
+		if response.Users == nil {
+			return nil, errors.New("invalid managed user list response: users array is required")
+		}
+		if len(response.Users) > managedListPageSize {
+			return nil, errors.New("invalid managed user list response: page too large")
+		}
+		previousID := cursor
+		for _, wire := range response.Users {
+			if !isCanonicalPositiveDecimal(wire.ID) || !decimalStringGreater(wire.ID, previousID) {
+				return nil, errors.New("invalid managed user list response: user order did not advance")
+			}
+			previousID = wire.ID
+			user, deleted, err := decodeManagedUser(wire)
+			if err != nil {
+				return nil, fmt.Errorf("invalid managed user list response: %w", err)
+			}
+			if _, exists := seen[user.ID]; exists {
+				return nil, errors.New("invalid managed user list response: duplicate user")
+			}
+			seen[user.ID] = struct{}{}
+			if !deleted {
+				users = append(users, *user)
+			}
+		}
+		if response.NextCursor == nil {
+			return users, nil
+		}
+		next := *response.NextCursor
+		if !isCanonicalPositiveDecimal(next) || !decimalStringGreater(next, cursor) {
+			return nil, errors.New("invalid managed user list response: cursor did not advance")
+		}
+		if len(response.Users) == 0 || next != previousID {
+			return nil, errors.New("invalid managed user list response: cursor does not match page")
+		}
+		cursor = next
+	}
+	return nil, errors.New("invalid managed user list response: too many pages")
+}
+
+func (c *HTTPControlPlane) ListManagedGroups(ctx context.Context) ([]service.Group, error) {
+	return c.listManagedGroups(ctx, false)
+}
+
+func (c *HTTPControlPlane) listManagedGroups(ctx context.Context, activeOnly bool) ([]service.Group, error) {
 	cursor := "0"
 	groups := make([]service.Group, 0)
 	seen := make(map[int64]struct{})
@@ -335,7 +408,10 @@ func (c *HTTPControlPlane) ListActiveManagedGroups(ctx context.Context) ([]servi
 				return nil, errors.New("invalid managed group list response: duplicate group")
 			}
 			seen[group.ID] = struct{}{}
-			if deleted || group.Status != service.StatusActive {
+			if deleted {
+				continue
+			}
+			if activeOnly && group.Status != service.StatusActive {
 				continue
 			}
 			if err := ensureManagedGroupInCurrentSlice(group); err != nil {

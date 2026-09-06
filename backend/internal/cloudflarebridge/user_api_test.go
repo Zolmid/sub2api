@@ -97,6 +97,28 @@ func (f *userAPIControlPlane) GetManagedUser(ctx context.Context, id int64) (*se
 	return f.GetAuthUserByID(ctx, id)
 }
 
+func (f *userAPIControlPlane) ListManagedUsers(context.Context) ([]service.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	users := make([]service.User, 0, len(f.users))
+	for _, user := range f.users {
+		if user.DeletedAt == nil {
+			users = append(users, *user)
+		}
+	}
+	return users, nil
+}
+
+func (f *userAPIControlPlane) ListManagedGroups(context.Context) ([]service.Group, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	groups := make([]service.Group, 0, len(f.groups))
+	for _, group := range f.groups {
+		groups = append(groups, *group)
+	}
+	return groups, nil
+}
+
 func (f *userAPIControlPlane) CreateManagedAPIKey(_ context.Context, key *service.APIKey) (*service.APIKey, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -206,7 +228,7 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 	require.NoError(t, user.SetPassword(password))
 	other := &service.User{ID: otherID, Email: "other@example.test", Username: "other", Status: service.StatusActive, Role: service.RoleUser, Concurrency: 1, Balance: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	require.NoError(t, other.SetPassword("other-password"))
-	group := &service.Group{ID: groupID, Name: "standard", Platform: service.PlatformOpenAI, Status: service.StatusActive, SubscriptionType: service.SubscriptionTypeStandard, Hydrated: true}
+	group := &service.Group{ID: groupID, Name: "standard", Platform: service.PlatformOpenAI, RateMultiplier: 1, Status: service.StatusActive, SubscriptionType: service.SubscriptionTypeStandard, Hydrated: true}
 	return &userAPIControlPlane{
 		fakeControlPlane: testControlPlane(),
 		users:            map[int64]*service.User{userID: user, otherID: other},
@@ -532,6 +554,90 @@ func TestCloudflareCurrentUserUsesJWTSubjectAndFailsClosed(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, missing.Code, missing.Body.String())
 	invalid := callJSON(t, handler, http.MethodGet, "/api/v1/auth/me", "not-a-token", "")
 	require.Equal(t, http.StatusUnauthorized, invalid.Code, invalid.Body.String())
+}
+
+func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	disabledGroupID := int64(9007199254741098)
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.groups[disabledGroupID] = &service.Group{ID: disabledGroupID, Name: "disabled", Platform: service.PlatformOpenAI, RateMultiplier: 1, Status: service.StatusDisabled, SubscriptionType: service.SubscriptionTypeStandard, Hydrated: true}
+	control.mu.Unlock()
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+
+	unauthenticated := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users", "", "")
+	require.Equal(t, http.StatusUnauthorized, unauthenticated.Code, unauthenticated.Body.String())
+	ordinaryToken := loginToken(t, handler, "other@example.test", "other-password")
+	ordinary := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users", ordinaryToken, "")
+	require.Equal(t, http.StatusForbidden, ordinary.Code, ordinary.Body.String())
+	adminToken := loginToken(t, handler, "user@example.test", password)
+
+	users := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?page=1&page_size=1&role=admin&include_subscriptions=true&sort_by=created_at&sort_order=desc", adminToken, "")
+	require.Equal(t, http.StatusOK, users.Code, users.Body.String())
+	var userEnvelope map[string]any
+	require.NoError(t, json.Unmarshal(users.Body.Bytes(), &userEnvelope))
+	data := userEnvelope["data"].(map[string]any)
+	items := data["items"].([]any)
+	require.Equal(t, int64(1), int64(data["total"].(float64)))
+	require.Equal(t, strconv.FormatInt(userID, 10), items[0].(map[string]any)["id"])
+	withoutSubscriptionExpansion := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?sort_by=balance&sort_order=desc", adminToken, "")
+	require.Equal(t, http.StatusOK, withoutSubscriptionExpansion.Code, withoutSubscriptionExpansion.Body.String())
+	explicitlyWithoutSubscriptions := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?include_subscriptions=false&sort_by=concurrency&sort_order=asc", adminToken, "")
+	require.Equal(t, http.StatusOK, explicitlyWithoutSubscriptions.Code, explicitlyWithoutSubscriptions.Body.String())
+
+	user := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users/9007199254740993", adminToken, "")
+	require.Equal(t, http.StatusOK, user.Code, user.Body.String())
+	groups := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups?status=active&sort_by=sort_order&sort_order=asc", adminToken, "")
+	require.Equal(t, http.StatusOK, groups.Code, groups.Body.String())
+	allGroups := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups/all?platform=openai", adminToken, "")
+	require.Equal(t, http.StatusOK, allGroups.Code, allGroups.Body.String())
+	group := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups/9007199254741097", adminToken, "")
+	require.Equal(t, http.StatusOK, group.Code, group.Body.String())
+	inactiveGroups := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups?status=inactive&sort_by=status&sort_order=asc", adminToken, "")
+	require.Equal(t, http.StatusOK, inactiveGroups.Code, inactiveGroups.Body.String())
+	var inactiveEnvelope map[string]any
+	require.NoError(t, json.Unmarshal(inactiveGroups.Body.Bytes(), &inactiveEnvelope))
+	inactiveItems := inactiveEnvelope["data"].(map[string]any)["items"].([]any)
+	require.Len(t, inactiveItems, 1)
+	require.Equal(t, strconv.FormatInt(disabledGroupID, 10), inactiveItems[0].(map[string]any)["id"])
+	require.Equal(t, "inactive", inactiveItems[0].(map[string]any)["status"])
+	require.Equal(t, float64(1), inactiveItems[0].(map[string]any)["rate_multiplier"])
+
+	invalidFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups?platform=anthropic", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, invalidFilter.Code, invalidFilter.Body.String())
+	unsupportedGroupFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?group_name=standard&include_subscriptions=true", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedGroupFilter.Code, unsupportedGroupFilter.Body.String())
+	unsupportedAttributeFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?attr%5B1%5D=company&include_subscriptions=true", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedAttributeFilter.Code, unsupportedAttributeFilter.Body.String())
+	unsupportedSort := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?include_subscriptions=true&sort_by=last_used_at&sort_order=desc", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedSort.Code, unsupportedSort.Body.String())
+	includeDeleted := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users/9007199254740993?include_deleted=true", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, includeDeleted.Code, includeDeleted.Body.String())
+	duplicateBoolean := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups/all?include_inactive=true&include_inactive=false", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, duplicateBoolean.Code, duplicateBoolean.Body.String())
+	mutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/users", adminToken, "{}")
+	require.Equal(t, http.StatusNotFound, mutation.Code, mutation.Body.String())
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users", nil)
+	request.Header.Set("x-api-key", "some-admin-key")
+	apiKeyResponse := httptest.NewRecorder()
+	handler.ServeHTTP(apiKeyResponse, request)
+	require.Equal(t, http.StatusUnauthorized, apiKeyResponse.Code, apiKeyResponse.Body.String())
+}
+
+func TestCloudflareSetupStatusIsCompletedAndReadOnly(t *testing.T) {
+	handler, err := NewHandler(testRuntimeConfig(t), testControlPlane(), &fakeHTTPUpstream{})
+	require.NoError(t, err)
+	status := callJSON(t, handler, http.MethodGet, "/setup/status", "", "")
+	require.Equal(t, http.StatusOK, status.Code, status.Body.String())
+	var envelope map[string]any
+	require.NoError(t, json.Unmarshal(status.Body.Bytes(), &envelope))
+	data := envelope["data"].(map[string]any)
+	require.Equal(t, false, data["needs_setup"])
+	require.Equal(t, "completed", data["step"])
+	mutation := callJSON(t, handler, http.MethodPost, "/setup/install", "", "{}")
+	require.Equal(t, http.StatusNotFound, mutation.Code, mutation.Body.String())
 }
 
 func TestCloudflareAPIKeyHTTPStatusAndNoOpCompatibility(t *testing.T) {

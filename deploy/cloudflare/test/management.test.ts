@@ -134,6 +134,39 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/groups/delete", { operation_id: "terminal-noop", id: scope.groupID })).status).toBe(409);
   });
 
+  it("replays browser group creates across candidate IDs and enforces live-name uniqueness", async () => {
+    const operationID = "browser-group-" + id();
+    const firstID = id();
+    const retryID = id();
+    const name = "browser-" + id();
+    const createRequest = {
+      operation_id: operationID,
+      id: firstID,
+      name,
+      platform: "openai",
+      status: "active",
+      is_exclusive: false,
+      subscription_type: "standard",
+    };
+
+    const createdResponse = await call("/v1/manage/groups/create", createRequest);
+    expect(createdResponse.status).toBe(200);
+    const created = await createdResponse.json<{ group: { id: string }; replayed: boolean }>();
+    expect(created).toMatchObject({ group: { id: firstID }, replayed: false });
+
+    const replayResponse = await call("/v1/manage/groups/create", { ...createRequest, id: retryID });
+    expect(replayResponse.status).toBe(200);
+    const replay = await replayResponse.json<{ group: { id: string }; replayed: boolean }>();
+    expect(replay).toMatchObject({ group: { id: firstID }, replayed: true });
+    expect(await env.DB.prepare("SELECT count(*) count FROM groups WHERE id=?").bind(retryID).first("count")).toBe(0);
+
+    expect((await call("/v1/manage/groups/create", { ...createRequest, id: retryID, name: name + "-changed" })).status).toBe(409);
+    expect((await call("/v1/manage/groups/create", { ...createRequest, operation_id: operationID + "-duplicate", id: retryID })).status).toBe(409);
+
+    expect((await call("/v1/manage/groups/delete", { operation_id: operationID + "-delete", id: firstID })).status).toBe(200);
+    expect((await call("/v1/manage/groups/create", { ...createRequest, operation_id: operationID + "-recreate", id: retryID })).status).toBe(200);
+  });
+
   it("does not change account_groups or record success when the primary account update affects zero rows", async () => {
     const scope = await createScope("zero-primary");
     expect((await call("/v1/manage/accounts/create", { operation_id: "zero-primary-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: "zero-primary-upstream", base_url: "https://mock.upstream" }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);

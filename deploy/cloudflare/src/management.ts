@@ -318,12 +318,65 @@ async function userMutation(env: Env, route: string, body: Record<string, unknow
 }
 
 async function groupMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
-  const create=route.endsWith("/create"); const remove=route.endsWith("/delete"); const keys=create?["operation_id","id","name","platform","status","is_exclusive","subscription_type"]:remove?["operation_id","id"]:["operation_id","id","name","platform","status","is_exclusive","subscription_type"];
-  if(!only(body,keys)||!id(body.id)) return error("INVALID_REQUEST"); const prior=await lookupOperation(env,route,operation,body);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getGroup(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,body,{group:old});return error("CONFLICT",409);} const stamp=now();
-  const group:Group=remove?{...old!,status:"disabled",deleted_at:stamp,updated_at:stamp}:{id:body.id,name:(body.name??old?.name)as string,platform:(body.platform??old?.platform)as string,status:(body.status??old?.status)as string,is_exclusive:(body.is_exclusive??old?.is_exclusive)as boolean,subscription_type:(body.subscription_type??old?.subscription_type)as string,created_at:old?.created_at??stamp,updated_at:stamp,deleted_at:old?.deleted_at??null};
-  if(!isBoundedString(group.name,100)||group.platform!=="openai"||group.subscription_type!=="standard"||!status(group.status)||typeof group.is_exclusive!=="boolean")return error("INVALID_REQUEST");
-  const statement=create?env.DB.prepare("INSERT INTO groups(id,name,platform,status,is_exclusive,subscription_type,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?)").bind(group.id,group.name,group.platform,group.status,group.is_exclusive?1:0,group.subscription_type,group.created_at,group.updated_at,group.deleted_at):env.DB.prepare("UPDATE groups SET name=?,platform=?,status=?,is_exclusive=?,subscription_type=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(group.name,group.platform,group.status,group.is_exclusive?1:0,group.subscription_type,group.updated_at,group.deleted_at,group.id);
-  return replyMutation(env,route,operation,body,{group},[statement]);
+  const create = route.endsWith("/create");
+  const remove = route.endsWith("/delete");
+  const keys = create
+    ? ["operation_id", "id", "name", "platform", "status", "is_exclusive", "subscription_type"]
+    : remove
+      ? ["operation_id", "id"]
+      : ["operation_id", "id", "name", "platform", "status", "is_exclusive", "subscription_type"];
+  if (!only(body, keys) || !id(body.id)) return error("INVALID_REQUEST");
+
+  // Browser retries generate a fresh candidate ID. The operation identity and
+  // semantic fields, not that disposable candidate, define a create replay.
+  const fingerprint = create ? { ...body, id: "browser-created" } : body;
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    if (prior.kind === "conflict") return error("CONFLICT", 409);
+    return json(create ? { ...prior.response, replayed: true } : prior.response);
+  }
+
+  const old = await getGroup(env, body.id);
+  if (create && old) return error("CONFLICT", 409);
+  if (!create && !old) return error("NOT_FOUND", 404);
+  if (old !== null && old.deleted_at !== null) {
+    if (remove) return replyNoopMutation(env, route, operation, fingerprint, { group: old });
+    return error("CONFLICT", 409);
+  }
+
+  const stamp = now();
+  const group: Group = remove
+    ? { ...old!, status: "disabled", deleted_at: stamp, updated_at: stamp }
+    : {
+        id: body.id,
+        name: (body.name ?? old?.name) as string,
+        platform: (body.platform ?? old?.platform) as string,
+        status: (body.status ?? old?.status) as string,
+        is_exclusive: (body.is_exclusive ?? old?.is_exclusive) as boolean,
+        subscription_type: (body.subscription_type ?? old?.subscription_type) as string,
+        created_at: old?.created_at ?? stamp,
+        updated_at: stamp,
+        deleted_at: old?.deleted_at ?? null,
+      };
+  if (
+    !isBoundedString(group.name, 100) ||
+    group.name.trim() !== group.name ||
+    group.platform !== "openai" ||
+    group.subscription_type !== "standard" ||
+    !status(group.status) ||
+    typeof group.is_exclusive !== "boolean"
+  ) return error("INVALID_REQUEST");
+
+  const statement = create
+    ? env.DB.prepare("INSERT INTO groups(id,name,platform,status,is_exclusive,subscription_type,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?)")
+        .bind(group.id, group.name, group.platform, group.status, group.is_exclusive ? 1 : 0, group.subscription_type, group.created_at, group.updated_at, group.deleted_at)
+    : env.DB.prepare("UPDATE groups SET name=?,platform=?,status=?,is_exclusive=?,subscription_type=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL")
+        .bind(group.name, group.platform, group.status, group.is_exclusive ? 1 : 0, group.subscription_type, group.updated_at, group.deleted_at, group.id);
+  if (create) {
+    const saved = await managedOperation(env, route, operation, fingerprint, { group }, [statement]);
+    return saved ? json({ ...saved.response, replayed: saved.replay }) : error("CONFLICT", 409);
+  }
+  return replyMutation(env, route, operation, fingerprint, { group }, [statement]);
 }
 
 async function activeKeyReferences(env: Env, value: APIKey) {

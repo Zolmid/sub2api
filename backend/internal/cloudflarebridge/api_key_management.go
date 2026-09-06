@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -48,19 +49,27 @@ type managedAPIKeyResponse struct {
 // caller builds its operation ID before entering this helper, so both attempts
 // carry the same idempotency identity and the Worker can replay a committed
 // result instead of applying the mutation twice.
-func (c *HTTPControlPlane) postManagedMutation(ctx context.Context, path string, input any, output *managedAPIKeyResponse) error {
-	var target any
-	if output != nil {
-		target = output
-	}
-	err := c.post(ctx, path, input, target)
+func (c *HTTPControlPlane) postManagedMutation(ctx context.Context, path string, input any, output any) error {
+	err := c.post(ctx, path, input, output)
 	if !shouldRecoverManagedMutation(ctx, err) {
 		return err
 	}
-	if output != nil {
-		*output = managedAPIKeyResponse{}
+	if err := resetManagedMutationOutput(output); err != nil {
+		return err
 	}
-	return c.post(ctx, path, input, target)
+	return c.post(ctx, path, input, output)
+}
+
+func resetManagedMutationOutput(output any) error {
+	if output == nil {
+		return nil
+	}
+	target := reflect.ValueOf(output)
+	if target.Kind() != reflect.Pointer || target.IsNil() {
+		return errors.New("managed mutation output must be a non-nil pointer")
+	}
+	target.Elem().Set(reflect.Zero(target.Elem().Type()))
+	return nil
 }
 
 func shouldRecoverManagedMutation(ctx context.Context, err error) bool {

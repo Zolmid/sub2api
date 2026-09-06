@@ -125,7 +125,27 @@ export async function getModelsListCandidates(
  * @returns Created group
  */
 export async function create(groupData: CreateGroupRequest): Promise<AdminGroup> {
-  const { data } = await apiClient.post<AdminGroup>('/admin/groups', groupData)
+  const scope = await createOperationScope(groupData)
+  const pending = scope
+    ? createOperationKeys.get(scope.storageKey) ?? getStoredCreateOperation(scope.storageKey)
+    : null
+  let idempotencyKey = pending && scope && pending.fingerprint === scope.fingerprint
+    ? pending.idempotencyKey
+    : null
+  if (!idempotencyKey) {
+    const requestID = newGroupRequestID()
+    idempotencyKey = `group-create-${scope?.adminID ?? 'unknown-admin'}-${requestID}`
+  }
+  if (scope) {
+    const operation = { fingerprint: scope.fingerprint, idempotencyKey }
+    createOperationKeys.set(scope.storageKey, operation)
+    storeCreateOperation(scope.storageKey, operation)
+  }
+
+  const { data } = await apiClient.post<AdminGroup>('/admin/groups', groupData, {
+    headers: { 'Idempotency-Key': idempotencyKey }
+  })
+  if (scope) clearCreateOperation(scope.storageKey, idempotencyKey)
   return data
 }
 
@@ -135,10 +155,22 @@ export async function create(groupData: CreateGroupRequest): Promise<AdminGroup>
  * so a retry replays the original operation instead of creating another group.
  */
 const duplicateOperationKeys = new Map<string, string>()
+const createOperationKeys = new Map<string, PendingCreateOperation>()
 
-interface DuplicateOperationScope {
+interface GroupOperationScope {
   adminID: string
   key: string
+}
+
+interface CreateOperationScope {
+  adminID: string
+  storageKey: string
+  fingerprint: string
+}
+
+interface PendingCreateOperation {
+  fingerprint: string
+  idempotencyKey: string
 }
 
 function getCurrentAdminID(): string | null {
@@ -150,14 +182,31 @@ function getCurrentAdminID(): string | null {
     if (typeof user !== 'object' || user === null) return null
 
     const id = (user as { id?: unknown }).id
-    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return null
-    return String(id)
+    if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) return String(id)
+    if (
+      typeof id === 'string' &&
+      /^[1-9][0-9]*$/.test(id) &&
+      (id.length < 19 || (id.length === 19 && id <= '9223372036854775807'))
+    ) return id
+    return null
   } catch {
     return null
   }
 }
 
-function duplicateOperationScope(id: number): DuplicateOperationScope | null {
+async function createOperationScope(groupData: CreateGroupRequest): Promise<CreateOperationScope | null> {
+  const adminID = getCurrentAdminID()
+  if (!adminID) return null
+
+  const fingerprint = await groupPayloadFingerprint(groupData)
+  return {
+    adminID,
+    storageKey: `sub2api:admin:group-create:${adminID}`,
+    fingerprint
+  }
+}
+
+function duplicateOperationScope(id: number): GroupOperationScope | null {
   const adminID = getCurrentAdminID()
   if (!adminID) return null
 
@@ -167,7 +216,7 @@ function duplicateOperationScope(id: number): DuplicateOperationScope | null {
   }
 }
 
-function getStoredDuplicateOperationKey(storageKey: string): string | null {
+function getStoredGroupOperationKey(storageKey: string): string | null {
   try {
     return globalThis.sessionStorage?.getItem(storageKey) ?? null
   } catch {
@@ -175,7 +224,7 @@ function getStoredDuplicateOperationKey(storageKey: string): string | null {
   }
 }
 
-function storeDuplicateOperationKey(storageKey: string, key: string | null): void {
+function storeGroupOperationKey(storageKey: string, key: string | null): void {
   try {
     if (key) globalThis.sessionStorage?.setItem(storageKey, key)
     else globalThis.sessionStorage?.removeItem(storageKey)
@@ -184,18 +233,103 @@ function storeDuplicateOperationKey(storageKey: string, key: string | null): voi
   }
 }
 
+function getStoredCreateOperation(storageKey: string): PendingCreateOperation | null {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(storageKey)
+    if (!raw) return null
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null) return null
+    const operation = value as Partial<PendingCreateOperation>
+    if (
+      typeof operation.fingerprint !== 'string' ||
+      operation.fingerprint.length < 1 ||
+      operation.fingerprint.length > 128 ||
+      typeof operation.idempotencyKey !== 'string' ||
+      operation.idempotencyKey.length < 1 ||
+      operation.idempotencyKey.length > 128 ||
+      !/^[\x21-\x7E]+$/.test(operation.idempotencyKey)
+    ) return null
+    return {
+      fingerprint: operation.fingerprint,
+      idempotencyKey: operation.idempotencyKey
+    }
+  } catch {
+    return null
+  }
+}
+
+function storeCreateOperation(storageKey: string, operation: PendingCreateOperation | null): void {
+  try {
+    if (operation) globalThis.sessionStorage?.setItem(storageKey, JSON.stringify(operation))
+    else globalThis.sessionStorage?.removeItem(storageKey)
+  } catch {
+    // In-memory retry protection still works when browser storage is unavailable.
+  }
+}
+
+function clearCreateOperation(storageKey: string, idempotencyKey: string): void {
+  if (createOperationKeys.get(storageKey)?.idempotencyKey === idempotencyKey) {
+    createOperationKeys.delete(storageKey)
+  }
+  if (getStoredCreateOperation(storageKey)?.idempotencyKey === idempotencyKey) {
+    storeCreateOperation(storageKey, null)
+  }
+}
+
+function canonicalGroupPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalGroupPayload)
+  if (typeof value !== 'object' || value === null) return value
+
+  const source = value as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+  for (const key of Object.keys(source).sort()) {
+    if (source[key] !== undefined) result[key] = canonicalGroupPayload(source[key])
+  }
+  return result
+}
+
+async function groupPayloadFingerprint(groupData: CreateGroupRequest): Promise<string> {
+  const encoded = new TextEncoder().encode(JSON.stringify(canonicalGroupPayload(groupData)))
+  if (globalThis.crypto?.subtle) {
+    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', encoded))
+    return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+
+  // Web Crypto is available in supported browsers. This deterministic fallback
+  // only scopes sessionStorage when a test or legacy runtime omits subtle.
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const byte of encoded) {
+    first = Math.imul(first ^ byte, 0x01000193)
+    second = Math.imul(second ^ byte, 0x85ebca6b)
+  }
+  return `${encoded.length.toString(16)}-${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`
+}
+
+let fallbackGroupRequestSequence = 0
+
+function newGroupRequestID(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  if (globalThis.crypto?.getRandomValues) {
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+  fallbackGroupRequestSequence += 1
+  return `${Date.now().toString(36)}-${fallbackGroupRequestSequence.toString(36)}`
+}
+
 export async function duplicate(id: number): Promise<AdminGroup> {
   const scope = duplicateOperationScope(id)
   let idempotencyKey = scope
-    ? duplicateOperationKeys.get(scope.key) ?? getStoredDuplicateOperationKey(scope.key)
+    ? duplicateOperationKeys.get(scope.key) ?? getStoredGroupOperationKey(scope.key)
     : null
   if (!idempotencyKey) {
-    const requestID = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const requestID = newGroupRequestID()
     idempotencyKey = `group-duplicate-${scope?.adminID ?? 'unknown-admin'}-${id}-${requestID}`
   }
   if (scope) {
     duplicateOperationKeys.set(scope.key, idempotencyKey)
-    storeDuplicateOperationKey(scope.key, idempotencyKey)
+    storeGroupOperationKey(scope.key, idempotencyKey)
   }
 
   const { data } = await apiClient.post<AdminGroup>(`/admin/groups/${id}/duplicate`, undefined, {
@@ -204,7 +338,7 @@ export async function duplicate(id: number): Promise<AdminGroup> {
 
   if (scope) {
     duplicateOperationKeys.delete(scope.key)
-    storeDuplicateOperationKey(scope.key, null)
+    storeGroupOperationKey(scope.key, null)
   }
   return data
 }

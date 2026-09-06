@@ -262,22 +262,30 @@ func decodeManagedGroup(wire managedGroupWire) (*service.Group, bool, error) {
 	if err != nil {
 		return nil, false, errors.New("invalid group deletion timestamp")
 	}
-	if strings.TrimSpace(wire.Name) == "" || len(wire.Name) > 100 || strings.TrimSpace(wire.Platform) == "" ||
+	if !validCloudflareGroupName(wire.Name) || strings.TrimSpace(wire.Platform) == "" ||
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.SubscriptionType != service.SubscriptionTypeStandard && wire.SubscriptionType != service.SubscriptionTypeSubscription) {
 		return nil, false, errors.New("invalid managed group response")
 	}
 	return &service.Group{
-		ID:               id,
-		Name:             wire.Name,
-		Platform:         wire.Platform,
-		RateMultiplier:   1,
-		Status:           wire.Status,
-		IsExclusive:      wire.IsExclusive,
-		SubscriptionType: wire.SubscriptionType,
-		Hydrated:         true,
-		CreatedAt:        createdAt,
-		UpdatedAt:        updatedAt,
+		ID:                           id,
+		Name:                         wire.Name,
+		Platform:                     wire.Platform,
+		RateMultiplier:               1,
+		Status:                       wire.Status,
+		IsExclusive:                  wire.IsExclusive,
+		SubscriptionType:             wire.SubscriptionType,
+		LongContextPricingEnabled:    true,
+		ImageRateMultiplier:          1,
+		BatchImageDiscountMultiplier: 0.5,
+		BatchImageHoldMultiplier:     0.6,
+		VideoRateMultiplier:          1,
+		PeakRateMultiplier:           1,
+		MCPXMLInject:                 true,
+		MaxReasoningEffortOverLimit:  service.ReasoningEffortOverLimitDowngrade,
+		Hydrated:                     true,
+		CreatedAt:                    createdAt,
+		UpdatedAt:                    updatedAt,
 	}, deletedAt != nil, nil
 }
 

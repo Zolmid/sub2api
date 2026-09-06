@@ -24,13 +24,18 @@ import (
 
 type userAPIControlPlane struct {
 	*fakeControlPlane
-	mu            sync.Mutex
-	users         map[int64]*service.User
-	groups        map[int64]*service.Group
-	accounts      map[int64]*ManagedAccount
-	keys          map[int64]*service.APIKey
-	raw           map[string]int64
-	nextCreatedID int64
+	mu                       sync.Mutex
+	users                    map[int64]*service.User
+	groups                   map[int64]*service.Group
+	deletedGroups            map[int64]bool
+	accounts                 map[int64]*ManagedAccount
+	keys                     map[int64]*service.APIKey
+	raw                      map[string]int64
+	groupOps                 map[string]*service.Group
+	nextCreatedID            int64
+	mismatchGroupCreate      bool
+	referenceGroupDelete     int64
+	lastGroupCreateOperation string
 }
 
 func resolvedTestUser(user *service.User) *service.User {
@@ -75,7 +80,7 @@ func (f *userAPIControlPlane) GetManagedGroup(_ context.Context, id int64) (*ser
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	group := f.groups[id]
-	if group == nil {
+	if group == nil || f.deletedGroups[id] {
 		return nil, service.ErrGroupNotFound
 	}
 	copy := *group
@@ -86,8 +91,8 @@ func (f *userAPIControlPlane) ListActiveManagedGroups(context.Context) ([]servic
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	result := make([]service.Group, 0, len(f.groups))
-	for _, group := range f.groups {
-		if group.Status == service.StatusActive {
+	for id, group := range f.groups {
+		if !f.deletedGroups[id] && group.Status == service.StatusActive {
 			result = append(result, *group)
 		}
 	}
@@ -114,10 +119,86 @@ func (f *userAPIControlPlane) ListManagedGroups(context.Context) ([]service.Grou
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	groups := make([]service.Group, 0, len(f.groups))
-	for _, group := range f.groups {
-		groups = append(groups, *group)
+	for id, group := range f.groups {
+		if !f.deletedGroups[id] {
+			groups = append(groups, *group)
+		}
 	}
 	return groups, nil
+}
+
+func (f *userAPIControlPlane) CreateManagedGroup(_ context.Context, operationID string, group *service.Group) (*service.Group, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastGroupCreateOperation = operationID
+	if replay := f.groupOps[operationID]; replay != nil {
+		copy := *replay
+		return &copy, true, nil
+	}
+	for id, existing := range f.groups {
+		if !f.deletedGroups[id] && existing.Name == group.Name {
+			return nil, false, service.ErrGroupExists
+		}
+	}
+	now := time.Now().UTC()
+	stored := *group
+	if f.mismatchGroupCreate {
+		stored.ID++
+	}
+	stored.Platform = service.PlatformOpenAI
+	stored.SubscriptionType = service.SubscriptionTypeStandard
+	stored.CreatedAt = now
+	stored.UpdatedAt = now
+	stored.Hydrated = true
+	f.groups[stored.ID] = &stored
+	f.deletedGroups[stored.ID] = false
+	f.groupOps[operationID] = &stored
+	copy := stored
+	return &copy, false, nil
+}
+
+func (f *userAPIControlPlane) UpdateManagedGroup(_ context.Context, _ string, id int64, update ManagedGroupUpdate) (*service.Group, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	group := f.groups[id]
+	if group == nil || f.deletedGroups[id] {
+		return nil, service.ErrGroupNotFound
+	}
+	if update.Name != nil {
+		group.Name = *update.Name
+	}
+	if update.Status != nil {
+		group.Status = *update.Status
+	}
+	if update.IsExclusive != nil {
+		group.IsExclusive = *update.IsExclusive
+	}
+	if update.Platform != nil {
+		group.Platform = *update.Platform
+	}
+	if update.SubscriptionType != nil {
+		group.SubscriptionType = *update.SubscriptionType
+	}
+	group.UpdatedAt = time.Now().UTC()
+	copy := *group
+	return &copy, nil
+}
+
+func (f *userAPIControlPlane) DeleteManagedGroup(_ context.Context, _ string, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.referenceGroupDelete == id {
+		return &controlPlaneResponseError{StatusCode: http.StatusConflict, Code: "REFERENCE_REJECTED"}
+	}
+	group := f.groups[id]
+	if group == nil || f.deletedGroups[id] {
+		return service.ErrGroupNotFound
+	}
+	now := time.Now().UTC()
+	group.Status = service.StatusDisabled
+	group.UpdatedAt = now
+	f.deletedGroups[id] = true
+	return nil
 }
 
 func (f *userAPIControlPlane) GetManagedAccount(_ context.Context, id int64) (*ManagedAccount, error) {
@@ -269,6 +350,7 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 		fakeControlPlane: testControlPlane(),
 		users:            map[int64]*service.User{userID: user, otherID: other},
 		groups:           map[int64]*service.Group{groupID: group},
+		deletedGroups:    map[int64]bool{},
 		accounts: map[int64]*ManagedAccount{
 			9007199254741993: {
 				ID: 9007199254741993, Name: "zeta", Platform: service.PlatformOpenAI,
@@ -294,6 +376,7 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 			9007199254740996: {ID: 9007199254740996, UserID: otherID, GroupID: &groupID, Name: "other", Status: service.StatusActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
 		},
 		raw:           map[string]int64{},
+		groupOps:      map[string]*service.Group{},
 		nextCreatedID: 9007199254741098,
 	}, password, userID, otherID
 }
@@ -745,6 +828,241 @@ func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(
 	require.Equal(t, http.StatusNotFound, tombstone.Code, tombstone.Body.String())
 	accountMutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/accounts", adminToken, "{}")
 	require.Equal(t, http.StatusNotFound, accountMutation.Code, accountMutation.Body.String())
+}
+
+func TestCloudflareAdminGroupMutationsRequireActiveAdminJWTAndUsePrivateControlPlane(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.mu.Unlock()
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+
+	createBody := `{
+		"name":"browser","description":"","platform":"openai","rate_multiplier":1,
+		"is_exclusive":false,"subscription_type":"standard","daily_limit_usd":null,
+		"weekly_limit_usd":null,"monthly_limit_usd":null,"long_context_pricing_enabled":true,
+		"force_openai_fast":false,"free_openai_fast":false,"model_pricing":[],
+		"allow_image_generation":false,"allow_batch_image_generation":false,
+		"image_rate_independent":false,"image_rate_multiplier":1,
+		"batch_image_discount_multiplier":0.5,"batch_image_hold_multiplier":0.6,
+		"image_price_1k":null,"image_price_2k":null,"image_price_4k":null,
+		"video_rate_independent":false,"video_rate_multiplier":1,"video_price_480p":null,
+		"video_price_720p":null,"video_price_1080p":null,"video_model_prices":{},
+		"web_search_price_per_call":null,"search_price_per_1k":null,
+		"audio_realtime_price_per_min":null,"audio_tts_price_per_million_chars":null,
+		"audio_stt_price_per_hour":null,"peak_rate_enabled":false,"peak_start":"",
+		"peak_end":"","peak_rate_multiplier":1,"profit_control_enabled":false,
+		"profit_min_margin":0,"profit_safety_buffer":0,"claude_code_only":false,
+		"fallback_group_id":null,"fallback_group_id_on_invalid_request":null,
+		"allow_messages_dispatch":false,"allow_live":false,"opus_mapped_model":"gpt-5.4",
+		"sonnet_mapped_model":"gpt-5.3-codex","haiku_mapped_model":"gpt-5.4-mini",
+		"exact_model_mappings":[],"require_oauth_only":false,"require_privacy_set":false,
+		"model_routing":{},"model_routing_enabled":false,"supported_model_scopes":[],
+		"mcp_xml_inject":true,"copy_accounts_from_group_ids":[],"rpm_limit":0,
+		"max_reasoning_effort":"","max_reasoning_effort_over_limit":"downgrade",
+		"reasoning_effort_mappings":[],"models_list_config":{"enabled":false,"models":[]},
+		"messages_dispatch_model_config":{"opus_mapped_model":"gpt-5.4","sonnet_mapped_model":"gpt-5.3-codex","haiku_mapped_model":"gpt-5.4-mini","exact_model_mappings":{}},
+		"codex_models_manifest_config":{"enabled":false,"account_ids":[],"fallback_to_scheduler":false}
+	}`
+	unauthenticated := callJSON(t, handler, http.MethodPost, "/api/v1/admin/groups", "", createBody)
+	require.Equal(t, http.StatusUnauthorized, unauthenticated.Code, unauthenticated.Body.String())
+	ordinaryToken := loginToken(t, handler, "other@example.test", "other-password")
+	ordinary := callJSON(t, handler, http.MethodPost, "/api/v1/admin/groups", ordinaryToken, createBody)
+	require.Equal(t, http.StatusForbidden, ordinary.Code, ordinary.Body.String())
+
+	adminToken := loginToken(t, handler, "user@example.test", password)
+	missingKey := callJSON(t, handler, http.MethodPost, "/api/v1/admin/groups", adminToken, createBody)
+	require.Equal(t, http.StatusBadRequest, missingKey.Code, missingKey.Body.String())
+	invalidKeyRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/groups", bytes.NewBufferString(createBody))
+	invalidKeyRequest.Header.Set("Content-Type", "application/json")
+	invalidKeyRequest.Header.Set("Authorization", "Bearer "+adminToken)
+	invalidKeyRequest.Header.Set("Idempotency-Key", strings.Repeat("x", 129))
+	invalidKey := httptest.NewRecorder()
+	handler.ServeHTTP(invalidKey, invalidKeyRequest)
+	require.Equal(t, http.StatusBadRequest, invalidKey.Code, invalidKey.Body.String())
+	require.Contains(t, invalidKey.Body.String(), "IDEMPOTENCY_KEY_INVALID")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/groups", bytes.NewBufferString(createBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Idempotency-Key", "group-create-browser")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, req)
+	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
+	var createdEnvelope struct {
+		Data struct {
+			ID               float64 `json:"id"`
+			Name             string  `json:"name"`
+			Platform         string  `json:"platform"`
+			Status           string  `json:"status"`
+			IsExclusive      bool    `json:"is_exclusive"`
+			SubscriptionType string  `json:"subscription_type"`
+			RateMultiplier   float64 `json:"rate_multiplier"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &createdEnvelope))
+	require.Greater(t, createdEnvelope.Data.ID, float64(0))
+	require.LessOrEqual(t, createdEnvelope.Data.ID, float64(maxJavaScriptSafeInteger))
+	require.Equal(t, "browser", createdEnvelope.Data.Name)
+	require.Equal(t, service.PlatformOpenAI, createdEnvelope.Data.Platform)
+	require.Equal(t, service.StatusActive, createdEnvelope.Data.Status)
+	require.Equal(t, service.SubscriptionTypeStandard, createdEnvelope.Data.SubscriptionType)
+	require.Equal(t, float64(1), createdEnvelope.Data.RateMultiplier)
+	firstOperation := control.lastGroupCreateOperation
+	require.NotEmpty(t, firstOperation)
+	require.True(t, strings.HasPrefix(firstOperation, "group-create:"+strconv.FormatInt(userID, 10)+":"), firstOperation)
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/groups", bytes.NewBufferString(createBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Idempotency-Key", "group-create-browser")
+	replayed := httptest.NewRecorder()
+	handler.ServeHTTP(replayed, req)
+	require.Equal(t, http.StatusOK, replayed.Code, replayed.Body.String())
+	var replayEnvelope struct {
+		Data struct {
+			ID float64 `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(replayed.Body.Bytes(), &replayEnvelope))
+	require.Equal(t, createdEnvelope.Data.ID, replayEnvelope.Data.ID)
+	require.Equal(t, firstOperation, control.lastGroupCreateOperation)
+
+	updatePath := "/api/v1/admin/groups/" + strconv.FormatInt(int64(createdEnvelope.Data.ID), 10)
+	updateBody := `{
+		"name":"renamed","description":"","platform":"openai","rate_multiplier":1,
+		"is_exclusive":true,"status":"inactive","subscription_type":"standard",
+		"daily_limit_usd":null,"weekly_limit_usd":null,"monthly_limit_usd":null,
+		"long_context_pricing_enabled":true,"model_pricing":[],"allow_image_generation":false,
+		"allow_batch_image_generation":false,"image_rate_independent":false,
+		"image_rate_multiplier":1,"batch_image_discount_multiplier":0.5,
+		"batch_image_hold_multiplier":0.6,"image_price_1k":-1,"image_price_2k":-1,
+		"image_price_4k":-1,"video_rate_independent":false,"video_rate_multiplier":1,
+		"video_price_480p":-1,"video_price_720p":-1,"video_price_1080p":-1,
+		"video_model_prices":{},"web_search_price_per_call":-1,"search_price_per_1k":-1,
+		"audio_realtime_price_per_min":-1,"audio_tts_price_per_million_chars":-1,
+		"audio_stt_price_per_hour":-1,"peak_rate_enabled":false,"peak_start":"",
+		"peak_end":"","peak_rate_multiplier":1,"profit_control_enabled":false,
+		"profit_min_margin":0,"profit_safety_buffer":0,"claude_code_only":false,
+		"fallback_group_id":0,"fallback_group_id_on_invalid_request":0,
+		"allow_messages_dispatch":false,"allow_live":false,"force_openai_fast":false,
+		"free_openai_fast":false,"opus_mapped_model":"gpt-5.4",
+		"sonnet_mapped_model":"gpt-5.3-codex","haiku_mapped_model":"gpt-5.4-mini",
+		"exact_model_mappings":[],"require_oauth_only":false,"require_privacy_set":false,
+		"model_routing":{},"model_routing_enabled":false,"supported_model_scopes":[],
+		"mcp_xml_inject":true,"copy_accounts_from_group_ids":[],"rpm_limit":0,
+		"max_reasoning_effort":"","max_reasoning_effort_over_limit":"downgrade",
+		"reasoning_effort_mappings":[],"models_list_config":{"enabled":false,"models":["gpt-5"]},
+		"messages_dispatch_model_config":{"opus_mapped_model":"gpt-5.4","sonnet_mapped_model":"gpt-5.3-codex","haiku_mapped_model":"gpt-5.4-mini","exact_model_mappings":{}},
+		"codex_models_manifest_config":{"enabled":false,"account_ids":[],"fallback_to_scheduler":false}
+	}`
+	updated := callJSON(t, handler, http.MethodPut, updatePath, adminToken, updateBody)
+	require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+	var updatedEnvelope struct {
+		Data struct {
+			ID          float64 `json:"id"`
+			Name        string  `json:"name"`
+			Status      string  `json:"status"`
+			IsExclusive bool    `json:"is_exclusive"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(updated.Body.Bytes(), &updatedEnvelope))
+	require.Equal(t, createdEnvelope.Data.ID, updatedEnvelope.Data.ID)
+	require.Equal(t, "renamed", updatedEnvelope.Data.Name)
+	require.Equal(t, "inactive", updatedEnvelope.Data.Status)
+	require.True(t, updatedEnvelope.Data.IsExclusive)
+	control.mu.Lock()
+	require.Equal(t, service.StatusDisabled, control.groups[int64(createdEnvelope.Data.ID)].Status)
+	control.mu.Unlock()
+
+	deleted := callJSON(t, handler, http.MethodDelete, updatePath, adminToken, "")
+	require.Equal(t, http.StatusOK, deleted.Code, deleted.Body.String())
+	afterDelete := callJSON(t, handler, http.MethodGet, updatePath, adminToken, "")
+	require.Equal(t, http.StatusNotFound, afterDelete.Code, afterDelete.Body.String())
+
+	publicWrite := callJSON(t, handler, http.MethodPost, "/api/v1/groups", adminToken, "{}")
+	require.Equal(t, http.StatusNotFound, publicWrite.Code, publicWrite.Body.String())
+}
+
+func TestCloudflareAdminGroupMutationPayloadBoundary(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.mu.Unlock()
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+	adminToken := loginToken(t, handler, "user@example.test", password)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"unknown", `{"name":"bad","unexpected":false}`},
+		{"unknown null", `{"name":"bad","unexpected":null}`},
+		{"unknown empty array", `{"name":"bad","unexpected":[]}`},
+		{"duplicate", `{"name":"bad","name":"again"}`},
+		{"trailing", `{"name":"bad"} []`},
+		{"malformed", `{"name":`},
+		{"bad type", `{"name":"bad","is_exclusive":"false"}`},
+		{"null supported bool", `{"name":"bad","is_exclusive":null}`},
+		{"null supported platform", `{"name":"bad","platform":null}`},
+		{"padded name", `{"name":" padded "}`},
+		{"legacy non-default", `{"name":"bad","rate_multiplier":2}`},
+		{"unsupported clear", `{"name":"bad","daily_limit_usd":0}`},
+		{"private status name", `{"name":"bad","status":"disabled"}`},
+		{"inactive create", `{"name":"bad","status":"inactive"}`},
+		{"unsupported behavior", `{"name":"bad","allow_messages_dispatch":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/groups", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			req.Header.Set("Idempotency-Key", "payload-"+tt.name)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		})
+	}
+
+	emptyUpdate := callJSON(t, handler, http.MethodPut, "/api/v1/admin/groups/9007199254741097", adminToken, `{}`)
+	require.Equal(t, http.StatusBadRequest, emptyUpdate.Code, emptyUpdate.Body.String())
+	explicitFalse := callJSON(t, handler, http.MethodPut, "/api/v1/admin/groups/9007199254741097", adminToken, `{"is_exclusive":false}`)
+	require.Equal(t, http.StatusOK, explicitFalse.Code, explicitFalse.Body.String())
+}
+
+func TestCloudflareAdminGroupMutationsFailClosedOnControlPlaneMismatches(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.referenceGroupDelete = 9007199254741097
+	control.mu.Unlock()
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+	adminToken := loginToken(t, handler, "user@example.test", password)
+
+	conflict := callJSON(t, handler, http.MethodDelete, "/api/v1/admin/groups/9007199254741097", adminToken, "")
+	require.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+
+	control.mu.Lock()
+	control.groups[9007199254741097].Platform = "anthropic"
+	control.referenceGroupDelete = 0
+	control.mu.Unlock()
+	update := callJSON(t, handler, http.MethodPut, "/api/v1/admin/groups/9007199254741097", adminToken, `{"name":"bad-readback"}`)
+	require.Equal(t, http.StatusInternalServerError, update.Code, update.Body.String())
+
+	control.mu.Lock()
+	control.groups[9007199254741097].Platform = service.PlatformOpenAI
+	control.mismatchGroupCreate = true
+	control.mu.Unlock()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/groups", bytes.NewBufferString(`{"name":"mismatched-create","platform":"openai"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Idempotency-Key", "mismatched-create")
+	create := httptest.NewRecorder()
+	handler.ServeHTTP(create, req)
+	require.Equal(t, http.StatusInternalServerError, create.Code, create.Body.String())
 }
 
 func TestCloudflareSetupStatusIsCompletedAndReadOnly(t *testing.T) {

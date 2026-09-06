@@ -7,14 +7,17 @@
     "types": "wrangler types",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "dry-run": "wrangler deploy --dry-run"
+    "dry-run": "wrangler deploy --dry-run",
+    "dev": "wrangler dev --config wrangler.local.jsonc",
+    "migrate:local": "wrangler d1 migrations apply sub2api-cloudflare-local --local --config wrangler.local.jsonc",
+    "fixture:local": "wrangler d1 execute sub2api-cloudflare-local --local --config wrangler.local.jsonc --file fixtures/local.sql"
   },
   "dependencies": {
     "@cloudflare/containers": "0.3.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",
-    "@cloudflare/workers-types": "5.20260906.1",
+    "@cloudflare/workers-types": "5.20260905.1",
     "typescript": "5.9.2",
     "vitest": "4.1.11",
     "wrangler": "4.129.0"

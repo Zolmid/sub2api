@@ -16,6 +16,7 @@ import (
 	"time"
 
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
+	"github.com/Wei-Shaw/sub2api/internal/cloudflarebridge"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -71,6 +72,13 @@ func main() {
 		if err := setup.RunCLI(); err != nil {
 			log.Fatalf("Setup failed: %v", err)
 		}
+		return
+	}
+
+	// Cloudflare mode has an explicit composition root and must not enter the
+	// setup/config path that initializes PostgreSQL and Redis.
+	if cloudflarebridge.EnabledFromEnv() {
+		runCloudflareServer()
 		return
 	}
 

@@ -151,4 +151,20 @@ func TestDetachUpstreamContextSemantics(t *testing.T) {
 		defer release()
 		require.NoError(t, detached.Err())
 	})
+
+	t.Run("cloudflare_lease_bound_context_keeps_cancel_for_detached_helper", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(WithCloudflareLeaseBoundUpstreamContext(context.Background()))
+		cancel()
+		same, release := detachUpstreamContext(ctx)
+		defer release()
+		require.ErrorIs(t, same.Err(), context.Canceled)
+	})
+
+	t.Run("cloudflare_lease_bound_context_keeps_cancel_for_stream_helper", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(WithCloudflareLeaseBoundUpstreamContext(context.Background()))
+		cancel()
+		same, release := detachStreamUpstreamContext(ctx, true)
+		defer release()
+		require.ErrorIs(t, same.Err(), context.Canceled)
+	})
 }

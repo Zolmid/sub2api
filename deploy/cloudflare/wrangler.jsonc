@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sub2api-cloudflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "vars": { "ENVIRONMENT": "local", "ALLOW_TEST_FIXTURE": "false" },
+  "containers": [
+    {
+      "class_name": "Sub2APIContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1,
+      "instance_type": "standard-1"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" },
+      { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] }],
+  "d1_databases": [{ "binding": "DB", "database_name": "sub2api-cloudflare", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }],
+  "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
+  "queues": {
+    "producers": [{ "binding": "USAGE_QUEUE", "queue": "sub2api-usage" }],
+    "consumers": [{ "queue": "sub2api-usage", "max_batch_size": 20, "max_retries": 5, "dead_letter_queue": "sub2api-usage-dlq" }]
+  },
+  "triggers": { "crons": ["*/2 * * * *"] }
+}

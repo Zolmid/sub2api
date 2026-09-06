@@ -2,6 +2,7 @@
 package middleware
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"strings"
@@ -18,7 +19,27 @@ func NewAdminAuthMiddleware(
 	settingService *service.SettingService,
 	auditService *service.AuditLogService,
 ) AdminAuthMiddleware {
-	return AdminAuthMiddleware(adminAuth(authService, userService, settingService, auditService))
+	return NewAdminAuthMiddlewareWithReader(authService, userService, settingService, auditService)
+}
+
+// AdminUserReader is the user persistence subset required by admin
+// authentication. It intentionally excludes the rest of UserService so an
+// alternate deployment backend can validate JWT and admin-key identities
+// without PostgreSQL or Redis construction.
+type AdminUserReader interface {
+	JWTUserReader
+	GetFirstAdmin(ctx context.Context) (*service.User, error)
+}
+
+// NewAdminAuthMiddlewareWithReader preserves the traditional middleware path
+// while exposing a narrow composition seam for alternate persistence backends.
+func NewAdminAuthMiddlewareWithReader(
+	authService *service.AuthService,
+	userReader AdminUserReader,
+	settingService *service.SettingService,
+	auditService *service.AuditLogService,
+) AdminAuthMiddleware {
+	return AdminAuthMiddleware(adminAuth(authService, userReader, settingService, auditService))
 }
 
 // adminAuth 管理员认证中间件实现
@@ -27,7 +48,7 @@ func NewAdminAuthMiddleware(
 // 2. JWT Token: Authorization: Bearer <jwt-token> (需要管理员角色)
 func adminAuth(
 	authService *service.AuthService,
-	userService *service.UserService,
+	userService AdminUserReader,
 	settingService *service.SettingService,
 	auditService *service.AuditLogService,
 ) gin.HandlerFunc {
@@ -122,8 +143,12 @@ func validateAdminAPIKey(
 	c *gin.Context,
 	key string,
 	settingService *service.SettingService,
-	userService *service.UserService,
+	userService AdminUserReader,
 ) bool {
+	if settingService == nil || userService == nil {
+		AbortWithError(c, 401, "INVALID_ADMIN_KEY", "Invalid admin API key")
+		return false
+	}
 	storedKey, err := settingService.GetAdminAPIKey(c.Request.Context())
 	if err != nil {
 		AbortWithError(c, 500, "INTERNAL_ERROR", "Internal server error")
@@ -158,7 +183,7 @@ func validateJWTForAdmin(
 	c *gin.Context,
 	token string,
 	authService *service.AuthService,
-	userService *service.UserService,
+	userService JWTUserReader,
 	settingService *service.SettingService,
 	auditService *service.AuditLogService,
 ) bool {

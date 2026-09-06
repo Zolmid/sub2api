@@ -123,6 +123,35 @@ func TestAdminAuthJWTValidatesTokenVersion(t *testing.T) {
 	})
 }
 
+func TestAdminAuthWithReaderFailsClosedForUnavailableAdminKeyStore(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", ExpireHour: 1}}
+	authService := service.NewAuthService(nil, nil, nil, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+	reader := &stubAdminUserReader{}
+
+	router := gin.New()
+	router.Use(gin.HandlerFunc(NewAdminAuthMiddlewareWithReader(authService, reader, nil, nil)))
+	router.GET("/t", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	request := httptest.NewRequest(http.MethodGet, "/t", nil)
+	request.Header.Set("x-api-key", "unavailable-store-must-not-pass")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	require.Contains(t, response.Body.String(), "INVALID_ADMIN_KEY")
+}
+
+type stubAdminUserReader struct{}
+
+func (*stubAdminUserReader) GetByID(context.Context, int64) (*service.User, error) {
+	return nil, service.ErrUserNotFound
+}
+
+func (*stubAdminUserReader) GetFirstAdmin(context.Context) (*service.User, error) {
+	return nil, service.ErrUserNotFound
+}
+
 type stubUserRepo struct {
 	getByID func(ctx context.Context, id int64) (*service.User, error)
 }

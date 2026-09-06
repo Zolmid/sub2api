@@ -165,6 +165,36 @@ func TestJWTAuth_ValidToken_TouchesLastActive(t *testing.T) {
 	require.Equal(t, []int64{1}, toucher.userIDs)
 }
 
+func TestJWTAuth_WithReaderDoesNotRequireUserService(t *testing.T) {
+	user := &service.User{
+		ID:                   7,
+		Email:                "reader@example.com",
+		Role:                 service.RoleUser,
+		Status:               service.StatusActive,
+		Concurrency:          2,
+		TokenVersion:         9,
+		TokenVersionResolved: true,
+	}
+	cfg := &config.Config{}
+	cfg.JWT.Secret = "test-jwt-secret-32bytes-long!!!"
+	cfg.JWT.AccessTokenExpireMinutes = 60
+	reader := &stubJWTUserRepo{users: map[int64]*service.User{user.ID: user}}
+	authSvc := service.NewAuthService(nil, reader, nil, nil, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	router := gin.New()
+	router.Use(gin.HandlerFunc(NewJWTAuthMiddlewareWithReader(authSvc, reader, nil, nil, nil)))
+	router.GET("/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	token, err := authSvc.GenerateToken(context.Background(), user)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+}
+
 func TestJWTAuth_MissingAuthorizationHeader(t *testing.T) {
 	router, _ := newJWTTestEnv(nil)
 

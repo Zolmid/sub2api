@@ -17,22 +17,39 @@ func NewJWTAuthMiddleware(
 	settingService *service.SettingService,
 	auditService *service.AuditLogService,
 ) JWTAuthMiddleware {
-	return JWTAuthMiddleware(jwtAuth(authService, userService, userService, settingService, auditService))
+	return NewJWTAuthMiddlewareWithReader(authService, userService, userService, settingService, auditService)
 }
 
-type jwtUserReader interface {
+// JWTUserReader is the narrow persistence boundary required to validate an
+// access token. Alternate deployment modes can provide it without constructing
+// the full UserService dependency graph.
+type JWTUserReader interface {
 	GetByID(ctx context.Context, id int64) (*service.User, error)
 }
 
-type userActivityToucher interface {
+// UserActivityToucher is optional best-effort activity persistence performed
+// after successful authentication.
+type UserActivityToucher interface {
 	TouchLastActiveForUser(ctx context.Context, user *service.User)
+}
+
+// NewJWTAuthMiddlewareWithReader preserves the existing JWT behavior while
+// allowing an alternate repository-backed user reader at the composition root.
+func NewJWTAuthMiddlewareWithReader(
+	authService *service.AuthService,
+	userReader JWTUserReader,
+	activityToucher UserActivityToucher,
+	settingService *service.SettingService,
+	auditService *service.AuditLogService,
+) JWTAuthMiddleware {
+	return JWTAuthMiddleware(jwtAuth(authService, userReader, activityToucher, settingService, auditService))
 }
 
 // jwtAuth JWT认证中间件实现
 func jwtAuth(
 	authService *service.AuthService,
-	userService jwtUserReader,
-	activityToucher userActivityToucher,
+	userService JWTUserReader,
+	activityToucher UserActivityToucher,
 	settingService *service.SettingService,
 	auditService *service.AuditLogService,
 ) gin.HandlerFunc {

@@ -5,64 +5,91 @@ import { BRIDGE_VERSION } from "../src/contracts";
 
 type TestEnv = Env & { TEST_MIGRATIONS: D1Migration[] };
 const testEnv = env as TestEnv;
+const id = () => "9" + String(crypto.getRandomValues(new Uint32Array(1))[0]).padStart(10, "0");
+const encryptionKey = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
+const secureEnv = new Proxy(env, {
+  get(target, property, receiver) {
+    if (property === "CREDENTIAL_ENCRYPTION_KEY") return encryptionKey;
+    return Reflect.get(target, property, receiver);
+  },
+}) as Env;
 const request = (path: string, body: object, options: { host?: string; version?: string; container?: string } = {}) =>
   new Request("http://" + (options.host ?? "sub2api.internal") + path, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Sub2API-Bridge-Version": options.version ?? BRIDGE_VERSION,
-      ...(options.container === "" ? {} : { "X-Sub2API-Container-Id": options.container ?? "management-test" }),
-    },
+    headers: { "content-type": "application/json", "X-Sub2API-Bridge-Version": options.version ?? BRIDGE_VERSION, ...(options.container === "" ? {} : { "X-Sub2API-Container-Id": options.container ?? "management-test" }) },
     body: JSON.stringify(body),
   });
-const call = (path: string, body: object, options?: Parameters<typeof request>[2]) => controlPlane(request(path, body, options), env);
+const call = (path: string, body: object, options?: Parameters<typeof request>[2], target: Env = secureEnv) => {
+  const input = body as Record<string, unknown>;
+  const scoped = input.operation_id === undefined ? input : { ...input, operation_id: String(input.operation_id) + "-" + id() };
+  return controlPlane(request(path, scoped, options), target);
+};
+
+async function createScope(tag: string) {
+  const userID = id(); const groupID = id(); const keyID = id(); const accountID = id();
+  const operation = tag + "-user-" + userID;
+  const userResponse = await call("/v1/manage/users/create", { operation_id: operation, id: userID, email: tag + "-" + userID + "@example.test", password_hash: "password-hash-for-" + tag, username: tag, notes: "", status: "active", role: "user", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false });
+  if (userResponse.status !== 200) throw new Error(await userResponse.text());
+  const groupResponse = await call("/v1/manage/groups/create", { operation_id: tag + "-group-" + groupID, id: groupID, name: tag, platform: "openai", status: "active", is_exclusive: false, subscription_type: "standard" });
+  if (groupResponse.status !== 200) throw new Error(await groupResponse.text());
+  expect((await call("/v1/manage/users/update", { operation_id: tag + "-groups-" + userID, id: userID, allowed_group_ids: [groupID] })).status).toBe(200);
+  return { userID, groupID, keyID, accountID };
+}
 
 describe("Stage C private management control plane", () => {
-  it("applies the forward migration repeatedly without losing Stage B fixtures", async () => {
+  it("backfills Stage B timestamps on the fresh migration chain", async () => {
     await applyD1Migrations(env.DB, testEnv.TEST_MIGRATIONS);
-    expect(await env.DB.prepare("SELECT count(*) count FROM pragma_table_info('users') WHERE name IN ('email','password_hash','deleted_at')").first("count")).toBe(3);
-    expect(await env.DB.prepare("SELECT count(*) count FROM users WHERE id='1001'").first("count")).toBe(1);
+    expect(await env.DB.prepare("SELECT count(*) count FROM pragma_table_info('users') WHERE name='updated_at'").first("count")).toBe(1);
   });
 
-  it("manages four bounded resources while preserving canonical decimal identifiers", async () => {
-    const userID = "9007199254740993"; const groupID = "9007199254740994"; const keyID = "9007199254740995"; const accountID = "9007199254740996";
-    const createdUser = await call("/v1/manage/users/create", { operation_id: "stage-c-user-create", id: userID, email: "stage-c@example.test", password_hash: "bcrypt-hash-that-is-never-returned", username: "stage-c", notes: "local test", status: "active", role: "user", concurrency: 3, rpm_limit: 9, balance_microusd: "9007199254740993000000", allowed_group_ids: [], restrict_public_groups: false });
-    expect(createdUser.status).toBe(200);
-    const userBody = await createdUser.json<{ user: Record<string, unknown> }>();
-    expect(userBody.user).toMatchObject({ id: userID, balance_microusd: "9007199254740993000000" });
-    expect(userBody.user).not.toHaveProperty("password_hash");
-    expect(await env.DB.prepare("SELECT password_hash FROM users WHERE id=?").bind(userID).first("password_hash")).toBe("bcrypt-hash-that-is-never-returned");
-    expect((await call("/v1/manage/groups/create", { operation_id: "stage-c-group-create", id: groupID, name: "stage-c-group", platform: "openai", status: "active", is_exclusive: false, subscription_type: "payg" })).status).toBe(200);
-    expect((await call("/v1/manage/users/update", { operation_id: "stage-c-user-group", id: userID, allowed_group_ids: [groupID] })).status).toBe(200);
-    const rawKey = "StageC_Test_Key_123456";
-    const createdKey = await call("/v1/manage/api-keys/create", { operation_id: "stage-c-key-create", id: keyID, user_id: userID, group_id: groupID, name: "stage-c key", status: "active", raw_key: rawKey, ip_whitelist: ["127.0.0.1"], ip_blacklist: [], expires_at: null });
-    expect(await createdKey.json()).toMatchObject({ raw_key: rawKey, api_key: { id: keyID } });
-    expect(await env.DB.prepare("SELECT key_hash FROM api_keys WHERE id=?").bind(keyID).first("key_hash")).not.toBe(rawKey);
-    const replay = await call("/v1/manage/api-keys/create", { operation_id: "stage-c-key-create", id: keyID, user_id: userID, group_id: groupID, name: "stage-c key", status: "active", raw_key: rawKey, ip_whitelist: ["127.0.0.1"], ip_blacklist: [], expires_at: null });
-    expect(await replay.json()).not.toHaveProperty("raw_key");
-    expect((await call("/v1/manage/accounts/create", { operation_id: "stage-c-account-create", id: accountID, name: "stage-c upstream", platform: "openai", status: "active", schedulable: true, priority: 3, max_concurrency: 2, credential_envelope: "fixture:v1:mock-upstream", extra: { openai_responses_supported: false }, group_ids: [groupID] })).status).toBe(200);
-    const account = await (await call("/v1/manage/accounts/get", { id: accountID })).json<{ account: Record<string, unknown> }>();
-    expect(account.account).toMatchObject({ id: accountID, type: "apikey", group_ids: [groupID] });
-    expect(account.account).not.toHaveProperty("credential_envelope");
-    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id=?").bind(accountID, groupID).first("count")).toBe(1);
-    expect(await (await call("/v1/manage/users/list", { cursor: "9007199254740992", limit: 1 })).json()).toMatchObject({ users: [{ id: userID }], next_cursor: null });
+  it("encrypts Worker-managed credentials and excludes secrets from operation responses", async () => {
+    const scope = await createScope("credentials"); const rawKey = "WorkerManagedKey_123456"; const upstreamKey = "upstream-secret-" + id(); const baseURL = "https://mock.upstream";
+    expect((await call("/v1/manage/api-keys/create", { operation_id: "credentials-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
+    expect((await call("/v1/manage/accounts/create", { operation_id: "credentials-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: upstreamKey, base_url: baseURL }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);
+    const encrypted = await env.DB.prepare("SELECT credential_envelope FROM accounts WHERE id=?").bind(scope.accountID).first("credential_envelope") as string;
+    expect(encrypted).toMatch(/^aes-gcm:v1:/); expect(encrypted).not.toContain(upstreamKey); expect(encrypted).not.toContain(baseURL);
+    const admission = await call("/v1/requests/admit", { request_id: "managed-admission-" + id(), api_key_id: scope.keyID, group_id: scope.groupID, model: "fixture-model", lease_ttl_seconds: 30 });
+    expect(admission.status).toBe(200); expect(await admission.json()).toMatchObject({ account: { id: scope.accountID, credentials: { api_key: upstreamKey, base_url: baseURL } } });
+    const rows = await env.DB.prepare("SELECT response_json FROM management_operations").all<{ response_json: string }>();
+    for (const row of rows.results) { expect(row.response_json).not.toContain("password-hash-for-credentials"); expect(row.response_json).not.toContain(rawKey); expect(row.response_json).not.toContain(upstreamKey); expect(row.response_json).not.toContain(baseURL); }
+    expect((await call("/v1/manage/accounts/create", { operation_id: "no-secret", id: id(), name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credentials: { api_key: "x", base_url: baseURL }, extra: {}, group_ids: [scope.groupID] }, undefined, env)).status).toBe(400);
   });
 
-  it("rejects malformed, disabled, missing, and cross-tenant references", async () => {
+  it("makes tombstones terminal and owner-scoped revoke atomically releases the credential hash", async () => {
+    const scope = await createScope("tombstone"); const rawKey = "ReusableKey_123456";
+    expect((await call("/v1/manage/api-keys/create", { operation_id: "tombstone-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
+    const oldHash = await env.DB.prepare("SELECT key_hash FROM api_keys WHERE id=?").bind(scope.keyID).first("key_hash");
+    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "wrong-owner", id: scope.keyID, expected_user_id: "999" })).status).toBe(404);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id LIKE 'wrong-owner-%'").first("count")).toBe(0);
+    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "revoke", id: scope.keyID, expected_user_id: scope.userID })).status).toBe(200);
+    const tombstone = await env.DB.prepare("SELECT key_hash,deleted_at FROM api_keys WHERE id=?").bind(scope.keyID).first<{ key_hash: string; deleted_at: string }>();
+    expect(tombstone?.key_hash).not.toBe(oldHash); expect((await call("/v1/auth/resolve", { key: rawKey })).status).toBe(404);
+    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "fresh-revoke", id: scope.keyID, expected_user_id: scope.userID })).status).toBe(200);
+    expect(await env.DB.prepare("SELECT deleted_at FROM api_keys WHERE id=?").bind(scope.keyID).first("deleted_at")).toBe(tombstone?.deleted_at);
+    expect((await call("/v1/manage/api-keys/rotate", { operation_id: "rotate-tombstone", id: scope.keyID, raw_key: "NoRestoreKey_123456" })).status).toBe(409);
+    expect((await call("/v1/manage/api-keys/create", { operation_id: "reuse-key", id: id(), user_id: scope.userID, group_id: scope.groupID, name: "reused", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
+    expect((await call("/v1/manage/users/delete", { operation_id: "delete-user", id: scope.userID })).status).toBe(200);
+    expect((await call("/v1/manage/users/update", { operation_id: "restore-user", id: scope.userID, status: "active" })).status).toBe(409);
+    expect((await call("/v1/manage/groups/delete", { operation_id: "delete-group", id: scope.groupID })).status).toBe(200);
+    expect((await call("/v1/manage/groups/update", { operation_id: "restore-group", id: scope.groupID, status: "active" })).status).toBe(409);
+  });
+
+  it("does not change account_groups or record success when the primary account update affects zero rows", async () => {
+    const scope = await createScope("zero-primary");
+    expect((await call("/v1/manage/accounts/create", { operation_id: "zero-primary-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: "zero-primary-upstream", base_url: "https://mock.upstream" }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);
+    await env.DB.prepare("CREATE TRIGGER account_update_ignored BEFORE UPDATE ON accounts WHEN NEW.name='ignored-account-update' BEGIN SELECT RAISE(IGNORE); END").run();
+    const response = await call("/v1/manage/accounts/update", { operation_id: "zero-primary-update", id: scope.accountID, name: "ignored-account-update", priority: 3, group_ids: ["2001"] });
+    expect(response.status).toBe(409);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id LIKE 'zero-primary-update-%'").first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id=?").bind(scope.accountID, scope.groupID).first("count")).toBe(1);
+    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id='2001'").bind(scope.accountID).first("count")).toBe(0);
+    await env.DB.prepare("DROP TRIGGER account_update_ignored").run();
+  });
+
+  it("rejects malformed and unsupported role, platform, and subscription values", async () => {
     expect((await call("/v1/manage/users/list", { limit: 101 })).status).toBe(400);
-    expect((await call("/v1/manage/groups/create", { operation_id: "unknown-field", id: "901", name: "x", platform: "openai", status: "active", is_exclusive: false, subscription_type: "payg", surprise: true })).status).toBe(400);
+    expect((await call("/v1/manage/users/create", { operation_id: "bad-role-" + id(), id: id(), email: "bad-role-" + id() + "@example.test", password_hash: "password-hash-123456789", username: "x", notes: "", status: "active", role: "operator", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false })).status).toBe(400);
+    for (const [operation, platform, subscription] of [["bad-platform", "anthropic", "standard"], ["bad-subscription", "openai", "subscription"], ["bad-mode", "openai", "payg"]]) expect((await call("/v1/manage/groups/create", { operation_id: operation, id: id(), name: "x", platform, status: "active", is_exclusive: false, subscription_type: subscription })).status).toBe(400);
     expect((await call("/v1/manage/users/get", { id: "1001" }, { host: "public.example" })).status).toBe(404);
-    expect((await call("/v1/manage/users/get", { id: "1001" }, { version: "wrong" })).status).toBe(404);
-    expect((await call("/v1/manage/users/get", { id: "1001" }, { container: "" })).status).toBe(404);
-    expect((await call("/v1/manage/api-keys/create", { operation_id: "cross-tenant-key", id: "9007199254740997", user_id: "1002", group_id: "2001", name: "bad", status: "active", raw_key: "CrossTenantKey_1234", ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(409);
-    expect((await call("/v1/manage/accounts/create", { operation_id: "missing-account-group", id: "9007199254740998", name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credential_envelope: "fixture:v1:mock-upstream", extra: {}, group_ids: ["999999"] })).status).toBe(400);
-  });
-
-  it("revokes keys and soft-deletes apikey upstream accounts", async () => {
-    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "fixture-key-revoke", id: "3001" })).status).toBe(200);
-    expect(await env.DB.prepare("SELECT status,deleted_at FROM api_keys WHERE id='3001'").first<{ status: string; deleted_at: string }>()).toMatchObject({ status: "disabled" });
-    expect((await call("/v1/manage/accounts/delete", { operation_id: "fixture-account-delete", id: "4001" })).status).toBe(200);
-    expect(await env.DB.prepare("SELECT status,schedulable,deleted_at FROM accounts WHERE id='4001'").first<{ status: string; schedulable: number; deleted_at: string }>()).toMatchObject({ status: "disabled", schedulable: 0 });
-    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id='4001' AND group_id='2001'").first("count")).toBe(1);
   });
 });

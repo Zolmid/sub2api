@@ -10,7 +10,7 @@ group-bound `apikey` accounts; safe-integer-exceeding decimal IDs; D1 migration
 replay; request fencing; malformed and cross-tenant references; one-time raw
 key responses; hash-only persistence; and revoke/soft-delete behavior.
 
-The suite currently passes 6 files / 31 tests. Containers are not emulated by
+The suite currently passes 6 files / 32 tests. Containers are not emulated by
 the Vitest pool, so Docker build, private HTTP/HTTPS interception, SSE, idle wake,
 two-process concurrency and process-death recovery are separately exercised with
 real local `wrangler dev`. Neither layer is treated as remote Cloudflare proof.

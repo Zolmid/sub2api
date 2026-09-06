@@ -16,6 +16,13 @@ ALTER TABLE api_keys ADD COLUMN deleted_at TEXT;
 ALTER TABLE accounts ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE accounts ADD COLUMN deleted_at TEXT;
 
+-- Existing Stage B rows must expose a real timestamp immediately after the
+-- forward migration. New rows write both timestamps in the control plane.
+UPDATE users SET updated_at=created_at WHERE updated_at='';
+UPDATE groups SET updated_at=created_at WHERE updated_at='';
+UPDATE api_keys SET updated_at=created_at WHERE updated_at='';
+UPDATE accounts SET updated_at=created_at WHERE updated_at='';
+
 -- Empty legacy rows are deliberately excluded until an explicit management
 -- operation populates them; raw password hashes are write-only protocol input.
 CREATE UNIQUE INDEX users_email_live_idx

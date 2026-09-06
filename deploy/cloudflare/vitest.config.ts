@@ -29,6 +29,7 @@ export default defineConfig({
   test: {
     pool: cloudflarePool(workerOptions),
     setupFiles: ["./test/setup.ts"],
+    fileParallelism: false,
     testTimeout: 10_000,
   },
 });

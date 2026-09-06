@@ -1,4 +1,5 @@
 import type { Completion, UsageEnvelope } from "./contracts";
+import { decryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
 import { managementControlPlane } from "./management";
 import {
   BRIDGE_VERSION,
@@ -25,12 +26,7 @@ type RuntimeEnv = Omit<
   | "ENVIRONMENT"
   | "ALLOW_TEST_FIXTURE"
   | "SUB2API_CF_UPSTREAM_ALLOWED_HOSTS"
-> & {
-  ENVIRONMENT: string;
-  ALLOW_TEST_FIXTURE: string;
-  SUB2API_CF_UPSTREAM_ALLOWED_HOSTS: string;
-  CREDENTIAL_ENCRYPTION_KEY?: string;
-};
+> & CredentialRuntime;
 
 type Alias = {
   alias: string;
@@ -183,7 +179,8 @@ async function fetchAuthRowByHash(hash: string, env: Env): Promise<AuthRow | nul
      FROM api_keys k
      JOIN users u ON u.id=k.user_id
      LEFT JOIN groups g ON g.id=k.group_id
-     WHERE k.key_hash=?`,
+     WHERE k.key_hash=? AND k.deleted_at IS NULL AND u.deleted_at IS NULL
+       AND g.deleted_at IS NULL`,
   )
     .bind(hash)
     .first<AuthRow>();
@@ -215,7 +212,8 @@ async function fetchAuthRowByID(keyID: string, env: Env): Promise<AuthRow | null
      FROM api_keys k
      JOIN users u ON u.id=k.user_id
      LEFT JOIN groups g ON g.id=k.group_id
-     WHERE k.id=?`,
+     WHERE k.id=? AND k.deleted_at IS NULL AND u.deleted_at IS NULL
+       AND g.deleted_at IS NULL`,
   )
     .bind(keyID)
     .first<AuthRow>();
@@ -332,7 +330,8 @@ async function touchAPIKey(request: Request, env: Env): Promise<Response> {
   const usedAt = new Date(body.used_at).toISOString();
   await env.DB.prepare(
     `UPDATE api_keys SET last_used_at=?
-     WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)`,
+     WHERE id=? AND deleted_at IS NULL
+       AND (last_used_at IS NULL OR last_used_at<?)`,
   )
     .bind(usedAt, body.api_key_id, usedAt)
     .run();
@@ -375,120 +374,11 @@ async function resolveAlias(model: string, env: Env): Promise<Alias | null> {
   return authoritative;
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const decoded = atob(value);
-  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
-}
-
-function allowedUpstreamHosts(env: RuntimeEnv): string[] {
-  return env.SUB2API_CF_UPSTREAM_ALLOWED_HOSTS.split(",")
-    .map((host) => host.trim().toLowerCase().replace(/\.$/, ""))
-    .filter(
-      (host, index, values) =>
-        host.length > 0 &&
-        host.length <= 253 &&
-        !/[/?#@]/.test(host) &&
-        values.indexOf(host) === index,
-    );
-}
-
-function hostMatches(pattern: string, hostname: string): boolean {
-  if (pattern.startsWith("*.")) {
-    const suffix = pattern.slice(2);
-    return hostname.length > suffix.length && hostname.endsWith(`.${suffix}`);
-  }
-  return pattern === hostname;
-}
-
-function validateCredentials(
-  candidate: unknown,
-  env: RuntimeEnv,
-): Record<string, string> | null {
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-    return null;
-  }
-  const value = candidate as Record<string, unknown>;
-  if (
-    !isBoundedString(value.api_key, 16_384) ||
-    !isBoundedString(value.base_url, 2_048)
-  ) {
-    return null;
-  }
-
-  try {
-    const url = new URL(value.base_url);
-    const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
-    if (
-      url.protocol !== "https:" ||
-      url.username !== "" ||
-      url.password !== "" ||
-      url.search !== "" ||
-      url.hash !== "" ||
-      !allowedUpstreamHosts(env).some((host) => hostMatches(host, hostname))
-    ) {
-      return null;
-    }
-    return { api_key: value.api_key, base_url: url.toString().replace(/\/$/, "") };
-  } catch {
-    return null;
-  }
-}
-
 async function decryptCredentials(
   envelope: string,
   env: Env,
 ): Promise<Record<string, string> | null> {
-  const runtime = env as unknown as RuntimeEnv;
-  if (
-    runtime.ENVIRONMENT === "local" &&
-    runtime.ALLOW_TEST_FIXTURE === "true" &&
-    envelope === "fixture:v1:mock-upstream"
-  ) {
-    return validateCredentials(
-      {
-        api_key: "fixture-upstream-token",
-        base_url: "https://mock.upstream",
-      },
-      runtime,
-    );
-  }
-
-  const parts = envelope.split(":");
-  if (
-    parts.length !== 4 ||
-    parts[0] !== "aes-gcm" ||
-    parts[1] !== "v1" ||
-    !runtime.CREDENTIAL_ENCRYPTION_KEY
-  ) {
-    return null;
-  }
-
-  try {
-    const keyBytes = decodeBase64(runtime.CREDENTIAL_ENCRYPTION_KEY);
-    const iv = decodeBase64(parts[2]);
-    const ciphertext = decodeBase64(parts[3]);
-    if (keyBytes.byteLength !== 32 || iv.byteLength !== 12 || ciphertext.byteLength < 17) {
-      return null;
-    }
-    const key = await crypto.subtle.importKey(
-      "raw",
-      keyBytes,
-      "AES-GCM",
-      false,
-      ["decrypt"],
-    );
-    const cleartext = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      key,
-      ciphertext,
-    );
-    return validateCredentials(
-      JSON.parse(new TextDecoder().decode(cleartext)),
-      runtime,
-    );
-  } catch {
-    return null;
-  }
+  return decryptAPIKeyCredentials(envelope, env as unknown as RuntimeEnv);
 }
 
 function parseObject(value: string): Record<string, unknown> | null {
@@ -581,9 +471,10 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
      WHERE ag.group_id=?
        AND a.status='active'
        AND a.schedulable=1
+       AND a.deleted_at IS NULL
        AND a.platform='openai'
        AND a.type='apikey'
-     ORDER BY a.priority DESC,a.id ASC
+     ORDER BY a.priority ASC,a.id ASC
      LIMIT 1`,
   )
     .bind(body.group_id)

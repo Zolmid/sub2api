@@ -1,7 +1,7 @@
 -- Fixture-only data. "fixture-test-key" is intentionally non-production and its SHA-256 is known.
 INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at) VALUES ('1001','active','user',1,'1000000','["2001"]',0,'2026-09-06T00:00:00Z');
 INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at) VALUES ('1002','disabled','user',1,'1000000','[]',0,'2026-09-06T00:00:00Z');
-INSERT INTO groups(id,name,platform,status,is_exclusive,subscription_type,created_at) VALUES ('2001','fixture-group','openai','active',0,'payg','2026-09-06T00:00:00Z');
+INSERT INTO groups(id,name,platform,status,is_exclusive,subscription_type,created_at) VALUES ('2001','fixture-group','openai','active',0,'standard','2026-09-06T00:00:00Z');
 INSERT INTO api_keys(id,user_id,group_id,name,status,key_hash,ip_whitelist_json,ip_blacklist_json,expires_at,last_used_at,created_at) VALUES ('3001','1001','2001','fixture active','active','40829bc3c826ce7293feb726994f7f21b24d66e85f4f79e3696e994b9047853c','[]','[]',NULL,NULL,'2026-09-06T00:00:00Z');
 INSERT INTO api_keys(id,user_id,group_id,name,status,key_hash,ip_whitelist_json,ip_blacklist_json,expires_at,last_used_at,created_at) VALUES ('3002','1002','2001','fixture disabled user','active','7c456932e32fd1036a6e6d818baba84828bfa5d066db0e65d99a96dd628c2707','[]','[]',NULL,NULL,'2026-09-06T00:00:00Z');
 INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at) VALUES ('4001','fixture mock','openai','apikey','active',1,10,1,'fixture:v1:mock-upstream','{"openai_responses_supported":false,"force_raw_chat_completions":true}','2026-09-06T00:00:00Z');

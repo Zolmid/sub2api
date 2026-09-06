@@ -254,6 +254,20 @@ describe("D1-backed private control plane", () => {
     await release(fallback, failedKV);
   });
 
+  it("chooses the smallest group-account priority and excludes deleted rows", async () => {
+    await env.DB.prepare("INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at) VALUES('4002','lower priority','openai','apikey','active',1,1,1,'fixture:v1:mock-upstream','{}','now','now')").run();
+    await env.DB.prepare("INSERT INTO account_groups(account_id,group_id) VALUES('4002','2001')").run();
+    const selected = await admit("request-priority-smallest");
+    expect(selected.account.id).toBe("4002");
+    await release(selected);
+    await env.DB.prepare("UPDATE accounts SET deleted_at='now' WHERE id='4002'").run();
+    const fallback = await admit("request-priority-deleted");
+    expect(fallback.account.id).toBe("4001");
+    await release(fallback);
+    await env.DB.prepare("UPDATE api_keys SET deleted_at='now' WHERE id='3001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+  });
+
   it("atomically finalizes once, accepts zero counters, and audits conflicts", async () => {
     const targetEnv = failingQueueEnv();
     const admission = await admit("request-completion-idempotent", targetEnv);

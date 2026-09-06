@@ -12,17 +12,20 @@ Stage C adds a private management protocol for the Go Cloudflare adapter. It is
 not a public API: every call is `POST` to `sub2api.internal`, with
 `X-Sub2API-Bridge-Version: 2026-09-06.v1` and a Container identity header.
 The explicit routes are `/v1/manage/{users,groups,api-keys,accounts}/{create,get,list,update,delete}`;
-API keys also provide `revoke` and `rotate`. Account routes manage only
-upstream accounts whose type is `apikey`. Accounts remain bound to groups by
+API keys also provide `revoke` and `rotate`. This slice accepts only `user` and
+`admin` roles, `openai` groups with `standard` subscription type, and upstream
+accounts whose type is `apikey` and platform is `openai`. Accounts remain bound to groups by
 the existing `account_groups` table, and admission continues selecting from
 the key's group-bound account candidates. There is no per-API-key account
 association.
 
 All IDs and `balance_microusd` values are canonical decimal strings. Mutation
 requests require an `operation_id`, reject unknown fields, and are replay-safe.
-User `password_hash`, API-key raw values, account credential envelopes, and
+User `password_hash`, API-key raw values, account credentials/envelopes, and
 stored hashes are write-only: get/list responses never include them. A raw API
-key is returned only by the first successful create or rotate response.
+key is returned only by the first successful create or rotate response. Account
+create/update accepts write-only `{ api_key, base_url }`; the Worker validates
+the allowed host and encrypts it with `CREDENTIAL_ENCRYPTION_KEY` before D1 write.
 
 HTTPS egress interception is enabled for the fixture host. At runtime the Container passes `SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt` so Go trusts Cloudflare's ephemeral interception CA; that file is not copied into the image.
 

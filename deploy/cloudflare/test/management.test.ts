@@ -20,9 +20,7 @@ const request = (path: string, body: object, options: { host?: string; version?:
     body: JSON.stringify(body),
   });
 const call = (path: string, body: object, options?: Parameters<typeof request>[2], target: Env = secureEnv) => {
-  const input = body as Record<string, unknown>;
-  const scoped = input.operation_id === undefined ? input : { ...input, operation_id: String(input.operation_id) + "-" + id() };
-  return controlPlane(request(path, scoped, options), target);
+  return controlPlane(request(path, body, options), target);
 };
 
 async function createScope(tag: string) {
@@ -60,10 +58,12 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/api-keys/create", { operation_id: "tombstone-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
     const oldHash = await env.DB.prepare("SELECT key_hash FROM api_keys WHERE id=?").bind(scope.keyID).first("key_hash");
     expect((await call("/v1/manage/api-keys/revoke", { operation_id: "wrong-owner", id: scope.keyID, expected_user_id: "999" })).status).toBe(404);
-    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id LIKE 'wrong-owner-%'").first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id='wrong-owner'").first("count")).toBe(0);
     expect((await call("/v1/manage/api-keys/revoke", { operation_id: "revoke", id: scope.keyID, expected_user_id: scope.userID })).status).toBe(200);
     const tombstone = await env.DB.prepare("SELECT key_hash,deleted_at FROM api_keys WHERE id=?").bind(scope.keyID).first<{ key_hash: string; deleted_at: string }>();
     expect(tombstone?.key_hash).not.toBe(oldHash); expect((await call("/v1/auth/resolve", { key: rawKey })).status).toBe(404);
+    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "revoke", id: scope.keyID, expected_user_id: scope.userID })).status).toBe(200);
+    expect((await call("/v1/manage/api-keys/revoke", { operation_id: "revoke", id: scope.keyID, expected_user_id: "999" })).status).toBe(409);
     expect((await call("/v1/manage/api-keys/revoke", { operation_id: "fresh-revoke", id: scope.keyID, expected_user_id: scope.userID })).status).toBe(200);
     expect(await env.DB.prepare("SELECT deleted_at FROM api_keys WHERE id=?").bind(scope.keyID).first("deleted_at")).toBe(tombstone?.deleted_at);
     expect((await call("/v1/manage/api-keys/rotate", { operation_id: "rotate-tombstone", id: scope.keyID, raw_key: "NoRestoreKey_123456" })).status).toBe(409);
@@ -74,13 +74,34 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/groups/update", { operation_id: "restore-group", id: scope.groupID, status: "active" })).status).toBe(409);
   });
 
+  it("replays stable operation IDs and rejects conflicting reuse after tombstones", async () => {
+    const scope = await createScope("replay"); const rawKey = "ReplayKey_123456789";
+    const keyRequest = { operation_id: "replay-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null };
+    expect(await (await call("/v1/manage/api-keys/create", keyRequest)).json()).toMatchObject({ raw_key: rawKey, api_key: { id: scope.keyID } });
+    const replay = await (await call("/v1/manage/api-keys/create", keyRequest)).json<Record<string, unknown>>();
+    expect(replay).toMatchObject({ api_key: { id: scope.keyID } }); expect(replay).not.toHaveProperty("raw_key");
+    expect((await call("/v1/manage/api-keys/create", { ...keyRequest, name: "different" })).status).toBe(409);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id='replay-key'").first("count")).toBe(1);
+
+    expect((await call("/v1/manage/users/delete", { operation_id: "delete-user-first", id: scope.userID })).status).toBe(200);
+    const deletedAt = await env.DB.prepare("SELECT deleted_at FROM users WHERE id=?").bind(scope.userID).first("deleted_at");
+    const terminalRequest = { operation_id: "terminal-noop", id: scope.userID };
+    expect((await call("/v1/manage/users/delete", terminalRequest)).status).toBe(200);
+    expect((await call("/v1/manage/users/delete", terminalRequest)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT deleted_at FROM users WHERE id=?").bind(scope.userID).first("deleted_at")).toBe(deletedAt);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id='terminal-noop'").first("count")).toBe(1);
+
+    expect((await call("/v1/manage/groups/delete", { operation_id: "delete-group-first", id: scope.groupID })).status).toBe(200);
+    expect((await call("/v1/manage/groups/delete", { operation_id: "terminal-noop", id: scope.groupID })).status).toBe(409);
+  });
+
   it("does not change account_groups or record success when the primary account update affects zero rows", async () => {
     const scope = await createScope("zero-primary");
     expect((await call("/v1/manage/accounts/create", { operation_id: "zero-primary-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: "zero-primary-upstream", base_url: "https://mock.upstream" }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);
     await env.DB.prepare("CREATE TRIGGER account_update_ignored BEFORE UPDATE ON accounts WHEN NEW.name='ignored-account-update' BEGIN SELECT RAISE(IGNORE); END").run();
     const response = await call("/v1/manage/accounts/update", { operation_id: "zero-primary-update", id: scope.accountID, name: "ignored-account-update", priority: 3, group_ids: ["2001"] });
     expect(response.status).toBe(409);
-    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id LIKE 'zero-primary-update-%'").first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id='zero-primary-update'").first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id=?").bind(scope.accountID, scope.groupID).first("count")).toBe(1);
     expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id='2001'").bind(scope.accountID).first("count")).toBe(0);
     await env.DB.prepare("DROP TRIGGER account_update_ignored").run();

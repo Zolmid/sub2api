@@ -167,19 +167,47 @@ async function managedOperation(
     return stored ? { response: stored, replay: true } : null;
   }
 }
-async function replayOperation(
+type OperationLookup =
+  | { kind: "replay"; response: Record<string, unknown> }
+  | { kind: "conflict" }
+  | null;
+async function lookupOperation(
   env: Env, route: string, operation: string, fingerprint: unknown,
-): Promise<Record<string, unknown> | null> {
+): Promise<OperationLookup> {
   const requestHash = await sha256(canonical(fingerprint));
   const prior = await env.DB.prepare(
     "SELECT route,request_hash,response_json FROM management_operations WHERE operation_id=?",
   ).bind(operation).first<{ route: string; request_hash: string; response_json: string }>();
-  if (!prior || prior.route !== route || prior.request_hash !== requestHash) return null;
-  return parsedObject(prior.response_json);
+  if (!prior) return null;
+  if (prior.route !== route || prior.request_hash !== requestHash) return { kind: "conflict" };
+  const response = parsedObject(prior.response_json);
+  return response ? { kind: "replay", response } : { kind: "conflict" };
+}
+async function recordNoopOperation(
+  env: Env, route: string, operation: string, fingerprint: unknown,
+  response: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  const requestHash = await sha256(canonical(fingerprint));
+  try {
+    await env.DB.prepare(
+      "INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) VALUES(?,?,?,?,?)",
+    ).bind(operation, route, requestHash, canonical(response), now()).run();
+    return response;
+  } catch {
+    const prior = await env.DB.prepare(
+      "SELECT route,request_hash,response_json FROM management_operations WHERE operation_id=?",
+    ).bind(operation).first<{ route: string; request_hash: string; response_json: string }>();
+    if (prior?.route !== route || prior.request_hash !== requestHash) return null;
+    return parsedObject(prior.response_json);
+  }
 }
 async function replyMutation(env: Env, route: string, operation: string, fingerprint: unknown, response: Record<string, unknown>, statements: D1PreparedStatement[]) {
   const saved = await managedOperation(env, route, operation, fingerprint, response, statements);
   return saved ? json(saved.response) : error("CONFLICT", 409);
+}
+async function replyNoopMutation(env: Env, route: string, operation: string, fingerprint: unknown, response: Record<string, unknown>) {
+  const saved = await recordNoopOperation(env, route, operation, fingerprint, response);
+  return saved ? json(saved) : error("CONFLICT", 409);
 }
 
 export async function managementControlPlane(request: Request, env: Env, route: string): Promise<Response> {
@@ -238,15 +266,16 @@ async function userMutation(env: Env, route: string, body: Record<string, unknow
   const create = route.endsWith("/create"); const remove = route.endsWith("/delete");
   const keys = create ? ["operation_id","id","email","password_hash","username","notes","status","role","concurrency","rpm_limit","balance_microusd","allowed_group_ids","restrict_public_groups"] : remove ? ["operation_id","id"] : ["operation_id","id","email","password_hash","username","notes","status","role","concurrency","rpm_limit","balance_microusd","allowed_group_ids","restrict_public_groups"];
   if (!only(body,keys) || !id(body.id)) return error("INVALID_REQUEST");
+  const fingerprint = body.password_hash === undefined
+    ? body
+    : { ...body, password_hash: "sha256:" + await sha256(String(body.password_hash)) };
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) return prior.kind === "replay" ? json(prior.response) : error("CONFLICT", 409);
   const old = await getUser(env,body.id);
-  if (create && old) {
-    const raw = body.password_hash;
-    const replay = await replayOperation(env,route,operation,{...body,password_hash:raw === undefined ? undefined : "sha256:" + await sha256(String(raw))});
-    return replay ? json(replay) : error("CONFLICT",409);
-  }
+  if (create && old) return error("CONFLICT",409);
   if (!create && !old) return error("NOT_FOUND",404);
   if (old !== null && old.deleted_at !== null) {
-    if (remove) return json({ user: old });
+    if (remove) return replyNoopMutation(env, route, operation, fingerprint, { user: old });
     return error("CONFLICT",409);
   }
   const stamp = now();
@@ -262,16 +291,13 @@ async function userMutation(env: Env, route: string, body: Record<string, unknow
   if (!email(user.email) || !isBoundedString(user.username,100,0) || !isBoundedString(user.notes,4096,0) || !status(user.status) || !roles.has(user.role) || !Number.isInteger(user.concurrency) || user.concurrency < 1 || user.concurrency > 100000 || !Number.isInteger(user.rpm_limit) || user.rpm_limit < 0 || user.rpm_limit > 1000000 || !isCanonicalUnsignedDecimal(user.balance_microusd) || user.balance_microusd.length > 40 || !groups || typeof user.restrict_public_groups !== "boolean" || (password !== undefined && !isBoundedString(password,255,20)) || (create && !isBoundedString(password,255,20)) || !(await groupsExist(env,groups))) return error("INVALID_REQUEST");
   user.allowed_group_ids=groups;
   const response={user};
-  const fingerprint = password === undefined
-    ? body
-    : { ...body, password_hash: "sha256:" + await sha256(password) };
   const statement=create ? env.DB.prepare("INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(user.id,user.status,user.role,user.concurrency,user.balance_microusd,sqlJSON(groups),user.restrict_public_groups?1:0,user.created_at,user.email,password ?? "",user.username,user.notes,user.rpm_limit,user.updated_at,user.deleted_at) : env.DB.prepare("UPDATE users SET email=?,password_hash=COALESCE(?,password_hash),username=?,notes=?,status=?,role=?,concurrency=?,rpm_limit=?,balance_microusd=?,allowed_group_ids_json=?,restrict_public_groups=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(user.email,password ?? null,user.username,user.notes,user.status,user.role,user.concurrency,user.rpm_limit,user.balance_microusd,sqlJSON(groups),user.restrict_public_groups?1:0,user.updated_at,user.deleted_at,user.id);
   return replyMutation(env,route,operation,fingerprint,response,[statement]);
 }
 
 async function groupMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   const create=route.endsWith("/create"); const remove=route.endsWith("/delete"); const keys=create?["operation_id","id","name","platform","status","is_exclusive","subscription_type"]:remove?["operation_id","id"]:["operation_id","id","name","platform","status","is_exclusive","subscription_type"];
-  if(!only(body,keys)||!id(body.id)) return error("INVALID_REQUEST"); const old=await getGroup(env,body.id); if(create&&old){const replay=await replayOperation(env,route,operation,body);return replay?json(replay):error("CONFLICT",409);}if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return json({group:old});return error("CONFLICT",409);} const stamp=now();
+  if(!only(body,keys)||!id(body.id)) return error("INVALID_REQUEST"); const prior=await lookupOperation(env,route,operation,body);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getGroup(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,body,{group:old});return error("CONFLICT",409);} const stamp=now();
   const group:Group=remove?{...old!,status:"disabled",deleted_at:stamp,updated_at:stamp}:{id:body.id,name:(body.name??old?.name)as string,platform:(body.platform??old?.platform)as string,status:(body.status??old?.status)as string,is_exclusive:(body.is_exclusive??old?.is_exclusive)as boolean,subscription_type:(body.subscription_type??old?.subscription_type)as string,created_at:old?.created_at??stamp,updated_at:stamp,deleted_at:old?.deleted_at??null};
   if(!isBoundedString(group.name,100)||group.platform!=="openai"||group.subscription_type!=="standard"||!status(group.status)||typeof group.is_exclusive!=="boolean")return error("INVALID_REQUEST");
   const statement=create?env.DB.prepare("INSERT INTO groups(id,name,platform,status,is_exclusive,subscription_type,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?)").bind(group.id,group.name,group.platform,group.status,group.is_exclusive?1:0,group.subscription_type,group.created_at,group.updated_at,group.deleted_at):env.DB.prepare("UPDATE groups SET name=?,platform=?,status=?,is_exclusive=?,subscription_type=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(group.name,group.platform,group.status,group.is_exclusive?1:0,group.subscription_type,group.updated_at,group.deleted_at,group.id);
@@ -284,7 +310,7 @@ async function activeKeyReferences(env: Env, value: APIKey) {
 }
 async function keyMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   const create=route.endsWith("/create");const rotate=route.endsWith("/rotate");const revoke=route.endsWith("/revoke");const keys=create?["operation_id","id","user_id","group_id","name","status","raw_key","ip_whitelist","ip_blacklist","expires_at"]:rotate?["operation_id","id","raw_key"]:revoke?["operation_id","id","expected_user_id"]:["operation_id","id","name","status","ip_whitelist","ip_blacklist","expires_at"];
-  if(!only(body,keys)||!id(body.id)||(body.expected_user_id!==undefined&&!id(body.expected_user_id)))return error("INVALID_REQUEST");const old=await getKey(env,body.id);if(create&&old){const raw=body.raw_key;const replay=await replayOperation(env,route,operation,{...body,raw_key:"sha256:"+await sha256(String(raw))});return replay?json(replay):error("CONFLICT",409);}if(!create&&!old)return error("NOT_FOUND",404);if(revoke&&body.expected_user_id!==undefined&&old!.user_id!==body.expected_user_id)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(revoke)return json({api_key:old});return error("CONFLICT",409);}if((create||rotate)&&(!isBoundedString(body.raw_key,128,16)||!/^[A-Za-z0-9_-]+$/.test(body.raw_key)))return error("INVALID_REQUEST");
+  if(!only(body,keys)||!id(body.id)||(body.expected_user_id!==undefined&&!id(body.expected_user_id)))return error("INVALID_REQUEST");const fingerprint=(create||rotate)?{...body,raw_key:"sha256:"+await sha256(String(body.raw_key))}:body;const prior=await lookupOperation(env,route,operation,fingerprint);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getKey(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(revoke&&body.expected_user_id!==undefined&&old!.user_id!==body.expected_user_id)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(revoke)return replyNoopMutation(env,route,operation,fingerprint,{api_key:old});return error("CONFLICT",409);}if((create||rotate)&&(!isBoundedString(body.raw_key,128,16)||!/^[A-Za-z0-9_-]+$/.test(body.raw_key)))return error("INVALID_REQUEST");
   if(rotate){const rawKey=body.raw_key as string;const hash=await sha256(rawKey);const duplicate=await env.DB.prepare("SELECT id FROM api_keys WHERE key_hash=? AND id<>?").bind(hash,body.id).first();if(duplicate)return error("CONFLICT",409);const response={api_key:old!};const saved=await managedOperation(env,route,operation,{...body,raw_key:"sha256:"+hash},response,[env.DB.prepare("UPDATE api_keys SET key_hash=?,updated_at=? WHERE id=? AND deleted_at IS NULL").bind(hash,now(),body.id)]);return saved?json({...saved.response,...(saved.replay?{}:{raw_key:rawKey})}):error("CONFLICT",409);}
   const stamp=now();
   if(revoke){const api_key:APIKey={...old!,status:"disabled",deleted_at:stamp,updated_at:stamp};const tombstone=await sha256("api-key-tombstone:"+crypto.randomUUID());const expected=body.expected_user_id;const statement=expected===undefined?env.DB.prepare("UPDATE api_keys SET key_hash=?,status='disabled',updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(tombstone,stamp,stamp,api_key.id):env.DB.prepare("UPDATE api_keys SET key_hash=?,status='disabled',updated_at=?,deleted_at=? WHERE id=? AND user_id=? AND deleted_at IS NULL").bind(tombstone,stamp,stamp,api_key.id,expected);return replyMutation(env,route,operation,body,{api_key},[statement]);}
@@ -296,15 +322,12 @@ async function keyMutation(env: Env, route: string, body: Record<string, unknown
 
 async function accountMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   const create=route.endsWith("/create");const remove=route.endsWith("/delete");const keys=create?["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"]:remove?["operation_id","id"]:["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"];
-  if(!only(body,keys)||!id(body.id))return error("INVALID_REQUEST");const old=await getAccount(env,body.id);const credentials=body.credentials;if(create&&old){const replay=await replayOperation(env,route,operation,{...body,credentials:credentials===undefined?undefined:"sha256:"+await sha256(canonical(credentials))});return replay?json(replay):error("CONFLICT",409);}if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return json({account:old});return error("CONFLICT",409);}const stamp=now();const groups=stringArray(body.group_ids??old?.group_ids,100,true);
+  if(!only(body,keys)||!id(body.id))return error("INVALID_REQUEST");const credentials=body.credentials;const fingerprint=credentials===undefined?body:{...body,credentials:"sha256:"+await sha256(canonical(credentials))};const prior=await lookupOperation(env,route,operation,fingerprint);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getAccount(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,fingerprint,{account:old});return error("CONFLICT",409);}const stamp=now();const groups=stringArray(body.group_ids??old?.group_ids,100,true);
   if(remove){const account:Account={...old!,status:"disabled",schedulable:false,deleted_at:stamp,updated_at:stamp};return replyMutation(env,route,operation,body,{account},[env.DB.prepare("UPDATE accounts SET status='disabled',schedulable=0,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(stamp,stamp,account.id)]);}
   const account:Account={id:body.id,name:(body.name??old?.name)as string,platform:(body.platform??old?.platform)as string,type:"apikey",status:(body.status??old?.status)as string,schedulable:(body.schedulable??old?.schedulable)as boolean,priority:(body.priority??old?.priority)as number,max_concurrency:(body.max_concurrency??old?.max_concurrency)as number,extra:(body.extra??old?.extra)as Record<string,unknown>,group_ids:groups??[],created_at:old?.created_at??stamp,updated_at:stamp,deleted_at:old?.deleted_at??null};
   if(!isBoundedString(account.name,100)||account.platform!=="openai"||!status(account.status)||typeof account.schedulable!=="boolean"||!Number.isInteger(account.priority)||account.priority<-100000||account.priority>100000||!Number.isInteger(account.max_concurrency)||account.max_concurrency<1||account.max_concurrency>100000||!isObject(account.extra)||!groups||groups.length===0||!(await groupsExist(env,groups,true))||(create&&credentials===undefined))return error("INVALID_REQUEST");account.group_ids=groups;
   const runtime=env as unknown as CredentialRuntime;const encrypted=credentials===undefined?undefined:await encryptAPIKeyCredentials(credentials,runtime);if(credentials!==undefined&&!encrypted)return error("INVALID_REQUEST");
   const statements:D1PreparedStatement[]=create?[env.DB.prepare("INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(account.id,account.name,account.platform,"apikey",account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted,sqlJSON(account.extra),account.created_at,account.updated_at,account.deleted_at)]:[env.DB.prepare("UPDATE accounts SET name=?,platform=?,status=?,schedulable=?,priority=?,max_concurrency=?,credential_envelope=COALESCE(?,credential_envelope),extra_json=?,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(account.name,account.platform,account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted??null,sqlJSON(account.extra),account.updated_at,account.deleted_at,account.id),env.DB.prepare("DELETE FROM account_groups WHERE account_id=? AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,operation)];
   for(const groupID of groups)statements.push(env.DB.prepare("INSERT INTO account_groups(account_id,group_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,groupID,operation));
-  const fingerprint = credentials === undefined
-    ? body
-    : { ...body, credentials: "sha256:" + await sha256(canonical(credentials)) };
   return replyMutation(env,route,operation,fingerprint,{account},statements);
 }

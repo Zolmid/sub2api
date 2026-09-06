@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,11 @@ import (
 )
 
 const managedListPageSize = 100
+
+const (
+	microUSDPerUSD       = uint64(1_000_000)
+	maxExactFloatInteger = uint64(1<<53 - 1)
+)
 
 // ManagementReadControlPlane is the non-secret read subset used by the first
 // Cloudflare management slice. Authentication records containing password
@@ -104,6 +110,25 @@ func canonicalUnsignedDecimal(value string) bool {
 	return isCanonicalPositiveDecimal(value)
 }
 
+// displayBalanceFromMicroUSD converts the fixed-point D1 representation only
+// at the presentation read boundary. Requiring the integer coefficient to be
+// exactly representable by float64 prevents a large D1 value from being
+// silently rounded before it reaches legacy display DTOs.
+func displayBalanceFromMicroUSD(value string) (float64, error) {
+	if !canonicalUnsignedDecimal(value) || len(value) > 40 {
+		return 0, errors.New("invalid balance_microusd")
+	}
+	microUSD, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || microUSD > maxExactFloatInteger {
+		return 0, errors.New("balance_microusd is not exactly representable")
+	}
+	balance := float64(microUSD) / float64(microUSDPerUSD)
+	if math.IsNaN(balance) || math.IsInf(balance, 0) || uint64(math.Round(balance*float64(microUSDPerUSD))) != microUSD {
+		return 0, errors.New("balance_microusd is not exactly representable")
+	}
+	return balance, nil
+}
+
 func decodeManagedUser(wire managedUserWire) (*service.User, bool, error) {
 	id, err := parsePositiveID("user id", wire.ID)
 	if err != nil {
@@ -125,9 +150,12 @@ func decodeManagedUser(wire managedUserWire) (*service.User, bool, error) {
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.Role != service.RoleUser && wire.Role != service.RoleAdmin) ||
 		wire.Concurrency < 1 || wire.Concurrency > 100000 || wire.RPMLimit < 0 || wire.RPMLimit > 1000000 ||
-		!canonicalUnsignedDecimal(wire.BalanceMicroUSD) || len(wire.BalanceMicroUSD) > 40 ||
 		len(wire.AllowedGroupIDs) > 100 {
 		return nil, false, errors.New("invalid managed user response")
+	}
+	balance, err := displayBalanceFromMicroUSD(wire.BalanceMicroUSD)
+	if err != nil {
+		return nil, false, errors.New("invalid managed user response: balance")
 	}
 
 	allowedGroups := make([]int64, 0, len(wire.AllowedGroupIDs))
@@ -144,12 +172,6 @@ func decodeManagedUser(wire managedUserWire) (*service.User, bool, error) {
 		allowedGroups = append(allowedGroups, groupID)
 	}
 
-	balance := float64(0)
-	if wire.BalanceMicroUSD != "0" {
-		// APIKeyService only needs the sign. The exact amount remains fixed-point
-		// text in D1 and is never rounded through a JavaScript or Go float.
-		balance = 1
-	}
 	return &service.User{
 		ID:                   id,
 		Email:                wire.Email,

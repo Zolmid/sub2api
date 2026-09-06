@@ -110,8 +110,12 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.Role != service.RoleUser && wire.Role != service.RoleAdmin) ||
 		wire.Concurrency < 1 || wire.Concurrency > 100000 || wire.RPMLimit < 0 || wire.RPMLimit > 1000000 ||
-		!canonicalUnsignedDecimal(wire.BalanceMicroUSD) || len(wire.BalanceMicroUSD) > 40 || len(wire.AllowedGroupIDs) > 100 {
+		len(wire.AllowedGroupIDs) > 100 {
 		return nil, errors.New("invalid auth user response")
+	}
+	balance, err := displayBalanceFromMicroUSD(wire.BalanceMicroUSD)
+	if err != nil {
+		return nil, errors.New("invalid auth user response: balance")
 	}
 	allowedGroups := make([]int64, 0, len(wire.AllowedGroupIDs))
 	seen := make(map[int64]struct{}, len(wire.AllowedGroupIDs))
@@ -125,10 +129,6 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 		}
 		seen[groupID] = struct{}{}
 		allowedGroups = append(allowedGroups, groupID)
-	}
-	balance := float64(0)
-	if wire.BalanceMicroUSD != "0" {
-		balance = 1
 	}
 	material := normalizedEmail + "\n" + wire.PasswordHash
 	sum := sha256.Sum256([]byte(material))

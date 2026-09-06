@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -54,8 +53,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
 	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
-	authHandler := handler.NewAuthHandler(runtime.Application, userAuthService, nil, nil, nil, nil, nil, nil)
-	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
+	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, apiKeyService)
 	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
 	forwarder := service.NewCloudflareVerticalSliceOpenAIGatewayService(runtime.Application, upstream)
 	handler := &gatewayHandler{
@@ -69,16 +67,16 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	})
 
 	v1 := router.Group("/api/v1")
-	v1.POST("/auth/login", authHandler.Login)
+	v1.POST("/auth/login", userAPIHandler.Login)
 	authenticated := v1.Group("")
 	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
 	keys := authenticated.Group("/keys")
-	keys.GET("", apiKeyHandler.List)
-	keys.GET("/:id", apiKeyHandler.GetByID)
-	keys.POST("", apiKeyHandler.Create)
-	keys.PUT("/:id", apiKeyHandler.Update)
-	keys.DELETE("/:id", apiKeyHandler.Delete)
-	authenticated.GET("/groups/available", apiKeyHandler.GetAvailableGroups)
+	keys.GET("", userAPIHandler.ListAPIKeys)
+	keys.GET("/:id", userAPIHandler.GetAPIKey)
+	keys.POST("", userAPIHandler.CreateAPIKey)
+	keys.PUT("/:id", userAPIHandler.UpdateAPIKey)
+	keys.DELETE("/:id", userAPIHandler.DeleteAPIKey)
+	authenticated.GET("/groups/available", userAPIHandler.GetAvailableGroups)
 
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,11 +23,12 @@ import (
 
 type userAPIControlPlane struct {
 	*fakeControlPlane
-	mu     sync.Mutex
-	users  map[int64]*service.User
-	groups map[int64]*service.Group
-	keys   map[int64]*service.APIKey
-	raw    map[string]int64
+	mu            sync.Mutex
+	users         map[int64]*service.User
+	groups        map[int64]*service.Group
+	keys          map[int64]*service.APIKey
+	raw           map[string]int64
+	nextCreatedID int64
 }
 
 func resolvedTestUser(user *service.User) *service.User {
@@ -104,12 +104,16 @@ func (f *userAPIControlPlane) CreateManagedAPIKey(_ context.Context, key *servic
 	}
 	now := time.Now().UTC()
 	stored := *key
+	if f.nextCreatedID > 0 {
+		stored.ID = f.nextCreatedID
+	}
 	stored.Key = ""
 	stored.CreatedAt = now
 	stored.UpdatedAt = now
 	f.keys[stored.ID] = &stored
 	f.raw[key.Key] = stored.ID
 	result := stored
+	result.Key = key.Key
 	return &result, nil
 }
 
@@ -195,9 +199,9 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 	t.Helper()
 	const userID int64 = 9007199254740993
 	const otherID int64 = 9007199254740994
-	groupID := int64(2001)
+	groupID := int64(9007199254741097)
 	password := "correct horse battery staple"
-	user := &service.User{ID: userID, Email: "User@Example.test", Username: "user", Status: service.StatusActive, Role: service.RoleUser, Concurrency: 2, Balance: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	user := &service.User{ID: userID, Email: "User@Example.test", Username: "user", Status: service.StatusActive, Role: service.RoleUser, Concurrency: 2, Balance: 2.5, AllowedGroups: []int64{groupID}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	require.NoError(t, user.SetPassword(password))
 	other := &service.User{ID: otherID, Email: "other@example.test", Username: "other", Status: service.StatusActive, Role: service.RoleUser, Concurrency: 1, Balance: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	require.NoError(t, other.SetPassword("other-password"))
@@ -210,7 +214,8 @@ func newUserAPIControlPlane(t *testing.T) (*userAPIControlPlane, string, int64, 
 			9007199254740995: {ID: 9007199254740995, UserID: userID, GroupID: &groupID, Name: "mine", Status: service.StatusActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
 			9007199254740996: {ID: 9007199254740996, UserID: otherID, GroupID: &groupID, Name: "other", Status: service.StatusActive, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
 		},
-		raw: map[string]int64{},
+		raw:           map[string]int64{},
+		nextCreatedID: 9007199254741098,
 	}, password, userID, otherID
 }
 
@@ -248,34 +253,117 @@ func TestCloudflareUserAPIEndToEndLoginJWTAndOwnerIsolation(t *testing.T) {
 	handler, err := NewHandler(runtime, control, &fakeHTTPUpstream{})
 	require.NoError(t, err)
 
-	token := loginToken(t, handler, "USER@example.test", password)
+	loginPayload, err := json.Marshal(map[string]string{"email": "USER@example.test", "password": password})
+	require.NoError(t, err)
+	login := callJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "", string(loginPayload))
+	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
+	var loginEnvelope struct {
+		Data struct {
+			AccessToken string `json:"access_token"`
+			User        struct {
+				ID            string   `json:"id"`
+				Balance       float64  `json:"balance"`
+				AllowedGroups []string `json:"allowed_groups"`
+			} `json:"user"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &loginEnvelope))
+	require.Equal(t, "9007199254740993", loginEnvelope.Data.User.ID)
+	require.Equal(t, 2.5, loginEnvelope.Data.User.Balance)
+	require.Equal(t, []string{"9007199254741097"}, loginEnvelope.Data.User.AllowedGroups)
+	token := loginEnvelope.Data.AccessToken
+	require.NotEmpty(t, token)
+
 	list := callJSON(t, handler, http.MethodGet, "/api/v1/keys", token, "")
 	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
-	require.Contains(t, list.Body.String(), `"id":9007199254740995`)
-	require.NotContains(t, list.Body.String(), `9007199254740996`)
+	var listEnvelope struct {
+		Data struct {
+			Items []struct {
+				ID      string `json:"id"`
+				UserID  string `json:"user_id"`
+				GroupID string `json:"group_id"`
+				Name    string `json:"name"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &listEnvelope))
+	require.Equal(t, []struct {
+		ID      string `json:"id"`
+		UserID  string `json:"user_id"`
+		GroupID string `json:"group_id"`
+		Name    string `json:"name"`
+	}{{ID: "9007199254740995", UserID: "9007199254740993", GroupID: "9007199254741097", Name: "mine"}}, listEnvelope.Data.Items)
 
 	mine := callJSON(t, handler, http.MethodGet, "/api/v1/keys/9007199254740995", token, "")
 	require.Equal(t, http.StatusOK, mine.Code, mine.Body.String())
+	var mineEnvelope struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(mine.Body.Bytes(), &mineEnvelope))
+	require.Equal(t, "9007199254740995", mineEnvelope.Data.ID)
 	other := callJSON(t, handler, http.MethodGet, "/api/v1/keys/9007199254740996", token, "")
 	require.Equal(t, http.StatusNotFound, other.Code, other.Body.String())
 
 	groups := callJSON(t, handler, http.MethodGet, "/api/v1/groups/available", token, "")
 	require.Equal(t, http.StatusOK, groups.Code, groups.Body.String())
+	var groupEnvelope struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(groups.Body.Bytes(), &groupEnvelope))
+	require.Equal(t, "9007199254741097", groupEnvelope.Data[0].ID)
 
-	created := callJSON(t, handler, http.MethodPost, "/api/v1/keys", token, `{"name":"created","group_id":2001}`)
+	unsafeNumericGroup := callJSON(t, handler, http.MethodPost, "/api/v1/keys", token, `{"name":"unsafe","group_id":9007199254741097}`)
+	require.Equal(t, http.StatusBadRequest, unsafeNumericGroup.Code, unsafeNumericGroup.Body.String())
+	unsupportedField := callJSON(t, handler, http.MethodPost, "/api/v1/keys", token, `{"name":"unsupported","group_id":"9007199254741097","quota":1}`)
+	require.Equal(t, http.StatusBadRequest, unsupportedField.Code, unsupportedField.Body.String())
+
+	created := callJSON(t, handler, http.MethodPost, "/api/v1/keys", token, `{"name":"created","group_id":"9007199254741097"}`)
 	require.Equal(t, http.StatusOK, created.Code, created.Body.String())
 	var createdEnvelope struct {
 		Data struct {
-			ID int64 `json:"id"`
+			ID      string `json:"id"`
+			UserID  string `json:"user_id"`
+			GroupID string `json:"group_id"`
+			Key     string `json:"key"`
 		} `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &createdEnvelope))
-	require.Positive(t, createdEnvelope.Data.ID)
+	require.Equal(t, "9007199254741098", createdEnvelope.Data.ID)
+	require.Equal(t, "9007199254740993", createdEnvelope.Data.UserID)
+	require.Equal(t, "9007199254741097", createdEnvelope.Data.GroupID)
+	require.NotEmpty(t, createdEnvelope.Data.Key)
 
-	updated := callJSON(t, handler, http.MethodPut, "/api/v1/keys/"+strconv.FormatInt(createdEnvelope.Data.ID, 10), token, `{"name":"renamed"}`)
+	createdPath := "/api/v1/keys/" + createdEnvelope.Data.ID
+	readCreated := callJSON(t, handler, http.MethodGet, createdPath, token, "")
+	require.Equal(t, http.StatusOK, readCreated.Code, readCreated.Body.String())
+	var readCreatedEnvelope struct {
+		Data struct {
+			ID  string `json:"id"`
+			Key string `json:"key"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(readCreated.Body.Bytes(), &readCreatedEnvelope))
+	require.Equal(t, createdEnvelope.Data.ID, readCreatedEnvelope.Data.ID)
+	require.Empty(t, readCreatedEnvelope.Data.Key)
+
+	updated := callJSON(t, handler, http.MethodPut, createdPath, token, `{"name":"renamed"}`)
 	require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
-	deleted := callJSON(t, handler, http.MethodDelete, "/api/v1/keys/"+strconv.FormatInt(createdEnvelope.Data.ID, 10), token, "")
+	var updatedEnvelope struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(updated.Body.Bytes(), &updatedEnvelope))
+	require.Equal(t, createdEnvelope.Data.ID, updatedEnvelope.Data.ID)
+
+	deleted := callJSON(t, handler, http.MethodDelete, createdPath, token, "")
 	require.Equal(t, http.StatusOK, deleted.Code, deleted.Body.String())
+	afterDelete := callJSON(t, handler, http.MethodGet, createdPath, token, "")
+	require.Equal(t, http.StatusNotFound, afterDelete.Code, afterDelete.Body.String())
 }
 
 func TestCloudflareUserAPIFailsClosedForBadPasswordDisabledDeletedAndTokenChange(t *testing.T) {
@@ -323,7 +411,7 @@ func TestAuthUserRepositoryNormalizesEmailAndResolvesTokenVersion(t *testing.T) 
 		_ = json.NewEncoder(w).Encode(map[string]any{"user": map[string]any{
 			"id": "9007199254740993", "email": user.Email, "username": user.Username,
 			"password_hash": user.PasswordHash, "status": user.Status, "role": user.Role,
-			"concurrency": 1, "rpm_limit": 0, "balance_microusd": "0",
+			"concurrency": 1, "rpm_limit": 0, "balance_microusd": "2500000",
 			"allowed_group_ids": []string{}, "restrict_public_groups": false,
 			"created_at": user.CreatedAt.Format(time.RFC3339Nano), "updated_at": user.UpdatedAt.Format(time.RFC3339Nano),
 		}})
@@ -336,6 +424,7 @@ func TestAuthUserRepositoryNormalizesEmailAndResolvesTokenVersion(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, loaded.TokenVersionResolved)
 	require.Equal(t, resolvedTestUser(user).TokenVersion, loaded.TokenVersion)
+	require.Equal(t, 2.5, loaded.Balance)
 
 	runtime := testRuntimeConfig(t)
 	authService := service.NewAuthService(nil, repository, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
@@ -344,4 +433,18 @@ func TestAuthUserRepositoryNormalizesEmailAndResolvesTokenVersion(t *testing.T) 
 	claims, err := authService.ValidateToken(token)
 	require.NoError(t, err)
 	require.Equal(t, loaded.TokenVersion, claims.TokenVersion)
+}
+
+func TestCloudflareJSONIDUsesNumbersOnlyInsideJavaScriptSafeRange(t *testing.T) {
+	safe, err := json.Marshal(cloudflareJSONID(42))
+	require.NoError(t, err)
+	require.JSONEq(t, `42`, string(safe))
+	unsafe, err := json.Marshal(cloudflareJSONID(9007199254740993))
+	require.NoError(t, err)
+	require.JSONEq(t, `"9007199254740993"`, string(unsafe))
+
+	var accepted cloudflareRequestID
+	require.NoError(t, json.Unmarshal([]byte(`"9007199254740993"`), &accepted))
+	require.Equal(t, int64(9007199254740993), int64(accepted))
+	require.Error(t, json.Unmarshal([]byte(`9007199254740993`), &accepted))
 }

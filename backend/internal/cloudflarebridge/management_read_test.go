@@ -24,7 +24,7 @@ func TestHTTPControlPlaneGetManagedUserUsesNonSecretDecimalContract(t *testing.T
 		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		requestBody = string(body)
-		_, _ = io.WriteString(w, `{"user":{"id":"9007199254740993","email":"reader@example.test","username":"reader","notes":"safe","status":"active","role":"user","concurrency":3,"rpm_limit":9,"balance_microusd":"9007199254740993000000","allowed_group_ids":["9007199254740994"],"restrict_public_groups":true,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
+		_, _ = io.WriteString(w, `{"user":{"id":"9007199254740993","email":"reader@example.test","username":"reader","notes":"safe","status":"active","role":"user","concurrency":3,"rpm_limit":9,"balance_microusd":"2500000","allowed_group_ids":["9007199254740994"],"restrict_public_groups":true,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
 	}))
 	defer server.Close()
 
@@ -37,10 +37,25 @@ func TestHTTPControlPlaneGetManagedUserUsesNonSecretDecimalContract(t *testing.T
 	require.Equal(t, ProtocolVersion, version)
 	require.Equal(t, int64(9007199254740993), user.ID)
 	require.Equal(t, []int64{9007199254740994}, user.AllowedGroups)
-	require.Equal(t, float64(1), user.Balance)
+	require.Equal(t, 2.5, user.Balance)
 	require.Empty(t, user.PasswordHash)
 	require.False(t, user.TokenVersionResolved)
 	require.True(t, user.RestrictPublicGroups)
+}
+
+func TestDisplayBalanceFromMicroUSDFailsClosed(t *testing.T) {
+	require.Equal(t, 2.5, mustDisplayBalance(t, "2500000"))
+	for _, value := range []string{"", "01", "-1", "1.5", "9007199254740992", "18446744073709551616"} {
+		_, err := displayBalanceFromMicroUSD(value)
+		require.Error(t, err, value)
+	}
+}
+
+func mustDisplayBalance(t *testing.T, value string) float64 {
+	t.Helper()
+	balance, err := displayBalanceFromMicroUSD(value)
+	require.NoError(t, err)
+	return balance
 }
 
 func TestHTTPControlPlaneGetManagedUserTreatsTombstoneAsNotFound(t *testing.T) {

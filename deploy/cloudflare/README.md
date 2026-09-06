@@ -31,6 +31,17 @@ HTTPS egress interception is enabled for the fixture host. At runtime the Contai
 
 Production account credentials require `aes-gcm:v1:<base64(iv)>:<base64(ciphertext)>` plus the `CREDENTIAL_ENCRYPTION_KEY` secret. The deploy configuration is fixture-off and fail-closed. Local tests use `wrangler.test.jsonc`, which sets `ENVIRONMENT=local`, `ALLOW_TEST_FIXTURE=true`, `mock.upstream`, and a compatibility date constrained by the bundled workerd runtime.
 
+`POST /api/v1/auth/login` is additionally admitted at the Worker edge by the
+SQLite-backed `AUTH_LOGIN_ADMISSION` Durable Object: 20 requests per 60-second
+fixed window for each privacy-derived Cloudflare client identity. Production
+and local Worker runs require a dedicated base64-encoded 32-byte
+`SUB2API_CF_LOGIN_ADMISSION_KEY` Worker secret. Keep it out of `vars`, source,
+and logs; provision it through the normal secret mechanism before accepting
+login traffic. The test pool supplies a fixed test-only key. A missing or
+invalid edge identity, secret, binding, or DO call intentionally fails closed.
+For `pnpm dev`, put a local-only value with that name in the ignored
+`deploy/cloudflare/.dev.vars`; do not reuse a production value.
+
 Run source checks from this directory:
 
 ```sh

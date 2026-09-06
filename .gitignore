@@ -54,6 +54,7 @@ pnpm-debug.log*
 .env.*.local
 *.env
 !.env.example
+deploy/cloudflare/.dev.vars
 docker-compose.override.yml
 
 # ===================

@@ -5,8 +5,8 @@
   "compatibility_date": "2026-08-22",
   "compatibility_flags": ["nodejs_compat"],
   "vars": { "ENVIRONMENT": "local", "ALLOW_TEST_FIXTURE": "true", "SUB2API_CF_UPSTREAM_ALLOWED_HOSTS": "mock.upstream", "SUB2API_CF_LEASE_TTL_SECONDS": "5" },
-  "durable_objects": { "bindings": [{ "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" }, { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] }],
+  "durable_objects": { "bindings": [{ "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" }, { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" }, { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] }, { "tag": "v2-auth-login-admission", "new_sqlite_classes": ["AuthLoginAdmissionDO"] }],
   "d1_databases": [{ "binding": "DB", "database_name": "sub2api-cloudflare-stage-c-correction-test", "database_id": "local", "migrations_dir": "migrations" }],
   "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "local" }],
   "queues": { "producers": [{ "binding": "USAGE_QUEUE", "queue": "usage-test" }], "consumers": [{ "queue": "usage-test", "max_retries": 5, "dead_letter_queue": "usage-test-dlq" }] }

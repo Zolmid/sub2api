@@ -13,6 +13,9 @@ const workerOptions = async () => ({
       // Explicit local-only value; production receives this binding through
       // Worker secrets and no wrangler vars file contains it.
       SUB2API_CF_JWT_SECRET: "test-only-cloudflare-jwt-secret-32-bytes",
+      // A fixed test-only 32-byte base64 key. Production must set its own
+      // Worker secret and is never represented in this configuration.
+      SUB2API_CF_LOGIN_ADMISSION_KEY: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
       TEST_MIGRATIONS: await readD1Migrations(
         new URL("./migrations", import.meta.url).pathname,
       ),

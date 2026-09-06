@@ -11,9 +11,10 @@ import {
   readJson,
   type UsageEnvelope,
 } from "./contracts";
+import { AuthLoginAdmissionDO } from "./auth-login-admission";
 import { AccountLeaseDO } from "./lease";
 
-export { AccountLeaseDO, ContainerProxy };
+export { AccountLeaseDO, AuthLoginAdmissionDO, ContainerProxy };
 
 type ContainerRuntimeEnv = Omit<
   Env,
@@ -30,6 +31,11 @@ type ContainerRuntimeEnv = Omit<
   SUB2API_CF_JWT_SECRET: string;
 };
 
+type LoginAdmissionRuntimeEnv = Env & {
+  // This Worker secret is deliberately not declared in wrangler vars.
+  SUB2API_CF_LOGIN_ADMISSION_KEY?: string;
+};
+
 const FIXTURE_CONTAINER_HEADER = "X-Sub2API-Fixture-Container";
 const FIXTURE_CONTAINER_NAMES = new Set(["gateway-a", "gateway-b"]);
 const MAX_FIXTURE_DELAY_MS = 60_000;
@@ -38,6 +44,145 @@ const RESERVED_INGRESS_HEADERS = [
   "X-Sub2API-Bridge-Version",
   "X-Sub2API-Container-Id",
 ];
+const AUTH_LOGIN_PATH = "/api/v1/auth/login";
+const AUTH_LOGIN_ADMISSION_KEY_BYTES = 32;
+
+export type ContainerForwarder = (
+  request: Request,
+  containerName: string,
+) => Promise<Response>;
+
+function validIPv4(value: string): boolean {
+  const parts = value.split(".");
+  return (
+    parts.length === 4 &&
+    parts.every((part) => {
+      if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) return false;
+      const numeric = Number(part);
+      return Number.isInteger(numeric) && numeric >= 0 && numeric <= 255;
+    })
+  );
+}
+
+function validIPv6(value: string): boolean {
+  let address = value;
+  if (address.includes(".")) {
+    const separator = address.lastIndexOf(":");
+    if (separator < 0 || !validIPv4(address.slice(separator + 1))) return false;
+    address = `${address.slice(0, separator + 1)}0:0`;
+  }
+  if (!/^[0-9A-Fa-f:]+$/.test(address) || !address.includes(":")) {
+    return false;
+  }
+
+  const compressed = address.includes("::");
+  if (compressed && address.indexOf("::") !== address.lastIndexOf("::")) {
+    return false;
+  }
+  const [left, right] = compressed ? address.split("::") : [address, ""];
+  const parts = [
+    ...(left === "" ? [] : left.split(":")),
+    ...(right === "" ? [] : right.split(":")),
+  ];
+  if (parts.some((part) => !/^[0-9A-Fa-f]{1,4}$/.test(part))) return false;
+  return compressed ? parts.length < 8 : parts.length === 8;
+}
+
+export function authoritativeClientIdentity(value: string | null): string | null {
+  if (value === null || value.length < 7 || value.length > 45) return null;
+  return validIPv4(value) || validIPv6(value) ? value : null;
+}
+
+function base64Key(value: unknown): Uint8Array | null {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9+/]{43}=$/.test(value)
+  ) {
+    return null;
+  }
+  try {
+    const decoded = Uint8Array.from(atob(value), (character) =>
+      character.charCodeAt(0),
+    );
+    return decoded.byteLength === AUTH_LOGIN_ADMISSION_KEY_BYTES
+      ? decoded
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function admissionShardName(
+  clientIdentity: string,
+  secret: unknown,
+): Promise<string | null> {
+  const key = base64Key(secret);
+  if (!key) return null;
+  try {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      key,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign(
+      "HMAC",
+      cryptoKey,
+      new TextEncoder().encode(`sub2api-auth-login-v1\u0000${clientIdentity}`),
+    );
+    const shard = [...new Uint8Array(signature)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    return `auth-login-v1:${shard}`;
+  } catch {
+    return null;
+  }
+}
+
+function admissionError(
+  code: "LOGIN_ADMISSION_UNAVAILABLE" | "LOGIN_ADMISSION_LIMITED",
+  status: 429 | 503,
+  retryAfter?: number,
+): Response {
+  const headers = new Headers({ "cache-control": "no-store" });
+  if (retryAfter !== undefined) headers.set("retry-after", String(retryAfter));
+  return Response.json({ error: { code, message: code } }, { status, headers });
+}
+
+async function admitLogin(
+  request: Request,
+  env: Env,
+  timeMs: number,
+): Promise<Response | null> {
+  const identity = authoritativeClientIdentity(
+    request.headers.get("CF-Connecting-IP"),
+  );
+  const runtime = env as LoginAdmissionRuntimeEnv;
+  const shard = identity
+    ? await admissionShardName(identity, runtime.SUB2API_CF_LOGIN_ADMISSION_KEY)
+    : null;
+  if (!shard) return admissionError("LOGIN_ADMISSION_UNAVAILABLE", 503);
+
+  try {
+    const result = await env.AUTH_LOGIN_ADMISSION.getByName(shard).admit(timeMs);
+    if (result.allowed) return null;
+    if (
+      !Number.isSafeInteger(result.retry_after_seconds) ||
+      result.retry_after_seconds < 1 ||
+      result.retry_after_seconds > 60
+    ) {
+      return admissionError("LOGIN_ADMISSION_UNAVAILABLE", 503);
+    }
+    return admissionError(
+      "LOGIN_ADMISSION_LIMITED",
+      429,
+      result.retry_after_seconds,
+    );
+  } catch {
+    return admissionError("LOGIN_ADMISSION_UNAVAILABLE", 503);
+  }
+}
 
 export function parseContainerHosts(raw: string): string[] {
   return raw
@@ -196,25 +341,7 @@ Sub2APIContainer.outbound = (request: Request): Promise<Response> =>
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (new URL(request.url).hostname === INTERNAL_HOST) {
-      // An external caller must never reach the private control plane by
-      // forging the URL/Host. Only Container outbound dispatch invokes it.
-      return error("NOT_FOUND", 404);
-    }
-    const runtime = env as unknown as ContainerRuntimeEnv;
-    const containerName = selectContainerName(
-      request,
-      runtime.ENVIRONMENT,
-      runtime.ALLOW_TEST_FIXTURE,
-    );
-    if (containerName === null) {
-      return error("FIXTURE_CONTAINER_INVALID", 400);
-    }
-
-    const routedRequest = sanitizeIngressRequest(request);
-    return getContainer(env.SUB2API_CONTAINER, containerName).fetch(
-      routedRequest,
-    );
+    return routeIngress(request, env);
   },
 
   async queue(batch: MessageBatch<UsageEnvelope>, env: Env): Promise<void> {
@@ -231,5 +358,39 @@ const worker = {
     ctx.waitUntil(drainOutbox(env));
   },
 };
+
+export async function routeIngress(
+  request: Request,
+  env: Env,
+  forward: ContainerForwarder = (routedRequest, containerName) =>
+    getContainer(env.SUB2API_CONTAINER, containerName).fetch(routedRequest),
+  clock: () => number = Date.now,
+): Promise<Response> {
+  if (new URL(request.url).hostname === INTERNAL_HOST) {
+    // An external caller must never reach the private control plane by
+    // forging the URL/Host. Only Container outbound dispatch invokes it.
+    return error("NOT_FOUND", 404);
+  }
+  const runtime = env as unknown as ContainerRuntimeEnv;
+  const containerName = selectContainerName(
+    request,
+    runtime.ENVIRONMENT,
+    runtime.ALLOW_TEST_FIXTURE,
+  );
+  if (containerName === null) {
+    return error("FIXTURE_CONTAINER_INVALID", 400);
+  }
+
+  const url = new URL(request.url);
+  if (request.method === "POST" && url.pathname === AUTH_LOGIN_PATH) {
+    // This preflight intentionally examines only the authoritative edge
+    // address header; the login body is still unread at Container handoff.
+    const rejection = await admitLogin(request, env, clock());
+    if (rejection) return rejection;
+  }
+
+  const routedRequest = sanitizeIngressRequest(request);
+  return forward(routedRequest, containerName);
+}
 
 export default worker;

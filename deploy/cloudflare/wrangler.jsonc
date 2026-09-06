@@ -19,10 +19,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" },
-      { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" }
+      { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" },
+      { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] },
+    { "tag": "v2-auth-login-admission", "new_sqlite_classes": ["AuthLoginAdmissionDO"] }
+  ],
   "d1_databases": [{ "binding": "DB", "database_name": "sub2api-cloudflare", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }],
   "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
   "queues": {

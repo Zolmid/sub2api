@@ -23,13 +23,18 @@
   "durable_objects": {
     "bindings": [
       { "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" },
-      { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" }
+      { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" },
+      { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"]
+    },
+    {
+      "tag": "v2-auth-login-admission",
+      "new_sqlite_classes": ["AuthLoginAdmissionDO"]
     }
   ],
   "d1_databases": [

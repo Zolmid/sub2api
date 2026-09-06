@@ -1,4 +1,5 @@
 import type { Completion, UsageEnvelope } from "./contracts";
+import { managementControlPlane } from "./management";
 import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
@@ -124,6 +125,28 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
         return await relayLeaseAction(request, env, "/release");
       case "/v1/requests/complete":
         return await completeRequest(request, env);
+      case "/v1/manage/users/create":
+      case "/v1/manage/users/get":
+      case "/v1/manage/users/list":
+      case "/v1/manage/users/update":
+      case "/v1/manage/users/delete":
+      case "/v1/manage/groups/create":
+      case "/v1/manage/groups/get":
+      case "/v1/manage/groups/list":
+      case "/v1/manage/groups/update":
+      case "/v1/manage/groups/delete":
+      case "/v1/manage/api-keys/create":
+      case "/v1/manage/api-keys/get":
+      case "/v1/manage/api-keys/list":
+      case "/v1/manage/api-keys/update":
+      case "/v1/manage/api-keys/revoke":
+      case "/v1/manage/api-keys/rotate":
+      case "/v1/manage/accounts/create":
+      case "/v1/manage/accounts/get":
+      case "/v1/manage/accounts/list":
+      case "/v1/manage/accounts/update":
+      case "/v1/manage/accounts/delete":
+        return await managementControlPlane(request, env, url.pathname);
       default:
         return error("NOT_FOUND", 404);
     }

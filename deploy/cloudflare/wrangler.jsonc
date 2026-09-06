@@ -5,13 +5,15 @@
   "compatibility_date": "2026-09-06",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
-  "vars": { "ENVIRONMENT": "local", "ALLOW_TEST_FIXTURE": "false" },
+  "vars": { "ENVIRONMENT": "production", "ALLOW_TEST_FIXTURE": "false", "SUB2API_CF_UPSTREAM_ALLOWED_HOSTS": "", "SUB2API_CF_LEASE_TTL_SECONDS": "90" },
+  "observability": { "enabled": true },
   "containers": [
     {
       "class_name": "Sub2APIContainer",
       "image": "./Dockerfile",
+      "image_build_context": "../..",
       "max_instances": 1,
-      "instance_type": "standard-1"
+      "instance_type": "basic"
     }
   ],
   "durable_objects": {

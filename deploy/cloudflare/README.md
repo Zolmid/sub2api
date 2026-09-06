@@ -4,7 +4,9 @@ This directory is the Worker half of protocol `2026-09-06.v1`. It keeps persiste
 
 `Sub2APIContainer` serves the existing Go Cloudflare-mode gateway on port 8080. Its only special outbound hosts are `sub2api.internal` (the versioned private control plane) and fixture-gated `mock.upstream`. All other outbound requests use the stream-preserving Container outbound path.
 
-Production account credentials require `aes-gcm:v1:<base64(iv)>:<base64(ciphertext)>` plus the `CREDENTIAL_ENCRYPTION_KEY` secret. Local fixture use is limited to `ENVIRONMENT=local` and `ALLOW_TEST_FIXTURE=true`.
+HTTPS egress interception is enabled for the fixture host. At runtime the Container passes `SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt` so Go trusts Cloudflare's ephemeral interception CA; that file is not copied into the image.
+
+Production account credentials require `aes-gcm:v1:<base64(iv)>:<base64(ciphertext)>` plus the `CREDENTIAL_ENCRYPTION_KEY` secret. The deploy configuration is fixture-off and fail-closed. Local tests use `wrangler.test.jsonc`, which sets `ENVIRONMENT=local`, `ALLOW_TEST_FIXTURE=true`, `mock.upstream`, and a compatibility date constrained by the bundled workerd runtime.
 
 Run from this directory:
 

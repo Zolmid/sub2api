@@ -131,6 +131,30 @@ type APIKeyOwnerDeleteRepository interface {
 	DeleteWithAuditForOwner(ctx context.Context, id, userID int64) error
 }
 
+// APIKeyUserReader and the related narrow readers describe only the persistence
+// capabilities consumed by APIKeyService. Keeping these seams smaller than the
+// full administrative repositories lets alternate deployment modes reuse the
+// original service and HTTP handler without implementing unrelated user,
+// subscription, or group mutation surfaces up front.
+type APIKeyUserReader interface {
+	GetByID(ctx context.Context, id int64) (*User, error)
+}
+
+type APIKeyGroupReader interface {
+	GetByID(ctx context.Context, id int64) (*Group, error)
+	ListActive(ctx context.Context) ([]Group, error)
+}
+
+type APIKeySubscriptionReader interface {
+	GetActiveByUserIDAndGroupID(ctx context.Context, userID, groupID int64) (*UserSubscription, error)
+	ListActiveByUserID(ctx context.Context, userID int64) ([]UserSubscription, error)
+}
+
+type APIKeyUserGroupRateReader interface {
+	GetByUserID(ctx context.Context, userID int64) (map[int64]float64, error)
+	GetRPMOverrideByUserAndGroup(ctx context.Context, userID, groupID int64) (*int, error)
+}
+
 type apiKeyAllByUserIDLister interface {
 	ListAllByUserID(ctx context.Context, userID int64, filters APIKeyListFilters) ([]APIKey, error)
 }
@@ -294,10 +318,10 @@ type RateLimitCacheInvalidator interface {
 
 type APIKeyService struct {
 	apiKeyRepo                APIKeyRepository
-	userRepo                  UserRepository
-	groupRepo                 GroupRepository
-	userSubRepo               UserSubscriptionRepository
-	userGroupRateRepo         UserGroupRateRepository
+	userRepo                  APIKeyUserReader
+	groupRepo                 APIKeyGroupReader
+	userSubRepo               APIKeySubscriptionReader
+	userGroupRateRepo         APIKeyUserGroupRateReader
 	cache                     APIKeyCache
 	rateLimitCacheInvalid     RateLimitCacheInvalidator // optional: invalidate Redis rate limit cache
 	concurrencyService        *ConcurrencyService
@@ -343,10 +367,10 @@ func (s *APIKeyService) AuthLookupMetrics() APIKeyAuthLookupMetrics {
 // NewAPIKeyService 创建API Key服务实例
 func NewAPIKeyService(
 	apiKeyRepo APIKeyRepository,
-	userRepo UserRepository,
-	groupRepo GroupRepository,
-	userSubRepo UserSubscriptionRepository,
-	userGroupRateRepo UserGroupRateRepository,
+	userRepo APIKeyUserReader,
+	groupRepo APIKeyGroupReader,
+	userSubRepo APIKeySubscriptionReader,
+	userGroupRateRepo APIKeyUserGroupRateReader,
 	cache APIKeyCache,
 	cfg *config.Config,
 ) *APIKeyService {

@@ -121,7 +121,9 @@ func TestAPIKeyRepositoryOwnerDeleteIsAtomicAtWorkerBoundary(t *testing.T) {
 
 func TestAPIKeyRepositoryOwnerDeleteMapsConflictWithoutResponseLeak(t *testing.T) {
 	t.Parallel()
+	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"error":{"code":"CONFLICT","message":"private row detail"}}`))
 	}))
@@ -133,6 +135,70 @@ func TestAPIKeyRepositoryOwnerDeleteMapsConflictWithoutResponseLeak(t *testing.T
 	err = repository.DeleteWithAuditForOwner(context.Background(), 3001, 9999)
 	require.ErrorIs(t, err, service.ErrInsufficientPerms)
 	require.NotContains(t, err.Error(), "private row detail")
+	require.Equal(t, int32(1), calls.Load())
+}
+
+func TestAPIKeyRepositoryCreateRecoversAmbiguousFailureWithSameOperationID(t *testing.T) {
+	t.Parallel()
+	const timestamp = "2026-09-06T12:34:56Z"
+	var calls atomic.Int32
+	var firstOperationID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		operationID, _ := body["operation_id"].(string)
+		if calls.Add(1) == 1 {
+			firstOperationID = operationID
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"CONTROL_PLANE_UNAVAILABLE","message":"response lost"}}`))
+			return
+		}
+		require.Equal(t, firstOperationID, operationID)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"api_key": map[string]any{
+				"id": body["id"], "user_id": body["user_id"], "group_id": body["group_id"],
+				"name": body["name"], "status": body["status"],
+				"ip_whitelist": body["ip_whitelist"], "ip_blacklist": body["ip_blacklist"],
+				"expires_at": nil, "last_used_at": nil, "created_at": timestamp,
+				"updated_at": timestamp, "deleted_at": nil,
+			},
+		}))
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	repository := NewAPIKeyRepository(control)
+	groupID := int64(2001)
+	key := &service.APIKey{
+		UserID: 1001, Key: "unit_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		Name: "ambiguous recovery", GroupID: &groupID, Status: service.StatusAPIKeyActive,
+	}
+	require.NoError(t, repository.Create(context.Background(), key))
+	require.Equal(t, int32(2), calls.Load())
+	require.NotEmpty(t, firstOperationID)
+}
+
+func TestHTTPControlPlaneManagedMutationRetryClearsPartialResponse(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"raw_key":"stale-partial-value","api_key":{"id":[]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"api_key":{}}`))
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	var response managedAPIKeyResponse
+	require.NoError(t, control.postManagedMutation(context.Background(), "/v1/manage/api-keys/create", map[string]string{"operation_id": "stable"}, &response))
+	require.Equal(t, int32(2), calls.Load())
+	require.Empty(t, response.RawKey)
 }
 
 func TestHTTPControlPlaneTreatsManagedTombstoneAsNotFound(t *testing.T) {

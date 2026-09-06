@@ -42,6 +42,36 @@ type managedAPIKeyResponse struct {
 	RawKey string            `json:"raw_key,omitempty"`
 }
 
+// postManagedMutation retries one ambiguous private-protocol failure. Every
+// caller builds its operation ID before entering this helper, so both attempts
+// carry the same idempotency identity and the Worker can replay a committed
+// result instead of applying the mutation twice.
+func (c *HTTPControlPlane) postManagedMutation(ctx context.Context, path string, input any, output *managedAPIKeyResponse) error {
+	var target any
+	if output != nil {
+		target = output
+	}
+	err := c.post(ctx, path, input, target)
+	if !shouldRecoverManagedMutation(ctx, err) {
+		return err
+	}
+	if output != nil {
+		*output = managedAPIKeyResponse{}
+	}
+	return c.post(ctx, path, input, target)
+}
+
+func shouldRecoverManagedMutation(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || !errors.Is(err, ErrControlPlaneUnavailable) {
+		return false
+	}
+	var responseErr *controlPlaneResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr.StatusCode >= 500
+	}
+	return true
+}
+
 func managementOperationID(kind string) string {
 	return kind + ":" + uuid.NewString()
 }
@@ -158,7 +188,7 @@ func (c *HTTPControlPlane) CreateManagedAPIKey(ctx context.Context, key *service
 	}
 
 	var response managedAPIKeyResponse
-	if err := c.post(ctx, "/v1/manage/api-keys/create", request, &response); err != nil {
+	if err := c.postManagedMutation(ctx, "/v1/manage/api-keys/create", request, &response); err != nil {
 		return nil, mapManagedAPIKeyError(err, service.ErrAPIKeyExists)
 	}
 	created, err := decodeManagedAPIKey(response.APIKey)
@@ -219,7 +249,7 @@ func (c *HTTPControlPlane) UpdateManagedAPIKey(ctx context.Context, key *service
 	}
 
 	var response managedAPIKeyResponse
-	if err := c.post(ctx, "/v1/manage/api-keys/update", request, &response); err != nil {
+	if err := c.postManagedMutation(ctx, "/v1/manage/api-keys/update", request, &response); err != nil {
 		return nil, mapManagedAPIKeyError(err, nil)
 	}
 	updated, err := decodeManagedAPIKey(response.APIKey)
@@ -240,7 +270,7 @@ func (c *HTTPControlPlane) RevokeManagedAPIKey(ctx context.Context, id int64, ex
 	if expectedUserID != nil {
 		request["expected_user_id"] = strconv.FormatInt(*expectedUserID, 10)
 	}
-	err := c.post(ctx, "/v1/manage/api-keys/revoke", request, nil)
+	err := c.postManagedMutation(ctx, "/v1/manage/api-keys/revoke", request, nil)
 	conflict := error(nil)
 	if expectedUserID != nil {
 		conflict = service.ErrInsufficientPerms

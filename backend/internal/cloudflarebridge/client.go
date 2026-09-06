@@ -23,6 +23,24 @@ var (
 	ErrAdmissionRejected       = errors.New("cloudflare admission rejected")
 )
 
+// controlPlaneResponseError preserves the bounded machine-readable status from
+// the private Worker protocol without retaining or exposing its response body.
+// It still unwraps to ErrControlPlaneUnavailable so existing gateway callers
+// keep their fail-closed behavior while management adapters can map known
+// domain outcomes precisely.
+type controlPlaneResponseError struct {
+	StatusCode int
+	Code       string
+}
+
+func (e *controlPlaneResponseError) Error() string {
+	return fmt.Sprintf("%s: status=%d code=%s", ErrControlPlaneUnavailable, e.StatusCode, e.Code)
+}
+
+func (e *controlPlaneResponseError) Unwrap() error {
+	return ErrControlPlaneUnavailable
+}
+
 type HTTPControlPlane struct {
 	baseURL string
 	client  *http.Client
@@ -103,7 +121,7 @@ func (c *HTTPControlPlane) post(ctx context.Context, path string, input, output 
 		if code == "" {
 			code = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("%w: status=%d code=%s", ErrControlPlaneUnavailable, resp.StatusCode, code)
+		return &controlPlaneResponseError{StatusCode: resp.StatusCode, Code: code}
 	}
 	if output == nil || len(responseBody) == 0 {
 		return nil

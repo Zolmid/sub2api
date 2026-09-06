@@ -21,11 +21,13 @@ type ContainerRuntimeEnv = Omit<
   | "ALLOW_TEST_FIXTURE"
   | "SUB2API_CF_UPSTREAM_ALLOWED_HOSTS"
   | "SUB2API_CF_LEASE_TTL_SECONDS"
+  | "SUB2API_CF_JWT_SECRET"
 > & {
   ENVIRONMENT: string;
   ALLOW_TEST_FIXTURE: string;
   SUB2API_CF_UPSTREAM_ALLOWED_HOSTS: string;
   SUB2API_CF_LEASE_TTL_SECONDS: string;
+  SUB2API_CF_JWT_SECRET: string;
 };
 
 const FIXTURE_CONTAINER_HEADER = "X-Sub2API-Fixture-Container";
@@ -96,6 +98,9 @@ export class Sub2APIContainer extends Container<Env> {
       SUB2API_CF_UPSTREAM_ALLOWED_HOSTS: upstreamHosts.join(","),
       SUB2API_CF_ALLOW_TEST_FIXTURE: runtime.ALLOW_TEST_FIXTURE,
       SUB2API_CF_LEASE_TTL_SECONDS: runtime.SUB2API_CF_LEASE_TTL_SECONDS,
+      // This is a Worker secret binding. It is intentionally absent from
+      // wrangler vars and is exposed only to the private Container process.
+      SUB2API_CF_JWT_SECRET: runtime.SUB2API_CF_JWT_SECRET,
       // With HTTPS interception the SDK mounts an ephemeral CA at runtime. It
       // is deliberately not copied into the immutable image.
       SSL_CERT_FILE: "/etc/cloudflare/certs/cloudflare-containers-ca.crt",

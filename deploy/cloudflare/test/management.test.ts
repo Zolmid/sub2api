@@ -49,7 +49,7 @@ describe("Stage C private management control plane", () => {
     const admission = await call("/v1/requests/admit", { request_id: "managed-admission-" + id(), api_key_id: scope.keyID, group_id: scope.groupID, model: "fixture-model", lease_ttl_seconds: 30 });
     expect(admission.status).toBe(200); expect(await admission.json()).toMatchObject({ account: { id: scope.accountID, credentials: { api_key: upstreamKey, base_url: baseURL } } });
     const rows = await env.DB.prepare("SELECT response_json FROM management_operations").all<{ response_json: string }>();
-    for (const row of rows.results) { expect(row.response_json).not.toContain("password-hash-for-credentials"); expect(row.response_json).not.toContain(rawKey); expect(row.response_json).not.toContain(upstreamKey); expect(row.response_json).not.toContain(baseURL); }
+    for (const row of rows.results) { expect(row.response_json).not.toContain("password-hash-for-credentials"); expect(row.response_json).not.toContain("test-only-cloudflare-jwt-secret-32-bytes"); expect(row.response_json).not.toContain(rawKey); expect(row.response_json).not.toContain(upstreamKey); expect(row.response_json).not.toContain(baseURL); }
     expect((await call("/v1/manage/accounts/create", { operation_id: "no-secret", id: id(), name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credentials: { api_key: "x", base_url: baseURL }, extra: {}, group_ids: [scope.groupID] }, undefined, env)).status).toBe(400);
   });
 
@@ -77,7 +77,8 @@ describe("Stage C private management control plane", () => {
   it("replays stable operation IDs and rejects conflicting reuse after tombstones", async () => {
     const scope = await createScope("replay"); const rawKey = "ReplayKey_123456789";
     const keyRequest = { operation_id: "replay-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null };
-    expect(await (await call("/v1/manage/api-keys/create", keyRequest)).json()).toMatchObject({ raw_key: rawKey, api_key: { id: scope.keyID } });
+    const created = await (await call("/v1/manage/api-keys/create", keyRequest)).json<Record<string, unknown>>();
+    expect(created).toMatchObject({ api_key: { id: scope.keyID } }); expect(created).not.toHaveProperty("raw_key");
     const replay = await (await call("/v1/manage/api-keys/create", keyRequest)).json<Record<string, unknown>>();
     expect(replay).toMatchObject({ api_key: { id: scope.keyID } }); expect(replay).not.toHaveProperty("raw_key");
     expect((await call("/v1/manage/api-keys/create", { ...keyRequest, name: "different" })).status).toBe(409);

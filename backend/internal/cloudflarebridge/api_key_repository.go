@@ -154,20 +154,32 @@ func (r *APIKeyRepository) DeleteWithAuditForOwner(ctx context.Context, id, user
 	return management.RevokeManagedAPIKey(ctx, id, &userID)
 }
 
-func (r *APIKeyRepository) ListByUserID(context.Context, int64, pagination.PaginationParams, service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
-	return nil, nil, ErrNotMigrated
+func (r *APIKeyRepository) ListByUserID(ctx context.Context, userID int64, params pagination.PaginationParams, filters service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
+	reads, err := r.reads()
+	if err != nil {
+		return nil, nil, err
+	}
+	return reads.ListManagedAPIKeysByOwner(ctx, userID, params, filters)
 }
 
 func (r *APIKeyRepository) VerifyOwnership(context.Context, int64, []int64) ([]int64, error) {
 	return nil, ErrNotMigrated
 }
 
-func (r *APIKeyRepository) CountByUserID(context.Context, int64) (int64, error) {
-	return 0, ErrNotMigrated
+func (r *APIKeyRepository) CountByUserID(ctx context.Context, userID int64) (int64, error) {
+	reads, err := r.reads()
+	if err != nil {
+		return 0, err
+	}
+	return reads.CountManagedAPIKeysByOwner(ctx, userID)
 }
 
-func (r *APIKeyRepository) ExistsByKey(context.Context, string) (bool, error) {
-	return false, ErrNotMigrated
+func (r *APIKeyRepository) ExistsByKey(ctx context.Context, rawKey string) (bool, error) {
+	reads, err := r.reads()
+	if err != nil {
+		return false, err
+	}
+	return reads.ManagedAPIKeyExists(ctx, rawKey)
 }
 
 func (r *APIKeyRepository) ListByGroupID(context.Context, int64, pagination.PaginationParams) ([]service.APIKey, *pagination.PaginationResult, error) {

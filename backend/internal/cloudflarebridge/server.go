@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -47,9 +48,15 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 		return nil, fmt.Errorf("disable trusted proxies: %w", err)
 	}
 
-	authRepo := NewAPIKeyRepository(control)
-	authService := service.NewAPIKeyService(authRepo, nil, nil, nil, nil, nil, runtime.Application)
-	authMiddleware := middleware.NewAPIKeyAuthMiddleware(authService, nil, runtime.Application)
+	apiKeyRepo := NewAPIKeyRepository(control)
+	authUserRepo := NewAuthUserRepository(control)
+	groupReader := NewManagedGroupReader(control)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
+	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
+	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
+	authHandler := handler.NewAuthHandler(runtime.Application, userAuthService, nil, nil, nil, nil, nil, nil)
+	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
+	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
 	forwarder := service.NewCloudflareVerticalSliceOpenAIGatewayService(runtime.Application, upstream)
 	handler := &gatewayHandler{
 		control:         control,
@@ -61,13 +68,38 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "deployment_mode": DeploymentModeValue})
 	})
 
+	v1 := router.Group("/api/v1")
+	v1.POST("/auth/login", authHandler.Login)
+	authenticated := v1.Group("")
+	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
+	keys := authenticated.Group("/keys")
+	keys.GET("", apiKeyHandler.List)
+	keys.GET("/:id", apiKeyHandler.GetByID)
+	keys.POST("", apiKeyHandler.Create)
+	keys.PUT("/:id", apiKeyHandler.Update)
+	keys.DELETE("/:id", apiKeyHandler.Delete)
+	authenticated.GET("/groups/available", apiKeyHandler.GetAvailableGroups)
+
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))
 	gateway.Use(middleware.ClientRequestID())
-	gateway.Use(gin.HandlerFunc(authMiddleware))
+	gateway.Use(gin.HandlerFunc(apiKeyAuthMiddleware))
 	gateway.POST("/chat/completions", handler.chatCompletions)
 
 	return router, nil
+}
+
+// emptySubscriptionReader is intentionally narrow: the current Cloudflare
+// slice admits standard OpenAI groups only. A direct subscription lookup is an
+// unsupported capability and therefore fails closed.
+type emptySubscriptionReader struct{}
+
+func (emptySubscriptionReader) GetActiveByUserIDAndGroupID(context.Context, int64, int64) (*service.UserSubscription, error) {
+	return nil, ErrNotMigrated
+}
+
+func (emptySubscriptionReader) ListActiveByUserID(context.Context, int64) ([]service.UserSubscription, error) {
+	return []service.UserSubscription{}, nil
 }
 
 func (h *gatewayHandler) chatCompletions(c *gin.Context) {

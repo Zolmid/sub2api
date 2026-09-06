@@ -173,6 +173,7 @@ func (f *fakeHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, account
 
 func testRuntimeConfig(t *testing.T) *RuntimeConfig {
 	t.Helper()
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "mock.upstream")
 	t.Setenv("SUB2API_CF_ALLOW_TEST_FIXTURE", "")

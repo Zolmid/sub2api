@@ -15,13 +15,15 @@ import (
 const (
 	DeploymentModeEnv   = "SUB2API_DEPLOYMENT_MODE"
 	DeploymentModeValue = "cloudflare"
+	JWTSecretEnv        = "SUB2API_CF_JWT_SECRET"
 
-	defaultControlPlaneURL = "http://" + InternalHost
-	defaultServerHost      = "0.0.0.0"
-	defaultServerPort      = 8080
-	defaultMaxBodyBytes    = 16 << 20
-	defaultTextBodyBytes   = 4 << 20
-	defaultLeaseTTLSeconds = 90
+	defaultControlPlaneURL  = "http://" + InternalHost
+	defaultServerHost       = "0.0.0.0"
+	defaultServerPort       = 8080
+	defaultMaxBodyBytes     = 16 << 20
+	defaultTextBodyBytes    = 4 << 20
+	defaultLeaseTTLSeconds  = 90
+	defaultJWTExpireMinutes = 60
 )
 
 type RuntimeConfig struct {
@@ -38,6 +40,10 @@ func EnabledFromEnv() bool {
 }
 
 func LoadRuntimeConfigFromEnv() (*RuntimeConfig, error) {
+	jwtSecret := strings.TrimSpace(os.Getenv(JWTSecretEnv))
+	if len([]byte(jwtSecret)) < 32 {
+		return nil, fmt.Errorf("%s must contain at least 32 bytes", JWTSecretEnv)
+	}
 	controlPlaneURL := strings.TrimSpace(os.Getenv("SUB2API_CF_CONTROL_PLANE_URL"))
 	if controlPlaneURL == "" {
 		controlPlaneURL = defaultControlPlaneURL
@@ -112,6 +118,14 @@ func LoadRuntimeConfigFromEnv() (*RuntimeConfig, error) {
 			TextMaxBodySize:              defaultTextBodyBytes,
 			UpstreamResponseReadMaxBytes: config.DefaultUpstreamResponseReadMaxBytes,
 		},
+		JWT: config.JWTConfig{
+			Secret:                   jwtSecret,
+			ExpireHour:               1,
+			AccessTokenExpireMinutes: defaultJWTExpireMinutes,
+			RefreshTokenExpireDays:   30,
+			RefreshWindowMinutes:     15,
+		},
+		Default: config.DefaultConfig{APIKeyPrefix: "sk-"},
 	}
 
 	return &RuntimeConfig{

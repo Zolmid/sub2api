@@ -27,7 +27,6 @@ func TestAPIKeyRepositoryCreateUsesPrivateManagementProtocol(t *testing.T) {
 		require.Equal(t, ProtocolVersion, r.Header.Get("X-Sub2API-Bridge-Version"))
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
 		response := map[string]any{
-			"raw_key": rawKey,
 			"api_key": map[string]any{
 				"id":           captured["id"],
 				"user_id":      captured["user_id"],

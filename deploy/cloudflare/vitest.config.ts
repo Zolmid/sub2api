@@ -10,6 +10,9 @@ const workerOptions = async () => ({
   wrangler: { configPath: "./wrangler.test.jsonc" },
   miniflare: {
     bindings: {
+      // Explicit local-only value; production receives this binding through
+      // Worker secrets and no wrangler vars file contains it.
+      SUB2API_CF_JWT_SECRET: "test-only-cloudflare-jwt-secret-32-bytes",
       TEST_MIGRATIONS: await readD1Migrations(
         new URL("./migrations", import.meta.url).pathname,
       ),

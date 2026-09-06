@@ -3,12 +3,19 @@
 package cloudflarebridge
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
+func setTestJWTSecret(t *testing.T) {
+	t.Helper()
+	t.Setenv(JWTSecretEnv, strings.Repeat("t", 32))
+}
+
 func TestRuntimeConfigFailsClosedWithoutAuthorizedUpstreamHosts(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "")
 	t.Setenv("SUB2API_CF_ALLOW_TEST_FIXTURE", "")
@@ -19,6 +26,7 @@ func TestRuntimeConfigFailsClosedWithoutAuthorizedUpstreamHosts(t *testing.T) {
 }
 
 func TestRuntimeConfigFixtureUsesOnlyVirtualMockHost(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "")
 	t.Setenv("SUB2API_CF_ALLOW_TEST_FIXTURE", "true")
@@ -34,6 +42,7 @@ func TestRuntimeConfigFixtureUsesOnlyVirtualMockHost(t *testing.T) {
 }
 
 func TestRuntimeConfigFixtureRejectsAdditionalHosts(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "mock.upstream,api.openai.com")
 	t.Setenv("SUB2API_CF_ALLOW_TEST_FIXTURE", "true")
@@ -44,6 +53,7 @@ func TestRuntimeConfigFixtureRejectsAdditionalHosts(t *testing.T) {
 }
 
 func TestRuntimeConfigRejectsInvalidLeaseTTL(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "api.openai.com")
 	t.Setenv("SUB2API_CF_LEASE_TTL_SECONDS", "2")
@@ -53,6 +63,7 @@ func TestRuntimeConfigRejectsInvalidLeaseTTL(t *testing.T) {
 }
 
 func TestRuntimeConfigRejectsPublicControlPlaneURL(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "https://api.cloudflare.com/client/v4")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "api.openai.com")
 
@@ -61,6 +72,7 @@ func TestRuntimeConfigRejectsPublicControlPlaneURL(t *testing.T) {
 }
 
 func TestRuntimeConfigNormalizesAuthorizedHosts(t *testing.T) {
+	setTestJWTSecret(t)
 	t.Setenv("SUB2API_CF_CONTROL_PLANE_URL", "")
 	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "API.Example.com.,api.example.com")
 	t.Setenv("SUB2API_CF_ALLOW_TEST_FIXTURE", "")
@@ -68,4 +80,16 @@ func TestRuntimeConfigNormalizesAuthorizedHosts(t *testing.T) {
 	runtime, err := LoadRuntimeConfigFromEnv()
 	require.NoError(t, err)
 	require.Equal(t, []string{"api.example.com"}, runtime.AllowedHosts)
+}
+
+func TestRuntimeConfigRequiresStrongCloudflareJWTSecret(t *testing.T) {
+	t.Setenv(JWTSecretEnv, strings.Repeat("x", 31))
+	_, err := LoadRuntimeConfigFromEnv()
+	require.ErrorContains(t, err, JWTSecretEnv)
+
+	t.Setenv(JWTSecretEnv, strings.Repeat("密", 11))
+	t.Setenv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS", "api.example.com")
+	runtime, err := LoadRuntimeConfigFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, defaultJWTExpireMinutes, runtime.Application.JWT.AccessTokenExpireMinutes)
 }

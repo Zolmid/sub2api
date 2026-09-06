@@ -1,6 +1,7 @@
 import type { Completion, UsageEnvelope } from "./contracts";
 import { decryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
 import { managementControlPlane } from "./management";
+import { privateDataPlane } from "./private-data";
 import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
@@ -121,6 +122,11 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
         return await relayLeaseAction(request, env, "/release");
       case "/v1/requests/complete":
         return await completeRequest(request, env);
+      case "/v1/private/auth-users/get":
+      case "/v1/private/api-keys/list-by-owner":
+      case "/v1/private/api-keys/count-by-owner":
+      case "/v1/private/api-keys/exists":
+        return await privateDataPlane(request, env, url.pathname);
       case "/v1/manage/users/create":
       case "/v1/manage/users/get":
       case "/v1/manage/users/list":

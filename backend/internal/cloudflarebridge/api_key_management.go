@@ -39,7 +39,9 @@ type managedAPIKeyWire struct {
 
 type managedAPIKeyResponse struct {
 	APIKey managedAPIKeyWire `json:"api_key"`
-	RawKey string            `json:"raw_key,omitempty"`
+	// RawKey is decoded only so a protocol regression that returns a secret can
+	// be rejected. Correct Worker responses always leave it empty.
+	RawKey string `json:"raw_key,omitempty"`
 }
 
 // postManagedMutation retries one ambiguous private-protocol failure. Every
@@ -198,8 +200,8 @@ func (c *HTTPControlPlane) CreateManagedAPIKey(ctx context.Context, key *service
 	if created.ID != key.ID || created.UserID != key.UserID || created.GroupID == nil || *created.GroupID != *key.GroupID {
 		return nil, errors.New("invalid api key create response: identity mismatch")
 	}
-	if response.RawKey != "" && response.RawKey != key.Key {
-		return nil, errors.New("invalid api key create response: credential mismatch")
+	if response.RawKey != "" {
+		return nil, errors.New("invalid api key create response: unexpected credential")
 	}
 	created.Key = key.Key
 	return created, nil

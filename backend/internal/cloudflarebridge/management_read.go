@@ -2,6 +2,7 @@ package cloudflarebridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -162,6 +163,18 @@ type managedAccountWire struct {
 	CreatedAt      string         `json:"created_at"`
 	UpdatedAt      string         `json:"updated_at"`
 	DeletedAt      *string        `json:"deleted_at"`
+	// Any credential-bearing field is a private protocol violation. RawMessage
+	// detects the field even when a broken Worker returns null or an empty value.
+	Credentials        json.RawMessage `json:"credentials,omitempty"`
+	CredentialEnvelope json.RawMessage `json:"credential_envelope,omitempty"`
+	APIKey             json.RawMessage `json:"api_key,omitempty"`
+	BaseURL            json.RawMessage `json:"base_url,omitempty"`
+	RawKey             json.RawMessage `json:"raw_key,omitempty"`
+}
+
+func (wire managedAccountWire) leaksCredential() bool {
+	return len(wire.Credentials) != 0 || len(wire.CredentialEnvelope) != 0 || len(wire.APIKey) != 0 ||
+		len(wire.BaseURL) != 0 || len(wire.RawKey) != 0
 }
 
 func canonicalUnsignedDecimal(value string) bool {
@@ -313,7 +326,9 @@ func decodeManagedAccount(wire managedAccountWire) (*ManagedAccount, bool, error
 	if err != nil {
 		return nil, false, errors.New("invalid account deletion timestamp")
 	}
-	if strings.TrimSpace(wire.Name) == "" || len(wire.Name) > 100 || wire.Platform != service.PlatformOpenAI ||
+	if wire.leaksCredential() ||
+		wire.Name == "" || wire.Name != strings.TrimSpace(wire.Name) ||
+		len(utf16.Encode([]rune(wire.Name))) > 100 || wire.Platform != service.PlatformOpenAI ||
 		wire.Type != service.AccountTypeAPIKey || (wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		wire.Priority < -100000 || wire.Priority > 100000 || wire.MaxConcurrency < 1 || wire.MaxConcurrency > 100000 ||
 		wire.Extra == nil || len(wire.GroupIDs) > 100 {

@@ -9,7 +9,11 @@ import {
   readJson,
   sha256,
 } from "./contracts";
-import { encryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
+import {
+  encryptAPIKeyCredentials,
+  validateAPIKeyCredentials,
+  type CredentialRuntime,
+} from "./credentials";
 
 const ID_MAX = 20;
 const PAGE_MAX = 100;
@@ -53,6 +57,9 @@ const stringArray = (value: unknown, maximum = 100, decimal = false): string[] |
   const values = value as string[];
   return new Set(values).size === values.length ? values : null;
 };
+const sortedDecimalIDs = (values: string[] | null): string[] | null => values === null
+  ? null
+  : [...values].sort((left, right) => left.length - right.length || (left < right ? -1 : left > right ? 1 : 0));
 const date = (value: unknown): string | null | undefined => {
   if (value === null) return null;
   if (!isBoundedString(value, 64) || !Number.isFinite(Date.parse(value))) return undefined;
@@ -126,6 +133,11 @@ function accountReadProjection(account: Account): Account {
     max_concurrency: account.max_concurrency, extra, group_ids: account.group_ids,
     created_at: account.created_at, updated_at: account.updated_at, deleted_at: account.deleted_at,
   };
+}
+
+function accountExtraOK(extra: Record<string, unknown>): boolean {
+  const keys = Object.keys(extra);
+  return keys.length === 0 || (keys.length === 1 && typeof extra.privacy_mode === "string" && readablePrivacyModes.has(extra.privacy_mode));
 }
 
 function accountOperationReadProjection(response: Record<string, unknown>): Record<string, unknown> | null {
@@ -688,13 +700,303 @@ async function rebindKeyGroup(env: Env, route: string, body: Record<string, unkn
 }
 
 async function accountMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
-  const create=route.endsWith("/create");const remove=route.endsWith("/delete");const keys=create?["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"]:remove?["operation_id","id"]:["operation_id","id","name","platform","status","schedulable","priority","max_concurrency","credentials","extra","group_ids"];
-  if(!only(body,keys)||!id(body.id))return error("INVALID_REQUEST");const credentials=body.credentials;const fingerprint=credentials===undefined?body:{...body,credentials:"sha256:"+await sha256(canonical(credentials))};const prior=await lookupOperation(env,route,operation,fingerprint);if(prior){if(prior.kind!=="replay")return error("CONFLICT",409);const safe=accountOperationReadProjection(prior.response);return safe?json(safe):error("CONTROL_PLANE_UNAVAILABLE",503);}const old=await getAccount(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(remove)return replyNoopMutation(env,route,operation,fingerprint,{account:accountReadProjection(old)});return error("CONFLICT",409);}const stamp=now();const groups=stringArray(body.group_ids??old?.group_ids,100,true);
-  if(remove){const account:Account={...old!,status:"disabled",schedulable:false,deleted_at:stamp,updated_at:stamp};return replyMutation(env,route,operation,body,{account:accountReadProjection(account)},[env.DB.prepare("UPDATE accounts SET status='disabled',schedulable=0,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(stamp,stamp,account.id)]);}
-  const account:Account={id:body.id,name:(body.name??old?.name)as string,platform:(body.platform??old?.platform)as string,type:"apikey",status:(body.status??old?.status)as string,schedulable:(body.schedulable??old?.schedulable)as boolean,priority:(body.priority??old?.priority)as number,max_concurrency:(body.max_concurrency??old?.max_concurrency)as number,extra:(body.extra??old?.extra)as Record<string,unknown>,group_ids:groups??[],created_at:old?.created_at??stamp,updated_at:stamp,deleted_at:old?.deleted_at??null};
-  if(!isBoundedString(account.name,100)||account.platform!=="openai"||!status(account.status)||typeof account.schedulable!=="boolean"||!Number.isInteger(account.priority)||account.priority<-100000||account.priority>100000||!Number.isInteger(account.max_concurrency)||account.max_concurrency<1||account.max_concurrency>100000||!isObject(account.extra)||!groups||groups.length===0||!(await groupsExist(env,groups,true))||(create&&credentials===undefined))return error("INVALID_REQUEST");account.group_ids=groups;
-  const runtime=env as unknown as CredentialRuntime;const encrypted=credentials===undefined?undefined:await encryptAPIKeyCredentials(credentials,runtime);if(credentials!==undefined&&!encrypted)return error("INVALID_REQUEST");
-  const statements:D1PreparedStatement[]=create?[env.DB.prepare("INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(account.id,account.name,account.platform,"apikey",account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted,sqlJSON(account.extra),account.created_at,account.updated_at,account.deleted_at)]:[env.DB.prepare("UPDATE accounts SET name=?,platform=?,status=?,schedulable=?,priority=?,max_concurrency=?,credential_envelope=COALESCE(?,credential_envelope),extra_json=?,updated_at=?,deleted_at=? WHERE id=? AND type='apikey' AND deleted_at IS NULL").bind(account.name,account.platform,account.status,account.schedulable?1:0,account.priority,account.max_concurrency,encrypted??null,sqlJSON(account.extra),account.updated_at,account.deleted_at,account.id),env.DB.prepare("DELETE FROM account_groups WHERE account_id=? AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,operation)];
-  for(const groupID of groups)statements.push(env.DB.prepare("INSERT INTO account_groups(account_id,group_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(account.id,groupID,operation));
-  return replyMutation(env,route,operation,fingerprint,{account:accountReadProjection(account)},statements);
+  if (route.endsWith("/create")) return createAccountMutation(env, route, body, operation);
+  if (route.endsWith("/delete")) return deleteAccountMutation(env, route, body, operation);
+  return updateAccountMutation(env, route, body, operation);
+}
+
+const accountCreateKeys = [
+  "operation_id", "id", "name", "platform", "status", "schedulable",
+  "priority", "max_concurrency", "credentials", "extra", "group_ids",
+];
+const accountUpdateKeys = accountCreateKeys.filter((key) => key !== "credentials").concat("credentials");
+const accountPatchKeys = accountUpdateKeys.filter((key) => key !== "operation_id" && key !== "id");
+const liveCompatibleAccountGroupPredicate =
+  "NOT EXISTS (SELECT 1 FROM json_each(?) requested LEFT JOIN groups g ON g.id=requested.value " +
+  "WHERE g.id IS NULL OR g.deleted_at IS NOT NULL OR g.status<>'active' OR g.platform<>'openai' OR g.subscription_type<>'standard')";
+
+function validAccountFields(account: Account, groups: string[] | null): boolean {
+  return isBoundedString(account.name, 100) &&
+    account.name.trim() === account.name &&
+    account.platform === "openai" &&
+    status(account.status) &&
+    typeof account.schedulable === "boolean" &&
+    Number.isInteger(account.priority) && account.priority >= -100000 && account.priority <= 100000 &&
+    Number.isInteger(account.max_concurrency) && account.max_concurrency >= 1 && account.max_concurrency <= 100000 &&
+    isObject(account.extra) && accountExtraOK(account.extra) &&
+    groups !== null && groups.length > 0;
+}
+
+function validAccountPatch(body: Record<string, unknown>, groups: string[] | null): boolean {
+  if (!accountPatchKeys.some((key) => body[key] !== undefined)) return false;
+  if (body.name !== undefined && !isBoundedString(body.name, 100)) return false;
+  if (body.platform !== undefined && body.platform !== "openai") return false;
+  if (body.status !== undefined && !status(body.status)) return false;
+  if (body.schedulable !== undefined && typeof body.schedulable !== "boolean") return false;
+  if (body.priority !== undefined &&
+    (!Number.isInteger(body.priority) || Number(body.priority) < -100000 || Number(body.priority) > 100000)) return false;
+  if (body.max_concurrency !== undefined &&
+    (!Number.isInteger(body.max_concurrency) || Number(body.max_concurrency) < 1 || Number(body.max_concurrency) > 100000)) return false;
+  if (body.extra !== undefined && (!isObject(body.extra) || !accountExtraOK(body.extra))) return false;
+  return body.group_ids === undefined || (groups !== null && groups.length > 0);
+}
+
+async function compatibleAccountGroupsExist(env: Env, groups: string[]): Promise<boolean> {
+  if (groups.length === 0) return false;
+  const marks = groups.map(() => "?").join(",");
+  const row = await env.DB.prepare(
+    "SELECT count(*) count FROM groups WHERE id IN (" + marks + ") AND deleted_at IS NULL " +
+    "AND status='active' AND platform='openai' AND subscription_type='standard'",
+  ).bind(...groups).first<{ count: number }>();
+  return row?.count === groups.length;
+}
+
+function accountCredentialCandidate(
+  value: unknown,
+  runtime: CredentialRuntime,
+): Record<string, string> | null {
+  if (!isObject(value) || !only(value, ["api_key", "base_url"])) return null;
+  return validateAPIKeyCredentials(value, runtime);
+}
+
+async function accountMutationReply(
+  env: Env,
+  route: string,
+  operation: string,
+  fingerprint: unknown,
+  response: Record<string, unknown>,
+  statements: D1PreparedStatement[],
+): Promise<Response | null> {
+  const saved = await managedOperation(env, route, operation, fingerprint, response, statements);
+  if (!saved) return null;
+  const safe = accountOperationReadProjection(saved.response);
+  return safe ? json({ ...safe, replayed: saved.replay }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+}
+
+async function createAccountMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  const groups = sortedDecimalIDs(stringArray(body.group_ids, 100, true));
+  const runtime = env as unknown as CredentialRuntime;
+  const credentials = accountCredentialCandidate(body.credentials, runtime);
+  const stamp = now();
+  const account: Account = {
+    id: body.id as string,
+    name: body.name as string,
+    platform: body.platform as string,
+    type: "apikey",
+    status: body.status as string,
+    schedulable: body.schedulable as boolean,
+    priority: body.priority as number,
+    max_concurrency: body.max_concurrency as number,
+    extra: body.extra as Record<string, unknown>,
+    group_ids: groups ?? [],
+    created_at: stamp,
+    updated_at: stamp,
+    deleted_at: null,
+  };
+  if (!only(body, accountCreateKeys) || !id(body.id) || !credentials || !validAccountFields(account, groups)) {
+    return error("INVALID_REQUEST");
+  }
+
+  // The candidate ID is transport allocation, not create intent. Credentials
+  // participate only through a digest and the canonical plaintext is never
+  // written to management_operations.
+  const fingerprint = {
+    operation_id: operation,
+    name: account.name,
+    platform: account.platform,
+    status: account.status,
+    schedulable: account.schedulable,
+    priority: account.priority,
+    max_concurrency: account.max_concurrency,
+    credential_digest: await sha256(canonical(credentials)),
+    extra: account.extra,
+    group_ids: account.group_ids,
+  };
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    if (prior.kind !== "replay") return error("IDEMPOTENCY_CONFLICT", 409);
+    const safe = accountOperationReadProjection(prior.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+  if (await getAccount(env, account.id)) return error("CONFLICT", 409);
+  if (!(await compatibleAccountGroupsExist(env, account.group_ids))) return error("REFERENCE_REJECTED", 409);
+
+  const encrypted = await encryptAPIKeyCredentials(credentials, runtime);
+  if (!encrypted) return error("INVALID_REQUEST");
+  const statement = env.DB.prepare(
+    "INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at,deleted_at) " +
+    "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE " + liveCompatibleAccountGroupPredicate,
+  ).bind(
+    account.id, account.name, account.platform, account.type, account.status,
+    account.schedulable ? 1 : 0, account.priority, account.max_concurrency,
+    encrypted, sqlJSON(account.extra), account.created_at, account.updated_at,
+    account.deleted_at, sqlJSON(account.group_ids),
+  );
+  const statements: D1PreparedStatement[] = [statement];
+  for (const groupID of account.group_ids) {
+    statements.push(env.DB.prepare(
+      "INSERT INTO account_groups(account_id,group_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)",
+    ).bind(account.id, groupID, operation));
+  }
+  const response = await accountMutationReply(
+    env, route, operation, fingerprint, { account: accountReadProjection(account) }, statements,
+  );
+  if (response) return response;
+
+  if (!(await compatibleAccountGroupsExist(env, account.group_ids))) return error("REFERENCE_REJECTED", 409);
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") {
+    const safe = accountOperationReadProjection(raced.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
+}
+
+async function updateAccountMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  const groupsProvided = body.group_ids !== undefined;
+  const groups = groupsProvided ? sortedDecimalIDs(stringArray(body.group_ids, 100, true)) : null;
+  const runtime = env as unknown as CredentialRuntime;
+  const credentials = body.credentials === undefined
+    ? undefined
+    : accountCredentialCandidate(body.credentials, runtime);
+  if (!only(body, accountUpdateKeys) || !id(body.id) || !validAccountPatch(body, groups) || credentials === null) {
+    return error("INVALID_REQUEST");
+  }
+  const normalizedBody = groupsProvided ? { ...body, group_ids: groups } : body;
+  const fingerprint = credentials === undefined
+    ? normalizedBody
+    : { ...normalizedBody, credentials: "sha256:" + await sha256(canonical(credentials)) };
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    if (prior.kind !== "replay") return error("IDEMPOTENCY_CONFLICT", 409);
+    const safe = accountOperationReadProjection(prior.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+
+  const old = await getAccount(env, body.id);
+  if (!old) return error("NOT_FOUND", 404);
+  if (old.deleted_at !== null) return error("CONFLICT", 409);
+  if (groupsProvided && !(await compatibleAccountGroupsExist(env, groups!))) {
+    return error("REFERENCE_REJECTED", 409);
+  }
+  const stamp = now();
+  const account: Account = {
+    ...old,
+    name: (body.name ?? old.name) as string,
+    platform: (body.platform ?? old.platform) as string,
+    status: (body.status ?? old.status) as string,
+    schedulable: (body.schedulable ?? old.schedulable) as boolean,
+    priority: (body.priority ?? old.priority) as number,
+    max_concurrency: (body.max_concurrency ?? old.max_concurrency) as number,
+    extra: (body.extra ?? old.extra) as Record<string, unknown>,
+    group_ids: groupsProvided ? groups! : old.group_ids,
+    updated_at: stamp,
+  };
+  if (!validAccountFields(account, account.group_ids)) return error("INVALID_REQUEST");
+  const encrypted = credentials === undefined
+    ? undefined
+    : await encryptAPIKeyCredentials(credentials, runtime);
+  if (credentials !== undefined && !encrypted) return error("INVALID_REQUEST");
+
+  let updateSQL =
+    "UPDATE accounts SET name=?,platform=?,status=?,schedulable=?,priority=?,max_concurrency=?," +
+    "credential_envelope=COALESCE(?,credential_envelope),extra_json=?,updated_at=?,deleted_at=? " +
+    "WHERE id=? AND type='apikey' AND deleted_at IS NULL";
+  const bindings: unknown[] = [
+    account.name, account.platform, account.status, account.schedulable ? 1 : 0,
+    account.priority, account.max_concurrency, encrypted ?? null,
+    sqlJSON(account.extra), account.updated_at, account.deleted_at, account.id,
+  ];
+  if (groupsProvided) {
+    updateSQL += " AND " + liveCompatibleAccountGroupPredicate;
+    bindings.push(sqlJSON(account.group_ids));
+  }
+  const statements: D1PreparedStatement[] = [env.DB.prepare(updateSQL).bind(...bindings)];
+  if (groupsProvided) {
+    statements.push(env.DB.prepare(
+      "DELETE FROM account_groups WHERE account_id=? AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)",
+    ).bind(account.id, operation));
+    for (const groupID of account.group_ids) {
+      statements.push(env.DB.prepare(
+        "INSERT INTO account_groups(account_id,group_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)",
+      ).bind(account.id, groupID, operation));
+    }
+  }
+  const response = await accountMutationReply(
+    env, route, operation, fingerprint, { account: accountReadProjection(account) }, statements,
+  );
+  if (response) return response;
+  if (groupsProvided && !(await compatibleAccountGroupsExist(env, account.group_ids))) {
+    return error("REFERENCE_REJECTED", 409);
+  }
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") {
+    const safe = accountOperationReadProjection(raced.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
+}
+
+async function deleteAccountMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  if (!only(body, ["operation_id", "id"]) || !id(body.id)) return error("INVALID_REQUEST");
+  const fingerprint = body;
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    if (prior.kind !== "replay") return error("IDEMPOTENCY_CONFLICT", 409);
+    const safe = accountOperationReadProjection(prior.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+  const old = await getAccount(env, body.id);
+  if (!old) return error("NOT_FOUND", 404);
+  if (old.deleted_at !== null) {
+    const stored = await recordNoopOperation(
+      env, route, operation, fingerprint, { account: accountReadProjection(old) },
+    );
+    const safe = stored && accountOperationReadProjection(stored);
+    return safe ? json({ ...safe, replayed: false }) : error("IDEMPOTENCY_CONFLICT", 409);
+  }
+  const stamp = now();
+  const account: Account = {
+    ...old,
+    status: "disabled",
+    schedulable: false,
+    updated_at: stamp,
+    deleted_at: stamp,
+  };
+  const response = await accountMutationReply(
+    env,
+    route,
+    operation,
+    fingerprint,
+    { account: accountReadProjection(account) },
+    [env.DB.prepare(
+      "UPDATE accounts SET status='disabled',schedulable=0,updated_at=?,deleted_at=? " +
+      "WHERE id=? AND type='apikey' AND deleted_at IS NULL",
+    ).bind(stamp, stamp, account.id)],
+  );
+  if (response) return response;
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") {
+    const safe = accountOperationReadProjection(raced.response);
+    return safe ? json({ ...safe, replayed: true }) : error("CONTROL_PLANE_UNAVAILABLE", 503);
+  }
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
 }

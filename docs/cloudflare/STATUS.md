@@ -4,6 +4,28 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
 
 ## Completed and locally evidenced
 
+- Added bounded Cloudflare-mode administrator account CRUD for OpenAI API-key
+  accounts through the private Worker management routes. The local contract is
+  limited to name, active/inactive status, schedulable, priority, concurrency,
+  AES-GCM `api_key`/`base_url`, safe `privacy_mode`, and compatible live groups.
+  Account create idempotency fingerprints semantic fields and a credential
+  digest rather than the disposable candidate ID; replay returns the original
+  committed account without retaining plaintext credentials. Updates preserve
+  omitted envelopes, replacements are encrypted, and delete leaves a disabled,
+  unschedulable tombstone that admission excludes.
+  The embedded console has a dedicated Cloudflare branch for this contract:
+  create/edit/filter/list expose only supported fields and actions, omit
+  credential replacement when the key is blank, preserve exact decimal-string
+  IDs, and suppress legacy probes, bulk tools, and unsupported row actions.
+  Traditional-mode components and request payloads retain their existing paths.
+  The automated local gate passed the Go 1.27 bridge package, Worker TypeScript
+  and generated types, workerd (8 files / 55 tests), the five focused frontend
+  files (106 tests), and the full frontend suite (257 files / 1884 tests),
+  typecheck, read-only lint, and production build. Composed browser and current
+  production-config dry-run evidence are recorded separately when completed.
+  OAuth/import/test/refresh/batch/export and other platform/type paths remain
+  unavailable; this is not remote deployment or real-upstream evidence.
+
 - Locked the upstream source, dependency/tool versions, license, and initial
   test results in `BASELINE.md`.
 - Audited the major PostgreSQL, Redis, process-local, filesystem, gateway,
@@ -120,7 +142,7 @@ production acceptance remain separate gates.
   hides unbind, and offers only active standard OpenAI groups. Traditional mode
   retains its existing selector behavior.
 - Isolated automated evidence passed: Go 1.27 cloudflarebridge package tests;
-  workerd-backed Worker tests (8 files / 52 tests); the focused frontend
+  workerd-backed Worker tests (8 files / 55 tests); the focused frontend
   component suite (3 tests), typecheck, and lint; and a Wrangler 4.129.0
   production-config dry-run that rebuilt the frontend, Go binary, distroless
   image, and 160.55 KiB Worker bundle (35.22 KiB gzip).
@@ -145,9 +167,9 @@ fail closed.
 
 ## Explicitly not complete
 
-This branch is not yet a full Sub2API Cloudflare migration. Remaining admin API
-key writes beyond standard-group rebind and all account writes, user
-role/step-up operations, dedicated balance changes,
+This branch is not yet a full Sub2API Cloudflare migration. Account writes
+outside the bounded OpenAI API-key CRUD contract, user role/step-up operations,
+dedicated balance changes,
 default subscriptions/default balance, complete repositories, subscriptions,
 pricing, reservation and authoritative monetary ledger, multi-account
 scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
@@ -181,9 +203,11 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    user mutation, and drive the remaining embedded-console flows—especially
    ambiguous admin-user create retry—in a real browser. The bounded API-key
    rebind browser flow and composed API lifecycle now pass separately.
-2. Complete the remaining bounded stage C management surfaces: admin API-key
-   writes beyond standard-group rebind and API-key-account writes, with shared
-   contract tests and no PostgreSQL/Redis fallback.
+2. Treat the existing user-owned API-key lifecycle plus the administrator
+   owner-list/group-rebind contract as the complete current API-key management
+   surface; do not invent administrator CRUD routes absent from the upstream
+   public contract. Keep OAuth/import/test/refresh/batch/export account
+   operations fail-closed until separately designed and tested.
 3. Design role promotion/demotion and balance changes only with their required
    step-up, audit, reservation, and ledger semantics. Default subscription and
    default-balance behavior must also be made explicit.

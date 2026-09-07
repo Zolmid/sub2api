@@ -893,7 +893,8 @@ func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testi
 	tombstone := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741995", adminToken, "")
 	require.Equal(t, http.StatusNotFound, tombstone.Code, tombstone.Body.String())
 	accountMutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/accounts", adminToken, "{}")
-	require.Equal(t, http.StatusNotFound, accountMutation.Code, accountMutation.Body.String())
+	require.Equal(t, http.StatusBadRequest, accountMutation.Code, accountMutation.Body.String())
+	require.Contains(t, accountMutation.Body.String(), "IDEMPOTENCY_KEY_REQUIRED")
 }
 
 func TestCloudflareAdminAPIKeyGroupRebindRequiresAdminAndUsesStrictPublicContract(t *testing.T) {

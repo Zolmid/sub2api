@@ -2,17 +2,32 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defineComponent } from 'vue'
 import { mount } from '@vue/test-utils'
 
-const { updateAccountMock, checkMixedChannelRiskMock, authIsSimpleMode } = vi.hoisted(() => ({
+const {
+  updateAccountMock,
+  checkMixedChannelRiskMock,
+  getWebSearchEmulationConfigMock,
+  getSettingsMock,
+  listTLSProfilesMock,
+  authIsSimpleMode,
+  appRuntimeVersion
+} = vi.hoisted(() => ({
   updateAccountMock: vi.fn(),
   checkMixedChannelRiskMock: vi.fn(),
-  authIsSimpleMode: { value: true }
+  getWebSearchEmulationConfigMock: vi.fn(),
+  getSettingsMock: vi.fn(),
+  listTLSProfilesMock: vi.fn(),
+  authIsSimpleMode: { value: true },
+  appRuntimeVersion: { value: 'traditional' }
 }))
 
 vi.mock('@/stores/app', () => ({
   useAppStore: () => ({
     showError: vi.fn(),
     showSuccess: vi.fn(),
-    showInfo: vi.fn()
+    showInfo: vi.fn(),
+    get cachedPublicSettings() {
+      return { version: appRuntimeVersion.value }
+    }
   })
 }))
 
@@ -31,11 +46,11 @@ vi.mock('@/api/admin', () => ({
       checkMixedChannelRisk: checkMixedChannelRiskMock
     },
     settings: {
-      getWebSearchEmulationConfig: vi.fn().mockResolvedValue({ enabled: false, providers: [] }),
-      getSettings: vi.fn().mockResolvedValue({})
+      getWebSearchEmulationConfig: getWebSearchEmulationConfigMock,
+      getSettings: getSettingsMock
     },
     tlsFingerprintProfiles: {
-      list: vi.fn().mockResolvedValue([])
+      list: listTLSProfilesMock
     }
   }
 }))
@@ -302,13 +317,13 @@ function buildOpenAIOAuthParentAccount() {
   } as any
 }
 
-function mountModal(account = buildAccount()) {
+function mountModal(account = buildAccount(), groups: any[] = []) {
   return mount(EditAccountModal, {
     props: {
       show: true,
       account,
       proxies: [],
-      groups: []
+      groups
     },
     global: {
       stubs: {
@@ -323,9 +338,90 @@ function mountModal(account = buildAccount()) {
   })
 }
 
+beforeEach(() => {
+  appRuntimeVersion.value = 'traditional'
+  getWebSearchEmulationConfigMock.mockReset().mockResolvedValue({ enabled: false, providers: [] })
+  getSettingsMock.mockReset().mockResolvedValue({})
+  listTLSProfilesMock.mockReset().mockResolvedValue([])
+})
+
 describe('EditAccountModal', () => {
   beforeEach(() => {
     authIsSimpleMode.value = true
+  })
+
+  it('keeps existing encrypted credentials while editing strict Cloudflare-native fields', async () => {
+    appRuntimeVersion.value = 'cloudflare'
+    const exactAccountID = '9007199254740994'
+    const exactGroupID = '9007199254740993'
+    const account = {
+      ...buildAccount(),
+      id: exactAccountID,
+      credentials: undefined,
+      credentials_status: { has_api_key: true },
+      extra: { privacy_mode: 'training_off' },
+      schedulable: true,
+      group_ids: [exactGroupID]
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    const wrapper = mountModal(account, [{
+      id: exactGroupID,
+      name: 'OpenAI standard',
+      platform: 'openai',
+      status: 'active',
+      subscription_type: 'standard'
+    }])
+
+    expect(wrapper.find('[data-testid="cloudflare-account-edit-scope"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('admin.accounts.notes')
+    expect(getWebSearchEmulationConfigMock).not.toHaveBeenCalled()
+    expect(getSettingsMock).not.toHaveBeenCalled()
+    expect(listTLSProfilesMock).not.toHaveBeenCalled()
+    await wrapper.get('[data-tour="edit-account-form-name"]').setValue('  Cloudflare edited  ')
+    await wrapper.get('[data-testid="cloudflare-account-status"]').setValue('inactive')
+    await wrapper.get('[data-testid="cloudflare-account-schedulable"]').setValue(false)
+    await wrapper.get('[data-testid="cloudflare-account-edit-concurrency"]').setValue(5)
+    await wrapper.get('[data-testid="cloudflare-account-edit-priority"]').setValue(-1)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock).toHaveBeenCalledWith(exactAccountID, {
+      name: 'Cloudflare edited',
+      status: 'inactive',
+      schedulable: false,
+      concurrency: 5,
+      priority: -1,
+      group_ids: [exactGroupID],
+      extra: { privacy_mode: 'training_off' }
+    })
+  })
+
+  it('replaces Cloudflare-native credentials only when a new API Key is entered', async () => {
+    appRuntimeVersion.value = 'cloudflare'
+    const account = {
+      ...buildAccount(),
+      credentials: undefined,
+      credentials_status: { has_api_key: true },
+      schedulable: true,
+      group_ids: [7]
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    const wrapper = mountModal(account, [{
+      id: 7,
+      name: 'OpenAI standard',
+      platform: 'openai',
+      status: 'active',
+      subscription_type: 'standard'
+    }])
+
+    await wrapper.get('[data-testid="cloudflare-account-edit-api-key"]').setValue('  replacement-secret  ')
+    await wrapper.get('[data-testid="cloudflare-account-edit-base-url"]').setValue('https://relay.example/v1/')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials).toEqual({
+      api_key: 'replacement-secret',
+      base_url: 'https://relay.example/v1'
+    })
   })
 
   it('reopening the same account rehydrates the OpenAI whitelist from props', async () => {

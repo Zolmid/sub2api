@@ -13,7 +13,8 @@ const {
   getUpstreamBillingProbeSettings,
   getAllProxies,
   getAllGroups,
-  showError
+  showError,
+  appRuntimeVersion
 } = vi.hoisted(() => ({
   listAccounts: vi.fn(),
   listWithEtag: vi.fn(),
@@ -22,7 +23,8 @@ const {
   getUpstreamBillingProbeSettings: vi.fn(),
   getAllProxies: vi.fn(),
   getAllGroups: vi.fn(),
-  showError: vi.fn()
+  showError: vi.fn(),
+  appRuntimeVersion: { value: 'traditional' }
 }))
 
 vi.mock('@/api/admin', () => ({
@@ -44,7 +46,14 @@ vi.mock('@/api/admin', () => ({
 }))
 
 vi.mock('@/stores/app', () => ({
-  useAppStore: () => ({ showError, showSuccess: vi.fn(), showInfo: vi.fn() })
+  useAppStore: () => ({
+    showError,
+    showSuccess: vi.fn(),
+    showInfo: vi.fn(),
+    get cachedPublicSettings() {
+      return { version: appRuntimeVersion.value }
+    }
+  })
 }))
 
 vi.mock('@/stores/auth', () => ({
@@ -57,7 +66,10 @@ vi.mock('vue-i18n', async () => {
 })
 
 const DataTableStub = defineComponent({
-  props: { data: { type: Array, default: () => [] } },
+  props: {
+    data: { type: Array, default: () => [] },
+    columns: { type: Array, default: () => [] }
+  },
   template: `
     <div>
       <div v-for="row in data" :key="row.id">
@@ -152,6 +164,8 @@ const fullAccount = {
 
 describe('admin AccountsView lite account list', () => {
   beforeEach(() => {
+    appRuntimeVersion.value = 'traditional'
+    delete window.__APP_CONFIG__
     localStorage.clear()
     listAccounts.mockReset().mockResolvedValue({ items: [listRow], total: 1, page: 1, page_size: 20, pages: 1 })
     listWithEtag.mockReset().mockResolvedValue({ notModified: true, etag: 'compact-etag', data: null })
@@ -178,6 +192,61 @@ describe('admin AccountsView lite account list', () => {
       expect.objectContaining({ lite: '1' }),
       expect.objectContaining({ signal: expect.any(AbortSignal) })
     )
+    wrapper.unmount()
+  })
+
+  it('uses only migrated list columns and avoids unsupported background APIs in Cloudflare mode', async () => {
+    appRuntimeVersion.value = 'cloudflare'
+    const exactID = '9007199254740994'
+    const exactGroupID = '9007199254740993'
+    listAccounts.mockResolvedValueOnce({
+      items: [{
+        ...listRow,
+        id: exactID,
+        type: 'apikey',
+        group_ids: [exactGroupID]
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+    getAllGroups.mockResolvedValueOnce([{
+      id: exactGroupID,
+      name: 'OpenAI standard',
+      platform: 'openai',
+      status: 'active',
+      subscription_type: 'standard'
+    }])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const columns = wrapper.getComponent(DataTableStub).props('columns') as Array<{ key: string }>
+    expect(columns.map(column => column.key)).toEqual([
+      'name',
+      'id',
+      'platform_type',
+      'status',
+      'schedulable',
+      'concurrency',
+      'groups',
+      'priority',
+      'created_at',
+      'actions'
+    ])
+    expect(listAccounts).toHaveBeenCalledWith(
+      1,
+      20,
+      expect.objectContaining({ lite: '1', include_scheduler_score: '0' }),
+      expect.any(Object)
+    )
+    expect(getBatchTodayStats).not.toHaveBeenCalled()
+    expect(getUpstreamBillingProbeSettings).not.toHaveBeenCalled()
+    expect(getAllProxies).not.toHaveBeenCalled()
+    expect(wrapper.find('account-bulk-actions-bar-stub').exists()).toBe(false)
+    expect(wrapper.find('account-action-menu-stub').exists()).toBe(false)
+    expect(wrapper.findAll('button').some(button => button.text().includes('common.more'))).toBe(false)
     wrapper.unmount()
   })
 

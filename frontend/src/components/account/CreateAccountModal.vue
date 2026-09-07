@@ -56,6 +56,81 @@
           data-tour="account-form-name"
         />
       </div>
+      <template v-if="isCloudflareMode">
+        <div
+          class="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800/50 dark:bg-blue-900/20 dark:text-blue-200"
+          data-testid="cloudflare-account-scope"
+        >
+          {{ t('admin.accounts.cloudflareNativeAccountHint') }}
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.platform') }}</label>
+          <input class="input" type="text" value="OpenAI API Key" disabled />
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
+          <input
+            v-model="apiKeyBaseUrl"
+            type="url"
+            required
+            class="input"
+            placeholder="https://api.openai.com"
+            data-testid="cloudflare-account-base-url"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.baseUrlHint') }}</p>
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.apiKeyRequired') }}</label>
+          <input
+            v-model="apiKeyValue"
+            type="password"
+            required
+            class="input font-mono"
+            placeholder="sk-proj-..."
+            data-testid="cloudflare-account-api-key"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.apiKeyHint') }}</p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="input-label">{{ t('admin.accounts.concurrency') }}</label>
+            <input
+              v-model.number="form.concurrency"
+              type="number"
+              min="1"
+              max="100000"
+              required
+              class="input"
+              data-testid="cloudflare-account-concurrency"
+            />
+          </div>
+          <div>
+            <label class="input-label">{{ t('admin.accounts.priority') }}</label>
+            <input
+              v-model.number="form.priority"
+              type="number"
+              min="-100000"
+              max="100000"
+              required
+              class="input"
+              data-testid="cloudflare-account-priority"
+            />
+            <p class="input-hint">{{ t('admin.accounts.priorityHint') }}</p>
+          </div>
+        </div>
+
+        <GroupSelector
+          v-model="form.group_ids"
+          :groups="cloudflareAccountGroups"
+          platform="openai"
+          data-testid="cloudflare-account-groups"
+        />
+      </template>
+      <template v-else>
       <div>
         <label class="input-label">{{ t('admin.accounts.notes') }}</label>
         <textarea
@@ -3440,6 +3515,7 @@
           data-tour="account-form-groups"
         />
       </div>
+      </template>
 
     </form>
 
@@ -3980,6 +4056,13 @@ const emit = defineEmits<{
 }>()
 
 const appStore = useAppStore()
+const isCloudflareMode = computed(() => {
+  return appStore.cachedPublicSettings?.version === 'cloudflare' ||
+    globalThis.window?.__APP_CONFIG__?.version === 'cloudflare'
+})
+const cloudflareAccountGroups = computed(() => props.groups.filter((group) => {
+  return group.platform === 'openai' && group.status === 'active' && group.subscription_type === 'standard'
+}))
 
 const hideAccountLongContextBilling = computed(() => {
   return allSelectedGroupsEnableLongContextPricing(form.group_ids, props.groups)
@@ -4309,12 +4392,13 @@ const {
   writeToExtra: writeQuotaNotifyToExtra,
 } = useQuotaNotifyState()
 
-// Load global feature states once
-adminAPI.settings.getWebSearchEmulationConfig().then(cfg => {
-  webSearchGlobalEnabled.value = cfg?.enabled === true && (cfg?.providers?.length ?? 0) > 0
-}).catch(() => { webSearchGlobalEnabled.value = false })
-
-loadQuotaNotifyGlobal()
+// These legacy settings are outside the bounded Cloudflare account contract.
+if (!isCloudflareMode.value) {
+  adminAPI.settings.getWebSearchEmulationConfig().then(cfg => {
+    webSearchGlobalEnabled.value = cfg?.enabled === true && (cfg?.providers?.length ?? 0) > 0
+  }).catch(() => { webSearchGlobalEnabled.value = false })
+  loadQuotaNotifyGlobal()
+}
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 const allowOverages = ref(false) // For antigravity accounts: enable AI Credits overages
 const antigravityAccountType = ref<'oauth' | 'upstream'>('oauth') // For antigravity: oauth or upstream
@@ -4576,8 +4660,23 @@ const form = reactive({
   expires_at: null as number | null
 })
 
+const configureCloudflareAccountForm = () => {
+  form.platform = 'openai'
+  form.type = 'apikey'
+  accountCategory.value = 'apikey'
+  apiKeyBaseUrl.value = 'https://api.openai.com'
+  form.credentials = {}
+}
+
+if (isCloudflareMode.value) {
+  configureCloudflareAccountForm()
+}
+
 // Helper to check if current type needs OAuth flow
 const isOAuthFlow = computed(() => {
+  if (isCloudflareMode.value) {
+    return false
+  }
   // Antigravity upstream 类型不需要 OAuth 流程
   if (form.platform === 'antigravity' && antigravityAccountType.value === 'upstream') {
     return false
@@ -4624,10 +4723,17 @@ watch(
   () => props.show,
   (newVal) => {
     if (newVal) {
-      // Load TLS fingerprint profiles
-      adminAPI.tlsFingerprintProfiles.list()
-        .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
-        .catch(() => { tlsFingerprintProfiles.value = [] })
+      if (isCloudflareMode.value) {
+        configureCloudflareAccountForm()
+      }
+      // TLS profiles are not part of the bounded Cloudflare account contract.
+      if (!isCloudflareMode.value) {
+        adminAPI.tlsFingerprintProfiles.list()
+          .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
+          .catch(() => { tlsFingerprintProfiles.value = [] })
+      } else {
+        tlsFingerprintProfiles.value = []
+      }
       // Modal opened - fill related models
       allowedModels.value = [...getModelsByPlatform(form.platform)]
       // Antigravity: 默认使用映射模式并填充默认映射
@@ -5249,6 +5355,9 @@ const resetForm = () => {
   antigravityMixedChannelConfirmed.value = false
   upstreamModelsPreviewed.value = false
   clearMixedChannelDialog()
+  if (isCloudflareMode.value) {
+    configureCloudflareAccountForm()
+  }
 }
 
 const handleClose = () => {
@@ -5461,6 +5570,49 @@ const handleVertexServiceAccountDrop = async (event: DragEvent) => {
 }
 
 const handleSubmit = async () => {
+  if (isCloudflareMode.value) {
+    const name = form.name.trim()
+    const baseUrl = apiKeyBaseUrl.value.trim().replace(/\/+$/, '')
+    const apiKey = apiKeyValue.value.trim()
+    if (!name) {
+      appStore.showError(t('admin.accounts.pleaseEnterAccountName'))
+      return
+    }
+    if (!apiKey) {
+      appStore.showError(t('admin.accounts.pleaseEnterApiKey'))
+      return
+    }
+    if (form.group_ids.length === 0) {
+      appStore.showError(t('admin.accounts.pleaseSelectAtLeastOneGroup'))
+      return
+    }
+    if (!Number.isInteger(form.concurrency) || form.concurrency < 1 || form.concurrency > 100000 ||
+        !Number.isInteger(form.priority) || form.priority < -100000 || form.priority > 100000) {
+      appStore.showError(t('admin.accounts.invalidCloudflareSchedulingValues'))
+      return
+    }
+    try {
+      const parsed = new URL(baseUrl)
+      if (parsed.protocol !== 'https:' || !parsed.host || parsed.username || parsed.password || parsed.search || parsed.hash) {
+        throw new Error('invalid base URL')
+      }
+    } catch {
+      appStore.showError(t('admin.accounts.invalidCloudflareBaseUrl'))
+      return
+    }
+    await submitCreateAccount({
+      name,
+      platform: 'openai',
+      type: 'apikey',
+      credentials: { api_key: apiKey, base_url: baseUrl },
+      extra: {},
+      concurrency: form.concurrency,
+      priority: form.priority,
+      group_ids: form.group_ids
+    })
+    return
+  }
+
   // For OAuth-based type, handle OAuth flow (goes to step 2)
   if (isOAuthFlow.value) {
     if (!isGrokSSOInputMethod.value && !form.name.trim()) {

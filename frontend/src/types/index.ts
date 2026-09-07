@@ -1475,7 +1475,7 @@ export interface CreateAccountRequest {
   load_factor?: number | null
   priority?: number
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
-  group_ids?: number[]
+  group_ids?: Array<number | string>
   expires_at?: number | null
   auto_pause_on_expired?: boolean
   upstream_billing_probe_enabled?: boolean
@@ -1495,7 +1495,7 @@ export interface UpdateAccountRequest {
   rate_multiplier?: number // Account billing multiplier (>=0, 0 means free)
   schedulable?: boolean
   status?: 'active' | 'inactive' | 'error'
-  group_ids?: number[]
+  group_ids?: Array<number | string>
   expires_at?: number | null
   auto_pause_on_expired?: boolean
   upstream_billing_probe_enabled?: boolean

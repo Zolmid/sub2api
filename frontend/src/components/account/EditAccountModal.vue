@@ -15,6 +15,102 @@
         <label class="input-label">{{ t('common.name') }}</label>
         <input v-model="form.name" type="text" required class="input" data-tour="edit-account-form-name" />
       </div>
+      <template v-if="isCloudflareMode">
+        <div
+          class="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800/50 dark:bg-blue-900/20 dark:text-blue-200"
+          data-testid="cloudflare-account-edit-scope"
+        >
+          {{ t('admin.accounts.cloudflareNativeAccountEditHint') }}
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.platform') }}</label>
+          <input class="input" type="text" value="OpenAI API Key" disabled />
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="input-label">{{ t('common.status') }}</label>
+            <select v-model="form.status" class="input" data-testid="cloudflare-account-status">
+              <option value="active">{{ t('common.active') }}</option>
+              <option value="inactive">{{ t('common.inactive') }}</option>
+            </select>
+          </div>
+          <label class="flex items-center gap-3 self-end rounded-lg border border-gray-200 px-3 py-2.5 dark:border-dark-600">
+            <input
+              v-model="cloudflareSchedulable"
+              type="checkbox"
+              class="h-4 w-4 rounded border-gray-300 text-primary-500 focus:ring-primary-500"
+              data-testid="cloudflare-account-schedulable"
+            />
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+              {{ t('admin.accounts.columns.schedulable') }}
+            </span>
+          </label>
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.apiKey') }}</label>
+          <input
+            v-model="editApiKey"
+            type="password"
+            class="input font-mono"
+            autocomplete="new-password"
+            placeholder="sk-proj-..."
+            data-testid="cloudflare-account-edit-api-key"
+          />
+          <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
+          <input
+            v-model="editBaseUrl"
+            type="url"
+            class="input"
+            placeholder="https://api.openai.com"
+            :disabled="!editApiKey.trim()"
+            data-testid="cloudflare-account-edit-base-url"
+          />
+          <p class="input-hint">{{ t('admin.accounts.cloudflareNativeCredentialReplaceHint') }}</p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="input-label">{{ t('admin.accounts.concurrency') }}</label>
+            <input
+              v-model.number="form.concurrency"
+              type="number"
+              min="1"
+              max="100000"
+              required
+              class="input"
+              data-testid="cloudflare-account-edit-concurrency"
+            />
+          </div>
+          <div>
+            <label class="input-label">{{ t('admin.accounts.priority') }}</label>
+            <input
+              v-model.number="form.priority"
+              type="number"
+              min="-100000"
+              max="100000"
+              required
+              class="input"
+              data-testid="cloudflare-account-edit-priority"
+            />
+            <p class="input-hint">{{ t('admin.accounts.priorityHint') }}</p>
+          </div>
+        </div>
+
+        <GroupSelector
+          v-model="form.group_ids"
+          :groups="cloudflareAccountGroups"
+          platform="openai"
+          data-testid="cloudflare-account-edit-groups"
+        />
+      </template>
+      <template v-else>
       <div>
         <label class="input-label">{{ t('admin.accounts.notes') }}</label>
         <textarea
@@ -2849,6 +2945,7 @@
         :mixed-scheduling="mixedScheduling"
         data-tour="account-form-groups"
       />
+      </template>
 
     </form>
 
@@ -3001,6 +3098,14 @@ const { t } = useI18n()
 const appStore = useAppStore()
 const authStore = useAuthStore()
 const browserTimeZone = getBrowserTimeZone()
+const isCloudflareMode = computed(() => {
+  return appStore.cachedPublicSettings?.version === 'cloudflare' ||
+    globalThis.window?.__APP_CONFIG__?.version === 'cloudflare'
+})
+const cloudflareAccountGroups = computed(() => props.groups.filter((group) => {
+  return group.platform === 'openai' && group.status === 'active' && group.subscription_type === 'standard'
+}))
+const cloudflareSchedulable = ref(true)
 
 // Spark 影子账号(parent_account_id 非空):代理恒继承母账号,不可独立编辑(外审 B/P1),
 // 故隐藏代理选择器。
@@ -3338,12 +3443,13 @@ const {
   reset: resetQuotaNotify,
 } = useQuotaNotifyState()
 
-// Load global feature states once
-adminAPI.settings.getWebSearchEmulationConfig().then(cfg => {
-  webSearchGlobalEnabled.value = cfg?.enabled === true && (cfg?.providers?.length ?? 0) > 0
-}).catch(() => { webSearchGlobalEnabled.value = false })
-
-loadQuotaNotifyGlobal()
+// These legacy settings are outside the bounded Cloudflare account contract.
+if (!isCloudflareMode.value) {
+  adminAPI.settings.getWebSearchEmulationConfig().then(cfg => {
+    webSearchGlobalEnabled.value = cfg?.enabled === true && (cfg?.providers?.length ?? 0) > 0
+  }).catch(() => { webSearchGlobalEnabled.value = false })
+  loadQuotaNotifyGlobal()
+}
 const editQuotaLimit = ref<number | null>(null)
 const editQuotaDailyLimit = ref<number | null>(null)
 const editQuotaWeeklyLimit = ref<number | null>(null)
@@ -3753,6 +3859,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     : 'active'
   form.group_ids = newAccount.group_ids || []
   form.expires_at = newAccount.expires_at ?? null
+  cloudflareSchedulable.value = newAccount.schedulable
 
   // Load intercept warmup requests setting (applies to all account types)
   const credentials = newAccount.credentials as Record<string, unknown> | undefined
@@ -4142,6 +4249,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 }
 
 async function loadTLSProfiles() {
+  if (isCloudflareMode.value) {
+    tlsFingerprintProfiles.value = []
+    return
+  }
   try {
     const profiles = await adminAPI.tlsFingerprintProfiles.list()
     tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name }))
@@ -4691,6 +4802,55 @@ const submitUpdateAccount = async (accountID: number, updatePayload: Record<stri
 const handleSubmit = async () => {
   if (!props.account) return
   const accountID = props.account.id
+
+  if (isCloudflareMode.value) {
+    if (props.account.platform !== 'openai' || props.account.type !== 'apikey') {
+      appStore.showError(t('admin.accounts.cloudflareNativeUnsupportedAccount'))
+      return
+    }
+    const name = form.name.trim()
+    if (!name) {
+      appStore.showError(t('admin.accounts.pleaseEnterAccountName'))
+      return
+    }
+    if (form.group_ids.length === 0) {
+      appStore.showError(t('admin.accounts.pleaseSelectAtLeastOneGroup'))
+      return
+    }
+    if (!Number.isInteger(form.concurrency) || form.concurrency < 1 || form.concurrency > 100000 ||
+        !Number.isInteger(form.priority) || form.priority < -100000 || form.priority > 100000) {
+      appStore.showError(t('admin.accounts.invalidCloudflareSchedulingValues'))
+      return
+    }
+
+    const updatePayload: Record<string, unknown> = {
+      name,
+      status: form.status,
+      schedulable: cloudflareSchedulable.value,
+      concurrency: form.concurrency,
+      priority: form.priority,
+      group_ids: form.group_ids,
+      extra: props.account.extra?.privacy_mode
+        ? { privacy_mode: props.account.extra.privacy_mode }
+        : {}
+    }
+    const nextAPIKey = editApiKey.value.trim()
+    if (nextAPIKey) {
+      const baseUrl = editBaseUrl.value.trim().replace(/\/+$/, '')
+      try {
+        const parsed = new URL(baseUrl)
+        if (parsed.protocol !== 'https:' || !parsed.host || parsed.username || parsed.password || parsed.search || parsed.hash) {
+          throw new Error('invalid base URL')
+        }
+      } catch {
+        appStore.showError(t('admin.accounts.invalidCloudflareBaseUrl'))
+        return
+      }
+      updatePayload.credentials = { api_key: nextAPIKey, base_url: baseUrl }
+    }
+    await submitUpdateAccount(accountID, updatePayload)
+    return
+  }
 
   if (form.status !== 'active' && form.status !== 'inactive' && form.status !== 'error') {
     appStore.showError(t('admin.accounts.pleaseSelectStatus'))

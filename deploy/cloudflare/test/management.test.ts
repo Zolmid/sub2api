@@ -66,11 +66,12 @@ describe("Stage C private management control plane", () => {
   it("encrypts Worker-managed credentials and excludes secrets from operation responses", async () => {
     const scope = await createScope("credentials"); const rawKey = "WorkerManagedKey_123456"; const upstreamKey = "upstream-secret-" + id(); const baseURL = "https://mock.upstream";
     expect((await call("/v1/manage/api-keys/create", { operation_id: "credentials-key", id: scope.keyID, user_id: scope.userID, group_id: scope.groupID, name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null })).status).toBe(200);
-    const accountCreateRequest = { operation_id: "credentials-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: upstreamKey, base_url: baseURL }, extra: { privacy_mode: "training_off", api_key: upstreamKey, base_url: baseURL }, group_ids: [scope.groupID] };
+    const accountCreateRequest = { operation_id: "credentials-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: upstreamKey, base_url: baseURL }, extra: { privacy_mode: "training_off" }, group_ids: [scope.groupID] };
     const accountCreate = await call("/v1/manage/accounts/create", accountCreateRequest);
     expect(accountCreate.status).toBe(200);
     const accountCreateRead = await accountCreate.json<{ account: { extra: Record<string, unknown> } }>();
     expect(accountCreateRead.account.extra).toEqual({ privacy_mode: "training_off" });
+    expect((await call("/v1/manage/accounts/create", { ...accountCreateRequest, operation_id: "credentials-extra-rejected", id: id(), extra: { api_key: upstreamKey } })).status).toBe(400);
     const legacySecret = "legacy-operation-secret-" + id();
     await env.DB.prepare("UPDATE management_operations SET response_json=? WHERE operation_id='credentials-account'").bind(JSON.stringify({ secret: legacySecret, account: { ...accountCreateRead.account, credentials: { api_key: legacySecret }, credential_envelope: legacySecret, extra: { privacy_mode: "training_off", api_key: legacySecret } } })).run();
     const accountCreateReplay = await call("/v1/manage/accounts/create", accountCreateRequest);
@@ -112,6 +113,206 @@ describe("Stage C private management control plane", () => {
     expect(tombstoneListRead).not.toContain(upstreamKey);
     expect(tombstoneListRead).not.toContain(baseURL);
     expect(tombstoneListRead).not.toContain("credential_envelope");
+    const tombstoneAdmission = await call("/v1/requests/admit", { request_id: "tombstone-admission-" + id(), api_key_id: scope.keyID, group_id: scope.groupID, model: "fixture-model", lease_ttl_seconds: 30 });
+    expect(tombstoneAdmission.status).toBe(429);
+  });
+
+  it("replays semantic account creates across disposable IDs and conflicts on changed intent", async () => {
+    const scope = await createScope("account-replay-" + id());
+    const secondGroupID = id();
+    expect((await call("/v1/manage/groups/create", {
+      operation_id: "account-replay-second-group-" + secondGroupID,
+      id: secondGroupID,
+      name: "account replay second group " + secondGroupID,
+      platform: "openai",
+      status: "active",
+      is_exclusive: false,
+      subscription_type: "standard",
+    })).status).toBe(200);
+    const ascendingGroupIDs = [scope.groupID, secondGroupID].sort();
+    const retryID = id();
+    const operationID = "browser-account-" + id();
+    const upstreamKey = "semantic-upstream-" + id();
+    const baseURL = "https://mock.upstream";
+    const createRequest = {
+      operation_id: operationID,
+      id: scope.accountID,
+      name: "semantic account",
+      platform: "openai",
+      status: "active",
+      schedulable: true,
+      priority: 4,
+      max_concurrency: 2,
+      credentials: { api_key: upstreamKey, base_url: baseURL },
+      extra: { privacy_mode: "training_off" },
+      group_ids: [...ascendingGroupIDs].reverse(),
+    };
+
+    const createdResponse = await call("/v1/manage/accounts/create", createRequest);
+    expect(createdResponse.status).toBe(200);
+    const createdText = await createdResponse.text();
+    expect(createdText).not.toContain(upstreamKey);
+    expect(createdText).not.toContain(baseURL);
+    expect(JSON.parse(createdText)).toMatchObject({ account: { id: scope.accountID }, replayed: false });
+
+    const replayResponse = await call("/v1/manage/accounts/create", {
+      ...createRequest,
+      id: retryID,
+      group_ids: ascendingGroupIDs,
+    });
+    expect(replayResponse.status).toBe(200);
+    const replayText = await replayResponse.text();
+    expect(replayText).not.toContain(upstreamKey);
+    expect(replayText).not.toContain(baseURL);
+    expect(JSON.parse(replayText)).toMatchObject({ account: { id: scope.accountID }, replayed: true });
+    expect(await env.DB.prepare("SELECT count(*) count FROM accounts WHERE id=?").bind(retryID).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(operationID).first("count")).toBe(1);
+
+    const operation = await env.DB.prepare(
+      "SELECT request_hash,response_json FROM management_operations WHERE operation_id=?",
+    ).bind(operationID).first<{ request_hash: string; response_json: string }>();
+    expect(operation?.request_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(operation?.response_json).not.toContain(upstreamKey);
+    expect(operation?.response_json).not.toContain(baseURL);
+    expect(operation?.response_json).not.toContain("credential_digest");
+
+    const changedPayload = await call("/v1/manage/accounts/create", {
+      ...createRequest,
+      id: retryID,
+      priority: 5,
+    });
+    expect(changedPayload.status).toBe(409);
+    expect(await changedPayload.json()).toMatchObject({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+    const changedCredential = await call("/v1/manage/accounts/create", {
+      ...createRequest,
+      id: retryID,
+      credentials: { api_key: upstreamKey + "-changed", base_url: baseURL },
+    });
+    expect(changedCredential.status).toBe(409);
+    expect(await changedCredential.json()).toMatchObject({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+  });
+
+  it("uses JavaScript UTF-16 length and exact trimming for account names", async () => {
+    const scope = await createScope("account-name-" + id());
+    const requestBody = {
+      operation_id: "account-name-valid-" + scope.accountID,
+      id: scope.accountID,
+      name: "😀".repeat(50),
+      platform: "openai",
+      status: "active",
+      schedulable: true,
+      priority: 0,
+      max_concurrency: 1,
+      credentials: { api_key: "account-name-secret-" + id(), base_url: "https://mock.upstream" },
+      extra: {},
+      group_ids: [scope.groupID],
+    };
+    expect((await call("/v1/manage/accounts/create", requestBody)).status).toBe(200);
+    expect((await call("/v1/manage/accounts/create", {
+      ...requestBody,
+      operation_id: "account-name-long-" + scope.accountID,
+      id: id(),
+      name: "😀".repeat(51),
+    })).status).toBe(400);
+    expect((await call("/v1/manage/accounts/create", {
+      ...requestBody,
+      operation_id: "account-name-padded-" + scope.accountID,
+      id: id(),
+      name: " padded ",
+    })).status).toBe(400);
+  });
+
+  it("preserves omitted account credentials, encrypts replacements, and rolls back invalid groups", async () => {
+    const scope = await createScope("account-update-" + id());
+    const rawKey = "AccountUpdateKey_" + id();
+    const firstSecret = "first-account-secret-" + id();
+    const replacementSecret = "replacement-account-secret-" + id();
+    expect((await call("/v1/manage/api-keys/create", {
+      operation_id: "account-update-key-" + scope.keyID,
+      id: scope.keyID,
+      user_id: scope.userID,
+      group_id: scope.groupID,
+      name: "account update key",
+      status: "active",
+      raw_key: rawKey,
+      ip_whitelist: [],
+      ip_blacklist: [],
+      expires_at: null,
+    })).status).toBe(200);
+    expect((await call("/v1/manage/accounts/create", {
+      operation_id: "account-update-create-" + scope.accountID,
+      id: scope.accountID,
+      name: "before update",
+      platform: "openai",
+      status: "active",
+      schedulable: true,
+      priority: 2,
+      max_concurrency: 1,
+      credentials: { api_key: firstSecret, base_url: "https://mock.upstream" },
+      extra: {},
+      group_ids: [scope.groupID],
+    })).status).toBe(200);
+    const originalEnvelope = await env.DB.prepare(
+      "SELECT credential_envelope FROM accounts WHERE id=?",
+    ).bind(scope.accountID).first("credential_envelope") as string;
+
+    const omitted = await call("/v1/manage/accounts/update", {
+      operation_id: "account-update-omitted-" + scope.accountID,
+      id: scope.accountID,
+      name: "credentials preserved",
+    });
+    expect(omitted.status).toBe(200);
+    expect(await env.DB.prepare("SELECT credential_envelope FROM accounts WHERE id=?").bind(scope.accountID).first("credential_envelope")).toBe(originalEnvelope);
+
+    const replaced = await call("/v1/manage/accounts/update", {
+      operation_id: "account-update-replaced-" + scope.accountID,
+      id: scope.accountID,
+      credentials: { api_key: replacementSecret, base_url: "https://mock.upstream" },
+    });
+    expect(replaced.status).toBe(200);
+    const replacedText = await replaced.text();
+    expect(replacedText).not.toContain(firstSecret);
+    expect(replacedText).not.toContain(replacementSecret);
+    const replacementEnvelope = await env.DB.prepare(
+      "SELECT credential_envelope FROM accounts WHERE id=?",
+    ).bind(scope.accountID).first("credential_envelope") as string;
+    expect(replacementEnvelope).toMatch(/^aes-gcm:v1:/);
+    expect(replacementEnvelope).not.toBe(originalEnvelope);
+    expect(replacementEnvelope).not.toContain(replacementSecret);
+
+    const admission = await call("/v1/requests/admit", {
+      request_id: "replacement-admission-" + id(),
+      api_key_id: scope.keyID,
+      group_id: scope.groupID,
+      model: "fixture-model",
+      lease_ttl_seconds: 30,
+    });
+    expect(admission.status).toBe(200);
+    expect(await admission.json()).toMatchObject({
+      account: { id: scope.accountID, credentials: { api_key: replacementSecret, base_url: "https://mock.upstream" } },
+    });
+
+    const missingGroupID = id();
+    const invalidOperation = "account-update-invalid-group-" + scope.accountID;
+    const invalidGroup = await call("/v1/manage/accounts/update", {
+      operation_id: invalidOperation,
+      id: scope.accountID,
+      group_ids: [missingGroupID],
+    });
+    expect(invalidGroup.status).toBe(409);
+    expect(await invalidGroup.json()).toMatchObject({ error: { code: "REFERENCE_REJECTED" } });
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(invalidOperation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id=?").bind(scope.accountID, scope.groupID).first("count")).toBe(1);
+    expect(await env.DB.prepare("SELECT count(*) count FROM account_groups WHERE account_id=? AND group_id=?").bind(scope.accountID, missingGroupID).first("count")).toBe(0);
+
+    const operationRows = await env.DB.prepare(
+      "SELECT response_json FROM management_operations WHERE operation_id IN (?,?)",
+    ).bind("account-update-omitted-" + scope.accountID, "account-update-replaced-" + scope.accountID).all<{ response_json: string }>();
+    for (const row of operationRows.results) {
+      expect(row.response_json).not.toContain(firstSecret);
+      expect(row.response_json).not.toContain(replacementSecret);
+      expect(row.response_json).not.toContain("mock.upstream");
+    }
   });
 
   it("makes tombstones terminal and owner-scoped revoke atomically releases the credential hash", async () => {

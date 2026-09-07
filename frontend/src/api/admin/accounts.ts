@@ -168,7 +168,9 @@ export async function listWithEtag(
  * @param id - Account ID
  * @returns Account details
  */
-export async function getById(id: number): Promise<Account> {
+export type AccountID = number | string
+
+export async function getById(id: AccountID): Promise<Account> {
   const { data } = await apiClient.get<Account>(`/admin/accounts/${id}`)
   return data
 }
@@ -178,9 +180,225 @@ export async function getById(id: number): Promise<Account> {
  * @param accountData - Account data
  * @returns Created account
  */
+interface PendingAccountCreateOperation {
+  fullFingerprint: string
+  nonsecretFingerprint: string
+  idempotencyKey: string
+}
+
+interface StoredAccountCreateOperation {
+  nonsecretFingerprint: string
+  idempotencyKey: string
+}
+
+interface AccountCreateOperationScope {
+  adminID: string
+  storageKey: string
+  fullFingerprint: string
+  nonsecretFingerprint: string
+}
+
+const pendingAccountCreateOperations = new Map<string, PendingAccountCreateOperation>()
+let fallbackAccountRequestSequence = 0
+
 export async function create(accountData: CreateAccountRequest): Promise<Account> {
-  const { data } = await apiClient.post<Account>('/admin/accounts', accountData)
-  return data
+  if (!isCloudflareAccountMode()) {
+    const { data } = await apiClient.post<Account>('/admin/accounts', accountData)
+    return data
+  }
+  const requestData = cloudflareAccountCreateRequest(accountData)
+  const scope = await accountCreateOperationScope(requestData)
+  const inMemory = scope ? pendingAccountCreateOperations.get(scope.storageKey) : null
+  const stored = scope ? getStoredAccountCreateOperation(scope.storageKey) : null
+  let idempotencyKey: string | null = null
+  if (scope && inMemory && inMemory.fullFingerprint === scope.fullFingerprint) {
+    idempotencyKey = inMemory.idempotencyKey
+  } else if (scope && !inMemory && stored?.nonsecretFingerprint === scope.nonsecretFingerprint) {
+    // A reload loses the credential-bearing digest by design. Reusing the key
+    // is safe: the Worker compares its own credential digest and returns 409
+    // if the reconstructed request does not represent the original intent.
+    idempotencyKey = stored.idempotencyKey
+  }
+  if (!idempotencyKey) {
+    idempotencyKey = `account-create-${scope?.adminID ?? 'unknown-admin'}-${newAccountRequestID()}`
+  }
+  if (scope) {
+    pendingAccountCreateOperations.set(scope.storageKey, {
+      fullFingerprint: scope.fullFingerprint,
+      nonsecretFingerprint: scope.nonsecretFingerprint,
+      idempotencyKey
+    })
+    storeAccountCreateOperation(scope.storageKey, {
+      nonsecretFingerprint: scope.nonsecretFingerprint,
+      idempotencyKey
+    })
+  }
+
+  try {
+    const { data } = await apiClient.post<Account>('/admin/accounts', requestData, {
+      headers: { 'Idempotency-Key': idempotencyKey }
+    })
+    if (scope) clearAccountCreateOperation(scope.storageKey, idempotencyKey)
+    return data
+  } catch (error) {
+    if (scope && isDefinitiveAccountCreateFailure(error)) {
+      clearAccountCreateOperation(scope.storageKey, idempotencyKey)
+    }
+    throw error
+  }
+}
+
+function isCloudflareAccountMode(): boolean {
+  return globalThis.window?.__APP_CONFIG__?.version === 'cloudflare'
+}
+
+function cloudflareAccountCreateRequest(accountData: CreateAccountRequest): CreateAccountRequest {
+  if (accountData.platform !== 'openai' || accountData.type !== 'apikey') {
+    throw new Error('Cloudflare mode currently supports OpenAI API-key accounts only')
+  }
+
+  const apiKey = accountData.credentials?.api_key
+  const baseUrl = accountData.credentials?.base_url
+  const privacyMode = accountData.extra?.privacy_mode
+  return {
+    name: accountData.name,
+    platform: 'openai',
+    type: 'apikey',
+    credentials: {
+      api_key: typeof apiKey === 'string' ? apiKey : '',
+      base_url: typeof baseUrl === 'string' ? baseUrl : ''
+    },
+    extra: typeof privacyMode === 'string' ? { privacy_mode: privacyMode } : {},
+    concurrency: accountData.concurrency,
+    priority: accountData.priority,
+    group_ids: accountData.group_ids
+  }
+}
+
+function currentAccountAdminID(): string | null {
+  try {
+    const rawUser = globalThis.localStorage?.getItem('auth_user')
+    if (!rawUser) return null
+    const user: unknown = JSON.parse(rawUser)
+    if (typeof user !== 'object' || user === null) return null
+    const id = (user as { id?: unknown }).id
+    if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) return String(id)
+    if (
+      typeof id === 'string' &&
+      /^[1-9][0-9]*$/.test(id) &&
+      (id.length < 19 || (id.length === 19 && id <= '9223372036854775807'))
+    ) return id
+    return null
+  } catch {
+    return null
+  }
+}
+
+async function accountCreateOperationScope(
+  accountData: CreateAccountRequest
+): Promise<AccountCreateOperationScope | null> {
+  const adminID = currentAccountAdminID()
+  if (!adminID) return null
+  const nonsecret = Object.fromEntries(
+    Object.entries(accountData).filter(([key]) => key !== 'credentials')
+  )
+  const [fullFingerprint, nonsecretFingerprint] = await Promise.all([
+    accountPayloadFingerprint(accountData),
+    accountPayloadFingerprint(nonsecret)
+  ])
+  return {
+    adminID,
+    storageKey: `sub2api:admin:account-create:${adminID}`,
+    fullFingerprint,
+    nonsecretFingerprint
+  }
+}
+
+function canonicalAccountPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalAccountPayload)
+  if (typeof value !== 'object' || value === null) return value
+  const source = value as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+  for (const key of Object.keys(source).sort()) {
+    if (source[key] !== undefined) result[key] = canonicalAccountPayload(source[key])
+  }
+  return result
+}
+
+async function accountPayloadFingerprint(value: unknown): Promise<string> {
+  const encoded = new TextEncoder().encode(JSON.stringify(canonicalAccountPayload(value)))
+  if (globalThis.crypto?.subtle) {
+    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', encoded))
+    return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const byte of encoded) {
+    first = Math.imul(first ^ byte, 0x01000193)
+    second = Math.imul(second ^ byte, 0x85ebca6b)
+  }
+  return `${encoded.length.toString(16)}-${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`
+}
+
+function newAccountRequestID(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  if (globalThis.crypto?.getRandomValues) {
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+  fallbackAccountRequestSequence += 1
+  return `${Date.now().toString(36)}-${fallbackAccountRequestSequence.toString(36)}`
+}
+
+function getStoredAccountCreateOperation(storageKey: string): StoredAccountCreateOperation | null {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(storageKey)
+    if (!raw) return null
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null) return null
+    const operation = value as Partial<StoredAccountCreateOperation>
+    if (
+      typeof operation.nonsecretFingerprint !== 'string' ||
+      operation.nonsecretFingerprint.length < 1 || operation.nonsecretFingerprint.length > 128 ||
+      typeof operation.idempotencyKey !== 'string' || operation.idempotencyKey.length < 1 ||
+      operation.idempotencyKey.length > 128 || !/^[\x21-\x7E]+$/.test(operation.idempotencyKey)
+    ) return null
+    return {
+      nonsecretFingerprint: operation.nonsecretFingerprint,
+      idempotencyKey: operation.idempotencyKey
+    }
+  } catch {
+    return null
+  }
+}
+
+function storeAccountCreateOperation(
+  storageKey: string,
+  operation: StoredAccountCreateOperation | null
+): void {
+  try {
+    if (operation) globalThis.sessionStorage?.setItem(storageKey, JSON.stringify(operation))
+    else globalThis.sessionStorage?.removeItem(storageKey)
+  } catch {
+    // The in-memory retry guard remains active when browser storage is unavailable.
+  }
+}
+
+function clearAccountCreateOperation(storageKey: string, idempotencyKey: string): void {
+  if (pendingAccountCreateOperations.get(storageKey)?.idempotencyKey === idempotencyKey) {
+    pendingAccountCreateOperations.delete(storageKey)
+  }
+  if (getStoredAccountCreateOperation(storageKey)?.idempotencyKey === idempotencyKey) {
+    storeAccountCreateOperation(storageKey, null)
+  }
+}
+
+function isDefinitiveAccountCreateFailure(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const direct = (error as { status?: unknown }).status
+  const response = (error as { response?: { status?: unknown } }).response?.status
+  const status = typeof direct === 'number' ? direct : response
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408
 }
 
 /**
@@ -233,9 +451,37 @@ export async function duplicate(id: number): Promise<Account> {
  * @param updates - Fields to update
  * @returns Updated account
  */
-export async function update(id: number, updates: UpdateAccountRequest): Promise<Account> {
-  const { data } = await apiClient.put<Account>(`/admin/accounts/${id}`, updates)
+export async function update(id: AccountID, updates: UpdateAccountRequest): Promise<Account> {
+  const { data } = await apiClient.put<Account>(
+    `/admin/accounts/${id}`,
+    cloudflareAccountUpdateRequest(updates)
+  )
   return data
+}
+
+function cloudflareAccountUpdateRequest(updates: UpdateAccountRequest): UpdateAccountRequest {
+  if (!isCloudflareAccountMode()) return updates
+
+  const result: UpdateAccountRequest = {}
+  if (updates.name !== undefined) result.name = updates.name
+  if (updates.status !== undefined) result.status = updates.status
+  if (updates.schedulable !== undefined) result.schedulable = updates.schedulable
+  if (updates.concurrency !== undefined) result.concurrency = updates.concurrency
+  if (updates.priority !== undefined) result.priority = updates.priority
+  if (updates.group_ids !== undefined) result.group_ids = updates.group_ids
+  if (updates.credentials !== undefined) {
+    const apiKey = updates.credentials.api_key
+    const baseUrl = updates.credentials.base_url
+    result.credentials = {
+      api_key: typeof apiKey === 'string' ? apiKey : '',
+      base_url: typeof baseUrl === 'string' ? baseUrl : ''
+    }
+  }
+  if (updates.extra !== undefined) {
+    const privacyMode = updates.extra.privacy_mode
+    result.extra = typeof privacyMode === 'string' ? { privacy_mode: privacyMode } : {}
+  }
+  return result
 }
 
 /**
@@ -253,7 +499,7 @@ export async function checkMixedChannelRisk(
  * @param id - Account ID
  * @returns Success confirmation
  */
-export async function deleteAccount(id: number): Promise<{ message: string }> {
+export async function deleteAccount(id: AccountID): Promise<{ message: string }> {
   const { data } = await apiClient.delete<{ message: string }>(`/admin/accounts/${id}`)
   return data
 }
@@ -563,7 +809,10 @@ export async function getBatchTodayStats(accountIds: number[]): Promise<BatchTod
  * @param schedulable - Whether the account should participate in scheduling
  * @returns Updated account
  */
-export async function setSchedulable(id: number, schedulable: boolean): Promise<Account> {
+export async function setSchedulable(id: AccountID, schedulable: boolean): Promise<Account> {
+  if (isCloudflareAccountMode()) {
+    return update(id, { schedulable })
+  }
   const { data } = await apiClient.post<Account>(`/admin/accounts/${id}/schedulable`, {
     schedulable
   })

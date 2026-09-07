@@ -6,9 +6,16 @@ import {
 } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
+const migrationDirectory = process.env.SUB2API_CF_TEST_MIGRATIONS_DIR ??
+  new URL("./migrations", import.meta.url).pathname;
+const isolatedDatabaseID = process.env.SUB2API_CF_TEST_DATABASE_ID;
+
 const workerOptions = async () => ({
   wrangler: { configPath: "./wrangler.test.jsonc" },
   miniflare: {
+    ...(isolatedDatabaseID
+      ? { d1Databases: { DB: isolatedDatabaseID } }
+      : {}),
     bindings: {
       // Explicit local-only value; production receives this binding through
       // Worker secrets and no wrangler vars file contains it.
@@ -17,7 +24,7 @@ const workerOptions = async () => ({
       // Worker secret and is never represented in this configuration.
       SUB2API_CF_LOGIN_ADMISSION_KEY: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
       TEST_MIGRATIONS: await readD1Migrations(
-        new URL("./migrations", import.meta.url).pathname,
+        migrationDirectory,
       ),
       TEST_FIXTURE_SQL: readFileSync(
         new URL("./fixtures/local.sql", import.meta.url),

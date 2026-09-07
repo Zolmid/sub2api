@@ -9,7 +9,11 @@ const {
   showWarningMock,
   importCodexSessionMock,
   createOpenAICodexPATMock,
+  getWebSearchEmulationConfigMock,
+  getSettingsMock,
+  listTLSProfilesMock,
   authIsSimpleMode,
+  appRuntimeVersion,
 } = vi.hoisted(() => ({
   createAccountMock: vi.fn(),
   probeUpstreamBillingMock: vi.fn(),
@@ -17,7 +21,11 @@ const {
   showWarningMock: vi.fn(),
   importCodexSessionMock: vi.fn(),
   createOpenAICodexPATMock: vi.fn(),
+  getWebSearchEmulationConfigMock: vi.fn(),
+  getSettingsMock: vi.fn(),
+  listTLSProfilesMock: vi.fn(),
   authIsSimpleMode: { value: true },
+  appRuntimeVersion: { value: 'traditional' },
 }))
 
 vi.mock('@/stores/app', () => ({
@@ -25,6 +33,9 @@ vi.mock('@/stores/app', () => ({
     showError: vi.fn(),
     showSuccess: vi.fn(),
     showWarning: showWarningMock,
+    get cachedPublicSettings() {
+      return { version: appRuntimeVersion.value }
+    },
   }),
 }))
 
@@ -47,11 +58,11 @@ vi.mock('@/api/admin', () => ({
       createOpenAICodexPAT: createOpenAICodexPATMock,
     },
     settings: {
-      getWebSearchEmulationConfig: vi.fn().mockResolvedValue({ enabled: false, providers: [] }),
-      getSettings: vi.fn().mockResolvedValue({}),
+      getWebSearchEmulationConfig: getWebSearchEmulationConfigMock,
+      getSettings: getSettingsMock,
     },
     tlsFingerprintProfiles: {
-      list: vi.fn().mockResolvedValue([]),
+      list: listTLSProfilesMock,
     },
   },
 }))
@@ -102,13 +113,17 @@ const GroupSelectorStub = defineComponent({
       type: Array,
       default: () => [],
     },
+    groups: {
+      type: Array,
+      default: () => [],
+    },
   },
   emits: ['update:modelValue'],
   template: `
     <button
       type="button"
       data-testid="select-pricing-groups"
-      @click="$emit('update:modelValue', [1, 2])"
+      @click="$emit('update:modelValue', groups.length ? groups.map(group => group.id) : [1, 2])"
     >
       groups
     </button>
@@ -196,6 +211,7 @@ async function openCodexImportStep(toggleClicks = 0) {
 
 describe('CreateAccountModal OpenAI long-context billing', () => {
   beforeEach(() => {
+    appRuntimeVersion.value = 'traditional'
     authIsSimpleMode.value = true
     createAccountMock.mockReset().mockResolvedValue({ id: 42, platform: 'openai', type: 'apikey' })
     probeUpstreamBillingMock.mockReset().mockResolvedValue({})
@@ -210,6 +226,52 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       warnings: [],
     })
     createOpenAICodexPATMock.mockReset().mockResolvedValue({})
+    getWebSearchEmulationConfigMock.mockReset().mockResolvedValue({ enabled: false, providers: [] })
+    getSettingsMock.mockReset().mockResolvedValue({})
+    listTLSProfilesMock.mockReset().mockResolvedValue([])
+  })
+
+  it('uses the strict Cloudflare-native account form and submits only migrated fields', async () => {
+    appRuntimeVersion.value = 'cloudflare'
+    const exactGroupID = '9007199254740993'
+    const wrapper = mountModal([{
+      id: exactGroupID,
+      name: 'OpenAI standard',
+      platform: 'openai',
+      status: 'active',
+      subscription_type: 'standard',
+    }])
+
+    expect(wrapper.find('[data-testid="cloudflare-account-scope"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('admin.accounts.notes')
+    expect(wrapper.findAll('button').some(button => button.text().includes('Anthropic'))).toBe(false)
+    expect(getWebSearchEmulationConfigMock).not.toHaveBeenCalled()
+    expect(getSettingsMock).not.toHaveBeenCalled()
+    expect(listTLSProfilesMock).not.toHaveBeenCalled()
+
+    await wrapper.get('[data-tour="account-form-name"]').setValue('  Cloudflare account  ')
+    await wrapper.get('[data-testid="cloudflare-account-base-url"]').setValue('https://relay.example/v1/')
+    await wrapper.get('[data-testid="cloudflare-account-api-key"]').setValue('  cf-secret  ')
+    await wrapper.get('[data-testid="cloudflare-account-concurrency"]').setValue(7)
+    await wrapper.get('[data-testid="cloudflare-account-priority"]').setValue(-2)
+    await wrapper.get('[data-testid="cloudflare-account-groups"]').trigger('click')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    expect(createAccountMock.mock.calls[0]?.[0]).toEqual({
+      name: 'Cloudflare account',
+      platform: 'openai',
+      type: 'apikey',
+      credentials: {
+        api_key: 'cf-secret',
+        base_url: 'https://relay.example/v1',
+      },
+      extra: {},
+      concurrency: 7,
+      priority: -2,
+      group_ids: [exactGroupID],
+    })
   })
 
   it('hides only the redundant account toggle when every selected group enables tier pricing', async () => {

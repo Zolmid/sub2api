@@ -245,9 +245,41 @@ export async function managementControlPlane(request: Request, env: Env, route: 
   if (!isBoundedString(request.headers.get("X-Sub2API-Container-Id"), 256)) return error("NOT_FOUND", 404);
   const body = await readJson<unknown>(request);
   if (!isObject(body)) return error("INVALID_REQUEST");
+  if (route.endsWith("/balance-history")) return balanceHistory(env, body);
   if (route.endsWith("/get")) return get(env, route, body);
   if (route.endsWith("/list")) return list(env, route, body);
   return mutate(env, route, body);
+}
+
+async function balanceHistory(env: Env, body: Record<string, unknown>): Promise<Response> {
+  if (!only(body, ["id", "page", "page_size", "type"]) || !id(body.id) ||
+    !Number.isInteger(body.page) || Number(body.page) < 1 || Number(body.page) > 1_000_000 ||
+    !Number.isInteger(body.page_size) || Number(body.page_size) < 1 || Number(body.page_size) > PAGE_MAX ||
+    (body.type !== undefined && !isBoundedString(body.type, 64))) return error("INVALID_REQUEST");
+  const user = await getUser(env, body.id as string);
+  if (!user || user.deleted_at !== null) return error("NOT_FOUND", 404);
+
+  const page = Number(body.page);
+  const pageSize = Number(body.page_size);
+  const type = body.type === undefined ? "" : body.type as string;
+  const matchesLedger = type === "" || type === "admin_balance";
+  const total = matchesLedger
+    ? await env.DB.prepare("SELECT count(*) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>()
+    : { total: 0 };
+  const recharged = await env.DB.prepare("SELECT coalesce(sum(CASE WHEN delta_microusd > '0' THEN CAST(delta_microusd AS INTEGER) ELSE 0 END), 0) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>();
+  const rows = matchesLedger
+    ? await env.DB.prepare("SELECT rowid AS id, adjustment_type, reason, delta_microusd, balance_before_microusd, balance_after_microusd, created_at FROM balance_ledger WHERE target_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").bind(user.id, pageSize, (page - 1) * pageSize).all<Record<string, unknown>>()
+    : { results: [] as Record<string, unknown>[] };
+  const items = rows.results.map((row) => ({
+    id: String(row.id),
+    adjustment_type: String(row.adjustment_type),
+    reason: String(row.reason),
+    delta_microusd: String(row.delta_microusd),
+    balance_before_microusd: String(row.balance_before_microusd),
+    balance_after_microusd: String(row.balance_after_microusd),
+    created_at: String(row.created_at),
+  }));
+  return json({ items, total: String(total?.total ?? 0), total_recharged: Number(recharged?.total ?? 0) / 1_000_000 });
 }
 
 async function get(env: Env, route: string, body: Record<string, unknown>): Promise<Response> {

@@ -4,6 +4,7 @@ package cloudflarebridge
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -49,6 +50,29 @@ func TestDisplayBalanceFromMicroUSDFailsClosed(t *testing.T) {
 		_, err := displayBalanceFromMicroUSD(value)
 		require.Error(t, err, value)
 	}
+}
+
+func TestHTTPControlPlaneManagedBalanceHistoryUsesNonSecretWireContract(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/v1/manage/users/balance-history", request.URL.Path)
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&requestBody))
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"items":[{"id":"7","adjustment_type":"subtract","reason":"manual correction","delta_microusd":"-250000","balance_before_microusd":"1250000","balance_after_microusd":"1000000","created_at":"2026-09-07T01:02:03Z"}],"total":"2","total_recharged":1.25}`)
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	history, err := control.GetManagedBalanceHistory(context.Background(), 9007199254740993, 2, 15, "admin_balance")
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{"id": "9007199254740993", "page": float64(2), "page_size": float64(15), "type": "admin_balance"}, requestBody)
+	require.Equal(t, int64(2), history.Total)
+	require.Equal(t, 1.25, history.TotalRecharged)
+	require.Len(t, history.Entries, 1)
+	require.Equal(t, int64(7), history.Entries[0].ID)
+	require.Equal(t, "-250000", history.Entries[0].DeltaMicroUSD)
+	require.Equal(t, "manual correction", history.Entries[0].Reason)
 }
 
 func mustDisplayBalance(t *testing.T, value string) float64 {

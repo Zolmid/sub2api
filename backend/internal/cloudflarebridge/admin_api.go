@@ -39,6 +39,81 @@ func (h *cloudflareAdminAPIHandler) accounts() (AdminAccountReadControlPlane, er
 	return accounts, nil
 }
 
+func (h *cloudflareAdminAPIHandler) balanceHistory() (AdminBalanceHistoryControlPlane, error) {
+	history, ok := h.control.(AdminBalanceHistoryControlPlane)
+	if !ok {
+		return nil, ErrNotMigrated
+	}
+	return history, nil
+}
+
+type cloudflareAdminBalanceHistoryDTO struct {
+	ID            cloudflareJSONID `json:"id"`
+	Code          string            `json:"code"`
+	Type          string            `json:"type"`
+	Value         float64           `json:"value"`
+	Status        string            `json:"status"`
+	UsedBy        cloudflareJSONID `json:"used_by"`
+	UsedAt        string            `json:"used_at"`
+	CreatedAt     string            `json:"created_at"`
+	GroupID       any               `json:"group_id"`
+	ValidityDays  int               `json:"validity_days"`
+	Notes         string            `json:"notes"`
+	BalanceBefore float64           `json:"balance_before"`
+	BalanceAfter  float64           `json:"balance_after"`
+}
+
+// GetBalanceHistory preserves the traditional modal response shape while
+// exposing only the Worker-owned, immutable balance ledger in Cloudflare mode.
+func (h *cloudflareAdminAPIHandler) GetBalanceHistory(c *gin.Context) {
+	userID, ok := cloudflareAdminIDParam(c, "id")
+	if !ok {
+		return
+	}
+	page, pageSize, ok := cloudflareAdminPage(c)
+	if !ok || pageSize > 100 {
+		if ok {
+			response.BadRequest(c, "Invalid page_size")
+		}
+		return
+	}
+	codeType, ok := cloudflareAdminEnum(c, "type", "", "admin_balance", "balance", "affiliate_balance", "concurrency", "admin_concurrency", "subscription")
+	if !ok {
+		return
+	}
+	history, err := h.balanceHistory()
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	result, err := history.GetManagedBalanceHistory(c.Request.Context(), userID, page, pageSize, codeType)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	items := make([]cloudflareAdminBalanceHistoryDTO, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		value, valueErr := signedDisplayBalanceFromMicroUSD(entry.DeltaMicroUSD)
+		before, beforeErr := displayBalanceFromMicroUSD(entry.BalanceBeforeMicroUSD)
+		after, afterErr := displayBalanceFromMicroUSD(entry.BalanceAfterMicroUSD)
+		if valueErr != nil || beforeErr != nil || afterErr != nil {
+			response.ErrorFrom(c, ErrControlPlaneUnavailable)
+			return
+		}
+		stamp := entry.CreatedAt.Format(time.RFC3339Nano)
+		items = append(items, cloudflareAdminBalanceHistoryDTO{
+			ID: cloudflareJSONID(entry.ID), Code: "", Type: "admin_balance", Value: value,
+			Status: service.StatusUsed, UsedBy: cloudflareJSONID(userID), UsedAt: stamp, CreatedAt: stamp,
+			GroupID: nil, ValidityDays: 0, Notes: entry.Reason, BalanceBefore: before, BalanceAfter: after,
+		})
+	}
+	pages := int((result.Total + int64(pageSize) - 1) / int64(pageSize))
+	if pages < 1 {
+		pages = 1
+	}
+	response.Success(c, gin.H{"items": items, "total": result.Total, "page": page, "page_size": pageSize, "pages": pages, "total_recharged": result.TotalRecharged})
+}
+
 // cloudflareAdminAccountDTO only represents fields persisted by the Worker.
 // Do not embed dto.Account here: its defaults would suggest runtime, billing,
 // expiry, or credential facts that the D1 account row does not contain.

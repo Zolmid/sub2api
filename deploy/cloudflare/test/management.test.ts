@@ -58,6 +58,40 @@ const userCreateBody = (
 });
 
 describe("Stage C private management control plane", () => {
+  it("loads the deterministic fixture users through the managed decoder shape", async () => {
+    const list = await call("/v1/manage/users/list", { cursor: "0", limit: 10 });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({
+      users: [
+        { id: "1001", email: "fixture-active-1001@example.test", username: "fixture-active-1001" },
+        { id: "1002", email: "fixture-disabled-1002@example.test", username: "fixture-disabled-1002" },
+      ],
+    });
+  });
+  it("reads immutable balance history with stable paging and does not expose operation IDs", async () => {
+    const scope = await createScope("ledger-history-" + id());
+    const adminID = id();
+    expect((await call("/v1/manage/users/create", userCreateBody("ledger-history-admin-" + adminID, adminID, "ledger-history-admin-" + adminID + "@example.test"))).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+    const stamp = "2026-09-07T01:02:03Z";
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-a-" + scope.userID, "secret-operation-a", adminID, scope.userID, "add", "first add", "1250000", "0", "1250000", stamp),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-b-" + scope.userID, "secret-operation-b", adminID, scope.userID, "subtract", "second subtract", "-250000", "1250000", "1000000", stamp),
+    ]);
+    const first = await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1 });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<{ items: Array<{ adjustment_type: string; delta_microusd: string; reason: string }>; total: string; total_recharged: number }>();
+    expect(firstBody).toMatchObject({ total: "2", total_recharged: 1.25, items: [{ adjustment_type: "subtract", delta_microusd: "-250000", reason: "second subtract" }] });
+    expect(JSON.stringify(firstBody)).not.toContain("secret-operation");
+    const second = await call("/v1/manage/users/balance-history", { id: scope.userID, page: 2, page_size: 1, type: "admin_balance" });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ items: [{ adjustment_type: "add", delta_microusd: "1250000" }], total: "2", total_recharged: 1.25 });
+    expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1, type: "concurrency" })).status).toBe(200);
+    expect(await env.DB.prepare("UPDATE users SET deleted_at=? WHERE id=?").bind(stamp, scope.userID).run());
+    expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1 })).status).toBe(404);
+    expect((await call("/v1/manage/users/balance-history", { id: "999999999999", page: 1, page_size: 1 })).status).toBe(404);
+    expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 0, page_size: 1 })).status).toBe(400);
+  });
   it("commits exact immutable balance ledger entries with idempotency and stale guards", async () => {
     const scope = await createScope("ledger-" + id());
     const adminID = id();

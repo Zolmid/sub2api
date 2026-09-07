@@ -29,6 +29,12 @@ type adminUserControlStub struct {
 	users      map[int64]*service.User
 	operations map[string]userCreateOperationStub
 	balances   map[string]ManagedBalanceAdjustmentResult
+	history    *ManagedBalanceHistoryPage
+	historyErr error
+	historyUserID int64
+	historyPage int
+	historyPageSize int
+	historyType string
 
 	createCalls           int
 	updateCalls           int
@@ -213,6 +219,17 @@ func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, ad
 	return &result, nil
 }
 
+func (stub *adminUserControlStub) GetManagedBalanceHistory(_ context.Context, userID int64, page, pageSize int, codeType string) (*ManagedBalanceHistoryPage, error) {
+	stub.historyUserID, stub.historyPage, stub.historyPageSize, stub.historyType = userID, page, pageSize, codeType
+	if stub.historyErr != nil {
+		return nil, stub.historyErr
+	}
+	if stub.history == nil {
+		return &ManagedBalanceHistoryPage{}, nil
+	}
+	return stub.history, nil
+}
+
 func (stub *adminUserControlStub) DeleteManagedUser(_ context.Context, _ string, userID int64) error {
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
@@ -241,7 +258,35 @@ func adminUserMutationRouter(control *adminUserControlStub, actorID int64) http.
 	router.PUT("/users/:id", withActor(handler.UpdateUser))
 	router.DELETE("/users/:id", withActor(handler.DeleteUser))
 	router.POST("/users/:id/balance", withActor(handler.UpdateBalance))
+	router.GET("/users/:id/balance-history", withActor(handler.GetBalanceHistory))
 	return router
+}
+
+func TestCloudflareAdminBalanceHistoryPreservesModalContractWithoutLedgerIDs(t *testing.T) {
+	userID := int64(2001)
+	control := newAdminUserControlStub(&service.User{ID: userID, Email: "user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1})
+	control.history = &ManagedBalanceHistoryPage{
+		Entries: []ManagedBalanceHistoryEntry{{ID: 7, AdjustmentType: "subtract", Reason: "manual correction", DeltaMicroUSD: "-250000", BalanceBeforeMicroUSD: "1250000", BalanceAfterMicroUSD: "1000000", CreatedAt: time.Date(2026, 9, 7, 1, 2, 3, 0, time.UTC)}},
+		Total: 2, TotalRecharged: 1.25,
+	}
+	handler := adminUserMutationRouter(control, 99)
+	recorded := httptest.NewRecorder()
+	handler.ServeHTTP(recorded, httptest.NewRequest(http.MethodGet, "/users/2001/balance-history?page=2&page_size=15&type=admin_balance", nil))
+	require.Equal(t, http.StatusOK, recorded.Code, recorded.Body.String())
+	require.Equal(t, userID, control.historyUserID)
+	require.Equal(t, 2, control.historyPage)
+	require.Equal(t, 15, control.historyPageSize)
+	require.Equal(t, "admin_balance", control.historyType)
+	require.Contains(t, recorded.Body.String(), `"type":"admin_balance"`)
+	require.Contains(t, recorded.Body.String(), `"value":-0.25`)
+	require.Contains(t, recorded.Body.String(), `"balance_before":1.25`)
+	require.Contains(t, recorded.Body.String(), `"balance_after":1`)
+	require.Contains(t, recorded.Body.String(), `"total_recharged":1.25`)
+	require.NotContains(t, recorded.Body.String(), "operation_id")
+	require.NotContains(t, recorded.Body.String(), "ledger_id")
+	badPageSize := httptest.NewRecorder()
+	handler.ServeHTTP(badPageSize, httptest.NewRequest(http.MethodGet, "/users/2001/balance-history?page_size=101", nil))
+	require.Equal(t, http.StatusBadRequest, badPageSize.Code)
 }
 
 func TestCloudflareAdminBalanceUsesExactControlPlaneContract(t *testing.T) {
@@ -577,3 +622,4 @@ func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
 var _ ControlPlane = (*adminUserControlStub)(nil)
 var _ AdminListControlPlane = (*adminUserControlStub)(nil)
 var _ AdminUserMutationControlPlane = (*adminUserControlStub)(nil)
+var _ AdminBalanceHistoryControlPlane = (*adminUserControlStub)(nil)

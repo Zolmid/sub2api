@@ -94,6 +94,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	admin.GET("/users", adminAPIHandler.ListUsers)
 	admin.GET("/users/:id", adminAPIHandler.GetUser)
 	admin.GET("/users/:id/api-keys", adminAPIHandler.ListUserAPIKeys)
+	admin.GET("/users/:id/balance-history", adminAPIHandler.GetBalanceHistory)
 	admin.POST("/users", adminAPIHandler.CreateUser)
 	admin.PUT("/users/:id", adminAPIHandler.UpdateUser)
 	admin.DELETE("/users/:id", adminAPIHandler.DeleteUser)

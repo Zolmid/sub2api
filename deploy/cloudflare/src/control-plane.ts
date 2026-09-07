@@ -132,6 +132,7 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
       case "/v1/manage/users/list":
       case "/v1/manage/users/update":
       case "/v1/manage/users/delete":
+      case "/v1/manage/users/balance-adjust":
       case "/v1/manage/groups/create":
       case "/v1/manage/groups/get":
       case "/v1/manage/groups/list":

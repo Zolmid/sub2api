@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,13 +29,14 @@ type adminUserControlStub struct {
 	users      map[int64]*service.User
 	operations map[string]userCreateOperationStub
 
-	createCalls         int
-	updateCalls         int
-	deleteCalls         int
-	lastOperation       string
-	lastBalanceMicroUSD string
-	lastSemanticToken   string
-	lastUpdate          ManagedUserUpdate
+	createCalls           int
+	updateCalls           int
+	deleteCalls           int
+	lastOperation         string
+	lastBalanceMicroUSD   string
+	lastSemanticToken     string
+	lastUpdate            ManagedUserUpdate
+	lastBalanceAdjustment ManagedBalanceAdjustment
 }
 
 func newAdminUserControlStub(users ...*service.User) *adminUserControlStub {
@@ -187,6 +189,22 @@ func (stub *adminUserControlStub) UpdateManagedUser(
 	return &copy, nil
 }
 
+func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, adjustment ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error) {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.lastBalanceAdjustment = adjustment
+	user := stub.users[adjustment.TargetUserID]
+	if user == nil || user.DeletedAt != nil {
+		return nil, service.ErrUserNotFound
+	}
+	before := user.Balance
+	amount, _ := strconv.ParseInt(adjustment.AmountMicroUSD, 10, 64)
+	if adjustment.Operation == "add" {
+		user.Balance += float64(amount) / float64(microUSDPerUSD)
+	}
+	return &ManagedBalanceAdjustmentResult{LedgerID: adjustment.OperationID, BalanceBeforeMicroUSD: strconv.FormatInt(int64(before*float64(microUSDPerUSD)), 10), BalanceAfterMicroUSD: strconv.FormatInt(int64(user.Balance*float64(microUSDPerUSD)), 10), DeltaMicroUSD: adjustment.AmountMicroUSD}, nil
+}
+
 func (stub *adminUserControlStub) DeleteManagedUser(_ context.Context, _ string, userID int64) error {
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
@@ -214,7 +232,22 @@ func adminUserMutationRouter(control *adminUserControlStub, actorID int64) http.
 	router.POST("/users", withActor(handler.CreateUser))
 	router.PUT("/users/:id", withActor(handler.UpdateUser))
 	router.DELETE("/users/:id", withActor(handler.DeleteUser))
+	router.POST("/users/:id/balance", withActor(handler.UpdateBalance))
 	return router
+}
+
+func TestCloudflareAdminBalanceUsesExactControlPlaneContract(t *testing.T) {
+	user := &service.User{ID: 2001, Email: "user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1}
+	control := newAdminUserControlStub(user)
+	handler := adminUserMutationRouter(control, 99)
+	result := callAdminUserMutation(t, handler, http.MethodPost, "/users/2001/balance", `{"balance":1.000001,"operation":"add","notes":"ledger note"}`, "balance-write")
+	require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+	require.Equal(t, int64(99), control.lastBalanceAdjustment.ActorUserID)
+	require.Equal(t, int64(2001), control.lastBalanceAdjustment.TargetUserID)
+	require.Equal(t, "1000001", control.lastBalanceAdjustment.AmountMicroUSD)
+	require.Equal(t, "add", control.lastBalanceAdjustment.Operation)
+	require.Equal(t, "ledger note", control.lastBalanceAdjustment.Reason)
+	require.Contains(t, control.lastBalanceAdjustment.OperationID, "user-balance:99:")
 }
 
 func callAdminUserMutation(

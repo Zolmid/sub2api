@@ -58,9 +58,49 @@ const userCreateBody = (
 });
 
 describe("Stage C private management control plane", () => {
+  it("commits exact immutable balance ledger entries with idempotency and stale guards", async () => {
+    const scope = await createScope("ledger-" + id());
+    const adminID = id();
+    expect((await call("/v1/manage/users/create", userCreateBody("ledger-admin-" + adminID, adminID, "ledger-admin-" + adminID + "@example.test", { role: "user" }))).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+    const request = { operation_id: "ledger-op-" + scope.userID, actor_user_id: adminID, target_user_id: scope.userID, operation: "add", amount_microusd: "999999999999999999", reason: "manual" };
+    const first = await call("/v1/manage/users/balance-adjust", request); expect(first.status).toBe(200);
+    const result = await first.json<{ balance: { balance_before_microusd: string; balance_after_microusd: string; delta_microusd: string }; replayed: boolean }>();
+    expect(result.balance).toMatchObject({ balance_before_microusd: "1", balance_after_microusd: "1000000000000000000", delta_microusd: "999999999999999999" }); expect(result.replayed).toBe(false);
+    expect((await call("/v1/manage/users/balance-adjust", request)).status).toBe(200);
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, amount_microusd: "2" })).status).toBe(409);
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-negative-" + scope.userID, operation: "subtract", amount_microusd: "1000000000000000001" })).status).toBe(409);
+    const maximum = "9999999999999999999999999999999999999999";
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-maximum-" + scope.userID, operation: "set", amount_microusd: maximum })).status).toBe(200);
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-overflow-" + scope.userID, operation: "add", amount_microusd: "1" })).status).toBe(409);
+    const ledger = await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE target_user_id=?").bind(scope.userID).first("count"); expect(ledger).toBe(2);
+    await expect(env.DB.prepare("UPDATE balance_ledger SET reason='rewritten' WHERE target_user_id=?").bind(scope.userID).run()).rejects.toThrow();
+    await expect(env.DB.prepare("DELETE FROM balance_ledger WHERE target_user_id=?").bind(scope.userID).run()).rejects.toThrow();
+    await env.DB.prepare("UPDATE users SET deleted_at=?,status='disabled' WHERE id=?").bind(new Date().toISOString(), scope.userID).run();
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-deleted-" + scope.userID })).status).toBe(404);
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-actor-" + scope.userID, actor_user_id: scope.userID })).status).toBe(403);
+  });
+  it("leaves no operation or ledger when the guarded projection update is stale", async () => {
+    const scope = await createScope("ledger-stale-" + id());
+    const adminID = id();
+    expect((await call("/v1/manage/users/create", userCreateBody("ledger-stale-admin-" + adminID, adminID, "ledger-stale-admin-" + adminID + "@example.test"))).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+    const operation = "ledger-stale-" + scope.userID;
+    const stamp = new Date().toISOString();
+    const results = await env.DB.batch([
+      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=?").bind("2", stamp, scope.userID, "999"),
+      env.DB.prepare("INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT ?,?,?,?,? WHERE changes()=1").bind(operation, "/v1/manage/users/balance-adjust", "a".repeat(64), "{\"balance\":{}}", stamp),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, adminID, scope.userID, "add", "stale", "1", "1", "2", stamp, operation),
+    ]);
+    expect(results[0].meta.changes).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(operation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(operation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+  });
   it("backfills Stage B timestamps on the fresh migration chain", async () => {
     await applyD1Migrations(env.DB, testEnv.TEST_MIGRATIONS);
     expect(await env.DB.prepare("SELECT count(*) count FROM pragma_table_info('users') WHERE name='updated_at'").first("count")).toBe(1);
+    expect((await env.DB.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
   });
 
   it("encrypts Worker-managed credentials and excludes secrets from operation responses", async () => {

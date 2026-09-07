@@ -227,3 +227,13 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    gates, not implied by CRUD success.
 5. Keep remote Cloudflare and real-upstream verification behind their separate
    authorization and disposable-resource requirements.
+# 2026-09-07 — D1 administrator balance-adjustment ledger (local verification)
+
+Cloudflare mode now routes the existing administrator balance endpoint through
+the private Worker control plane. The Worker stores canonical signed integer
+microusd deltas and an append-only D1 balance_ledger; the users balance
+projection, idempotency record, and ledger entry share one guarded D1 batch.
+Focused local workerd tests use an isolated directory containing only tracked
+migrations and cover exact arithmetic, replay/conflict, stale guard, bounds,
+deleted/administrator boundaries, and immutable rows. No browser, remote
+Worker/D1, real upstream, or production validation has occurred.

@@ -273,3 +273,12 @@ test resource namespace. Real-upstream verification additionally requires an
 authorized synthetic-budget account and redacted logging. Neither gate has been
 run. No local or dry-run result may be relabeled as remote Cloudflare or
 real-upstream acceptance.
+# Balance ledger lane (2026-09-07)
+
+Run the focused Worker suite with SUB2API_CF_TEST_MIGRATIONS_DIR set to an
+isolated directory populated from tracked deploy/cloudflare/migrations SQL
+files only. The balance-ledger cases assert exact BigInt microusd arithmetic,
+idempotent replay and changed-request conflict, a zero-row guarded-update
+stale path that writes neither management_operations nor balance_ledger,
+overflow/underflow rejection, tombstone/admin boundaries, immutable-row
+trigger rejection, repeat migration, and an empty foreign_key_check.

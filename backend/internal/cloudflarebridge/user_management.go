@@ -30,6 +30,28 @@ type AdminUserMutationControlPlane interface {
 	DeleteManagedUser(context.Context, string, int64) error
 }
 
+// AdminBalanceControlPlane is deliberately narrower than the legacy service:
+// the Worker owns the atomic D1 projection and immutable audit ledger.
+type AdminBalanceControlPlane interface {
+	AdjustManagedUserBalance(context.Context, ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error)
+}
+
+type ManagedBalanceAdjustment struct {
+	OperationID    string
+	ActorUserID    int64
+	TargetUserID   int64
+	Operation      string
+	AmountMicroUSD string
+	Reason         string
+}
+
+type ManagedBalanceAdjustmentResult struct {
+	LedgerID              string
+	BalanceBeforeMicroUSD string
+	BalanceAfterMicroUSD  string
+	DeltaMicroUSD         string
+}
+
 // ManagedUserUpdate contains only fields owned by the current Worker schema.
 // Role and balance deliberately have no representation here: role changes need
 // step-up authentication and balance changes belong to the ledger endpoint.
@@ -80,6 +102,71 @@ func (h *cloudflareAdminAPIHandler) userMutations() (AdminUserMutationControlPla
 		return nil, ErrNotMigrated
 	}
 	return mutations, nil
+}
+
+func (h *cloudflareAdminAPIHandler) balances() (AdminBalanceControlPlane, error) {
+	control, ok := h.control.(AdminBalanceControlPlane)
+	if !ok {
+		return nil, ErrNotMigrated
+	}
+	return control, nil
+}
+
+// UpdateBalance keeps the established public endpoint in Cloudflare mode. It
+// accepts the existing decimal UI representation only at this public edge,
+// converts it exactly once, then uses signed integer microusd across the
+// Container-to-Worker boundary.
+func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
+	userID, ok := cloudflareAdminIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var request struct {
+		Balance   json.RawMessage `json:"balance"`
+		Operation string          `json:"operation"`
+		Notes     string          `json:"notes"`
+	}
+	if err := decodeCloudflareJSON(c, &request); err != nil {
+		response.BadRequest(c, "Invalid request")
+		return
+	}
+	amount, valid := microUSDFromJSON(request.Balance)
+	if !valid || amount == "0" || (request.Operation != "set" && request.Operation != "add" && request.Operation != "subtract") || utf8.RuneCountInString(request.Notes) > 4096 {
+		response.BadRequest(c, "Invalid balance adjustment")
+		return
+	}
+	subject, authenticated := middleware.GetAuthSubjectFromContext(c)
+	actorID := subject.UserID
+	if !authenticated || actorID < 1 {
+		response.Unauthorized(c, "Unauthorized")
+		return
+	}
+	key, err := service.NormalizeIdempotencyKey(c.GetHeader("Idempotency-Key"))
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	balances, err := h.balances()
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	_, err = balances.AdjustManagedUserBalance(c.Request.Context(), ManagedBalanceAdjustment{OperationID: "user-balance:" + strconv.FormatInt(actorID, 10) + ":" + key, ActorUserID: actorID, TargetUserID: userID, Operation: request.Operation, AmountMicroUSD: amount, Reason: request.Notes})
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	management, err := h.management()
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	user, err := management.GetManagedUser(c.Request.Context(), userID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, newCloudflareAdminUserDTO(user))
 }
 
 func (h *cloudflareAdminAPIHandler) CreateUser(c *gin.Context) {
@@ -648,6 +735,16 @@ func mapManagedUserMutationError(err error) error {
 		return infraerrors.Forbidden("ADMIN_ROLE_PROTECTED", "admin users cannot be disabled or deleted in Cloudflare mode")
 	case "IDEMPOTENCY_CONFLICT":
 		return infraerrors.Conflict("IDEMPOTENCY_CONFLICT", "idempotency key was reused with a different user payload")
+	case "BALANCE_NEGATIVE":
+		return infraerrors.Conflict("BALANCE_NEGATIVE", "balance cannot be negative")
+	case "BALANCE_OVERFLOW":
+		return infraerrors.Conflict("BALANCE_OVERFLOW", "balance exceeds the supported limit")
+	case "STALE_BALANCE":
+		return infraerrors.Conflict("STALE_BALANCE", "balance changed concurrently; retry with a new idempotency key")
+	case "TARGET_NOT_FOUND":
+		return service.ErrUserNotFound
+	case "ACTOR_FORBIDDEN":
+		return infraerrors.Forbidden("ADMIN_REQUIRED", "administrator access is required")
 	case "CONFLICT":
 		return infraerrors.Conflict("USER_CONFLICT", "user mutation conflicted with current state")
 	}
@@ -851,3 +948,34 @@ func managedUserGroupIDs(values []int64) []string {
 }
 
 var _ AdminUserMutationControlPlane = (*HTTPControlPlane)(nil)
+var _ AdminBalanceControlPlane = (*HTTPControlPlane)(nil)
+
+func (c *HTTPControlPlane) AdjustManagedUserBalance(ctx context.Context, adjustment ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error) {
+	if adjustment.ActorUserID < 1 || adjustment.TargetUserID < 1 || !isCanonicalPositiveDecimal(adjustment.AmountMicroUSD) || adjustment.AmountMicroUSD == "0" {
+		return nil, ErrNotMigrated
+	}
+	var wire struct {
+		Balance struct {
+			LedgerID              string `json:"ledger_id"`
+			BalanceBeforeMicroUSD string `json:"balance_before_microusd"`
+			BalanceAfterMicroUSD  string `json:"balance_after_microusd"`
+			DeltaMicroUSD         string `json:"delta_microusd"`
+		} `json:"balance"`
+	}
+	err := c.post(ctx, "/v1/manage/users/balance-adjust", map[string]any{"operation_id": adjustment.OperationID, "actor_user_id": strconv.FormatInt(adjustment.ActorUserID, 10), "target_user_id": strconv.FormatInt(adjustment.TargetUserID, 10), "operation": adjustment.Operation, "amount_microusd": adjustment.AmountMicroUSD, "reason": adjustment.Reason}, &wire)
+	if err != nil {
+		return nil, mapManagedUserMutationError(err)
+	}
+	if wire.Balance.LedgerID != adjustment.OperationID || !unsignedMicroUSDWire(wire.Balance.BalanceBeforeMicroUSD) || !unsignedMicroUSDWire(wire.Balance.BalanceAfterMicroUSD) || !signedMicroUSDWire(wire.Balance.DeltaMicroUSD) {
+		return nil, errors.New("invalid balance adjustment response")
+	}
+	return &ManagedBalanceAdjustmentResult{LedgerID: wire.Balance.LedgerID, BalanceBeforeMicroUSD: wire.Balance.BalanceBeforeMicroUSD, BalanceAfterMicroUSD: wire.Balance.BalanceAfterMicroUSD, DeltaMicroUSD: wire.Balance.DeltaMicroUSD}, nil
+}
+
+func signedMicroUSDWire(value string) bool {
+	return value == "0" || isCanonicalPositiveDecimal(value) || (strings.HasPrefix(value, "-") && isCanonicalPositiveDecimal(strings.TrimPrefix(value, "-")))
+}
+
+func unsignedMicroUSDWire(value string) bool {
+	return value == "0" || isCanonicalPositiveDecimal(value)
+}

@@ -16,6 +16,8 @@ async function resetFixture(): Promise<void> {
   DELETE FROM usage_events;
   DELETE FROM outbox_events;
   DELETE FROM gateway_requests;
+  -- balance_ledger is intentionally immutable; test rows use fresh IDs and
+  -- remain as append-only evidence across fixture resets.
   DELETE FROM management_operations;
   DELETE FROM account_groups;
   DELETE FROM api_keys;

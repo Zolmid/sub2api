@@ -132,7 +132,7 @@ func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 		return
 	}
 	amount, valid := microUSDFromJSON(request.Balance)
-	if !valid || amount == "0" || (request.Operation != "set" && request.Operation != "add" && request.Operation != "subtract") || utf8.RuneCountInString(request.Notes) > 4096 {
+	if !valid || amount == "0" || (request.Operation != "set" && request.Operation != "add" && request.Operation != "subtract") || utf16Length(request.Notes) > 4096 {
 		response.BadRequest(c, "Invalid balance adjustment")
 		return
 	}

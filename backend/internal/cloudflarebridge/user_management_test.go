@@ -271,6 +271,20 @@ func TestCloudflareAdminBalanceUsesExactControlPlaneContract(t *testing.T) {
 	require.Equal(t, "true", replay.Header().Get("X-Idempotency-Replayed"))
 }
 
+func TestCloudflareAdminBalanceUsesWorkerUTF16ReasonLimit(t *testing.T) {
+	user := &service.User{ID: 2002, Email: "unicode-user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1}
+	control := newAdminUserControlStub(user)
+	handler := adminUserMutationRouter(control, 99)
+
+	boundaryBody := `{"balance":1,"operation":"add","notes":"` + strings.Repeat("😀", 2048) + `"}`
+	boundary := callAdminUserMutation(t, handler, http.MethodPost, "/users/2002/balance", boundaryBody, "utf16-boundary")
+	require.Equal(t, http.StatusOK, boundary.Code, boundary.Body.String())
+
+	overflowBody := `{"balance":1,"operation":"add","notes":"` + strings.Repeat("😀", 2049) + `"}`
+	overflow := callAdminUserMutation(t, handler, http.MethodPost, "/users/2002/balance", overflowBody, "utf16-overflow")
+	require.Equal(t, http.StatusBadRequest, overflow.Code, overflow.Body.String())
+}
+
 func callAdminUserMutation(
 	t *testing.T,
 	handler http.Handler,

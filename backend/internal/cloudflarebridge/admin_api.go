@@ -320,12 +320,23 @@ func cloudflareAdminAccountQueryOK(c *gin.Context) bool {
 	return true
 }
 
-func cloudflareAdminAccountDetailQueryOK(c *gin.Context) bool {
-	if len(c.Request.URL.Query()) == 0 {
+func cloudflareAdminIgnoredTimezoneOK(c *gin.Context) bool {
+	values, exists := c.GetQueryArray("timezone")
+	if !exists || len(values) == 1 {
 		return true
 	}
-	response.BadRequest(c, "Account detail query parameters are not migrated in Cloudflare mode")
+	response.BadRequest(c, "Invalid timezone")
 	return false
+}
+
+func cloudflareAdminAccountDetailQueryOK(c *gin.Context) bool {
+	for name := range c.Request.URL.Query() {
+		if name != "timezone" {
+			response.BadRequest(c, "Account detail query parameters are not migrated in Cloudflare mode")
+			return false
+		}
+	}
+	return cloudflareAdminIgnoredTimezoneOK(c)
 }
 
 func cloudflareAdminAccountGroup(c *gin.Context) (string, bool) {
@@ -363,7 +374,7 @@ func cloudflareAdminAccountPrivacyMode(c *gin.Context) (string, bool) {
 }
 
 func (h *cloudflareAdminAPIHandler) ListAccounts(c *gin.Context) {
-	if !cloudflareAdminAccountQueryOK(c) || !cloudflareAdminAccountProjectionFlags(c) {
+	if !cloudflareAdminAccountQueryOK(c) || !cloudflareAdminIgnoredTimezoneOK(c) || !cloudflareAdminAccountProjectionFlags(c) {
 		return
 	}
 	page, pageSize, ok := cloudflareAdminPage(c)

@@ -867,6 +867,12 @@ func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testi
 	require.NotContains(t, detailData, "credentials")
 	require.NotContains(t, detailData, "credential_envelope")
 	require.NotContains(t, detailData["extra"].(map[string]any), "api_key")
+	timezoneDetail := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741993?timezone=Asia%2FShanghai", adminToken, "")
+	require.Equal(t, http.StatusOK, timezoneDetail.Code, timezoneDetail.Body.String())
+	unsupportedDetailQuery := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741993?legacy_probe=1", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedDetailQuery.Code, unsupportedDetailQuery.Body.String())
+	duplicateDetailTimezone := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts/9007199254741993?timezone=UTC&timezone=Asia%2FShanghai", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, duplicateDetailTimezone.Code, duplicateDetailTimezone.Body.String())
 
 	filtered := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?status=active&group=9007199254741097&privacy_mode=training_off&search=zet&lite=1&include_scheduler_score=0", adminToken, "")
 	require.Equal(t, http.StatusOK, filtered.Code, filtered.Body.String())

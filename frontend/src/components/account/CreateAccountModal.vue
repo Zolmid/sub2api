@@ -5281,9 +5281,13 @@ const resetForm = () => {
 
   antigravityModelRestrictionMode.value = 'mapping'
   antigravityWhitelistModels.value = []
-  fetchAntigravityDefaultMappings().then(mappings => {
-    antigravityModelMappings.value = [...mappings]
-  })
+  if (isCloudflareMode.value) {
+    antigravityModelMappings.value = []
+  } else {
+    fetchAntigravityDefaultMappings().then(mappings => {
+      antigravityModelMappings.value = [...mappings]
+    })
+  }
   poolModeEnabled.value = false
   poolModeRetryCount.value = DEFAULT_POOL_MODE_RETRY_COUNT
   poolModeRetryStatusCodesInput.value = ''

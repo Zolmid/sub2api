@@ -12,6 +12,7 @@ const {
   getWebSearchEmulationConfigMock,
   getSettingsMock,
   listTLSProfilesMock,
+  getAntigravityDefaultModelMappingMock,
   authIsSimpleMode,
   appRuntimeVersion,
 } = vi.hoisted(() => ({
@@ -24,6 +25,7 @@ const {
   getWebSearchEmulationConfigMock: vi.fn(),
   getSettingsMock: vi.fn(),
   listTLSProfilesMock: vi.fn(),
+  getAntigravityDefaultModelMappingMock: vi.fn(),
   authIsSimpleMode: { value: true },
   appRuntimeVersion: { value: 'traditional' },
 }))
@@ -68,7 +70,7 @@ vi.mock('@/api/admin', () => ({
 }))
 
 vi.mock('@/api/admin/accounts', () => ({
-  getAntigravityDefaultModelMapping: vi.fn().mockResolvedValue([]),
+  getAntigravityDefaultModelMapping: getAntigravityDefaultModelMappingMock,
 }))
 
 vi.mock('vue-i18n', async () => {
@@ -229,6 +231,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     getWebSearchEmulationConfigMock.mockReset().mockResolvedValue({ enabled: false, providers: [] })
     getSettingsMock.mockReset().mockResolvedValue({})
     listTLSProfilesMock.mockReset().mockResolvedValue([])
+    getAntigravityDefaultModelMappingMock.mockReset().mockResolvedValue([])
   })
 
   it('uses the strict Cloudflare-native account form and submits only migrated fields', async () => {
@@ -248,6 +251,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(getWebSearchEmulationConfigMock).not.toHaveBeenCalled()
     expect(getSettingsMock).not.toHaveBeenCalled()
     expect(listTLSProfilesMock).not.toHaveBeenCalled()
+    expect(getAntigravityDefaultModelMappingMock).not.toHaveBeenCalled()
 
     await wrapper.get('[data-tour="account-form-name"]').setValue('  Cloudflare account  ')
     await wrapper.get('[data-testid="cloudflare-account-base-url"]').setValue('https://relay.example/v1/')
@@ -272,6 +276,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       priority: -2,
       group_ids: [exactGroupID],
     })
+    expect(getAntigravityDefaultModelMappingMock).not.toHaveBeenCalled()
   })
 
   it('hides only the redundant account toggle when every selected group enables tier pricing', async () => {

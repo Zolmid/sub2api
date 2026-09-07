@@ -87,6 +87,7 @@ describe("Stage C private management control plane", () => {
     expect(second.status).toBe(200);
     expect(await second.json()).toMatchObject({ items: [{ adjustment_type: "add", delta_microusd: "1250000" }], total: "2", total_recharged: 1.25 });
     expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1, type: "concurrency" })).status).toBe(200);
+    expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1, type: "not-a-history-type" })).status).toBe(400);
     expect(await env.DB.prepare("UPDATE users SET deleted_at=? WHERE id=?").bind(stamp, scope.userID).run());
     expect((await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1 })).status).toBe(404);
     expect((await call("/v1/manage/users/balance-history", { id: "999999999999", page: 1, page_size: 1 })).status).toBe(404);

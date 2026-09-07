@@ -100,7 +100,7 @@ func (c *HTTPControlPlane) GetManagedBalanceHistory(ctx context.Context, userID 
 		_, afterErr := displayBalanceFromMicroUSD(item.BalanceAfterMicroUSD)
 		if err != nil || timeErr != nil || deltaErr != nil || beforeErr != nil || afterErr != nil ||
 			(item.AdjustmentType != "add" && item.AdjustmentType != "subtract" && item.AdjustmentType != "set") ||
-			len(item.Reason) > 4096 {
+			utf16Length(item.Reason) > 4096 {
 			return nil, fmt.Errorf("invalid managed balance history response")
 		}
 		entries = append(entries, ManagedBalanceHistoryEntry{

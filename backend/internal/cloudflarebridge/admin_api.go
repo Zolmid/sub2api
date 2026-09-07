@@ -49,18 +49,18 @@ func (h *cloudflareAdminAPIHandler) balanceHistory() (AdminBalanceHistoryControl
 
 type cloudflareAdminBalanceHistoryDTO struct {
 	ID            cloudflareJSONID `json:"id"`
-	Code          string            `json:"code"`
-	Type          string            `json:"type"`
-	Value         float64           `json:"value"`
-	Status        string            `json:"status"`
+	Code          string           `json:"code"`
+	Type          string           `json:"type"`
+	Value         float64          `json:"value"`
+	Status        string           `json:"status"`
 	UsedBy        cloudflareJSONID `json:"used_by"`
-	UsedAt        string            `json:"used_at"`
-	CreatedAt     string            `json:"created_at"`
-	GroupID       any               `json:"group_id"`
-	ValidityDays  int               `json:"validity_days"`
-	Notes         string            `json:"notes"`
-	BalanceBefore float64           `json:"balance_before"`
-	BalanceAfter  float64           `json:"balance_after"`
+	UsedAt        string           `json:"used_at"`
+	CreatedAt     string           `json:"created_at"`
+	GroupID       any              `json:"group_id"`
+	ValidityDays  int              `json:"validity_days"`
+	Notes         string           `json:"notes"`
+	BalanceBefore float64          `json:"balance_before"`
+	BalanceAfter  float64          `json:"balance_after"`
 }
 
 // GetBalanceHistory preserves the traditional modal response shape while

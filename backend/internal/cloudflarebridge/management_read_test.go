@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -73,6 +74,42 @@ func TestHTTPControlPlaneManagedBalanceHistoryUsesNonSecretWireContract(t *testi
 	require.Equal(t, int64(7), history.Entries[0].ID)
 	require.Equal(t, "-250000", history.Entries[0].DeltaMicroUSD)
 	require.Equal(t, "manual correction", history.Entries[0].Reason)
+}
+
+func TestHTTPControlPlaneManagedBalanceHistoryReasonUsesUTF16Limit(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		reason  string
+		wantErr bool
+	}{
+		{name: "maximum emoji reason", reason: strings.Repeat("😀", 2048)},
+		{name: "oversized emoji reason", reason: strings.Repeat("😀", 2049), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
+					"items": []map[string]any{{
+						"id": "7", "adjustment_type": "add", "reason": test.reason,
+						"delta_microusd": "1", "balance_before_microusd": "0",
+						"balance_after_microusd": "1", "created_at": "2026-09-07T01:02:03Z",
+					}},
+					"total": "1", "total_recharged": 0.000001,
+				}))
+			}))
+			defer server.Close()
+
+			control, err := NewHTTPControlPlane(server.URL, server.Client())
+			require.NoError(t, err)
+			history, err := control.GetManagedBalanceHistory(context.Background(), 1, 1, 15, "admin_balance")
+			if test.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.reason, history.Entries[0].Reason)
+		})
+	}
 }
 
 func mustDisplayBalance(t *testing.T, value string) float64 {

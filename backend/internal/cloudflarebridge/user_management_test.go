@@ -26,15 +26,15 @@ type userCreateOperationStub struct {
 type adminUserControlStub struct {
 	mu sync.Mutex
 
-	users      map[int64]*service.User
-	operations map[string]userCreateOperationStub
-	balances   map[string]ManagedBalanceAdjustmentResult
-	history    *ManagedBalanceHistoryPage
-	historyErr error
-	historyUserID int64
-	historyPage int
+	users           map[int64]*service.User
+	operations      map[string]userCreateOperationStub
+	balances        map[string]ManagedBalanceAdjustmentResult
+	history         *ManagedBalanceHistoryPage
+	historyErr      error
+	historyUserID   int64
+	historyPage     int
 	historyPageSize int
-	historyType string
+	historyType     string
 
 	createCalls           int
 	updateCalls           int
@@ -267,7 +267,7 @@ func TestCloudflareAdminBalanceHistoryPreservesModalContractWithoutLedgerIDs(t *
 	control := newAdminUserControlStub(&service.User{ID: userID, Email: "user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1})
 	control.history = &ManagedBalanceHistoryPage{
 		Entries: []ManagedBalanceHistoryEntry{{ID: 7, AdjustmentType: "subtract", Reason: "manual correction", DeltaMicroUSD: "-250000", BalanceBeforeMicroUSD: "1250000", BalanceAfterMicroUSD: "1000000", CreatedAt: time.Date(2026, 9, 7, 1, 2, 3, 0, time.UTC)}},
-		Total: 2, TotalRecharged: 1.25,
+		Total:   2, TotalRecharged: 1.25,
 	}
 	handler := adminUserMutationRouter(control, 99)
 	recorded := httptest.NewRecorder()

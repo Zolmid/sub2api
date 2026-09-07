@@ -262,13 +262,14 @@ async function balanceHistory(env: Env, body: Record<string, unknown>): Promise<
   const page = Number(body.page);
   const pageSize = Number(body.page_size);
   const type = body.type === undefined ? "" : body.type as string;
+  if (!["", "admin_balance", "balance", "affiliate_balance", "concurrency", "admin_concurrency", "subscription"].includes(type)) return error("INVALID_REQUEST");
   const matchesLedger = type === "" || type === "admin_balance";
   const total = matchesLedger
     ? await env.DB.prepare("SELECT count(*) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>()
     : { total: 0 };
-  const recharged = await env.DB.prepare("SELECT coalesce(sum(CASE WHEN delta_microusd > '0' THEN CAST(delta_microusd AS INTEGER) ELSE 0 END), 0) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>();
+  const recharged = await env.DB.prepare("SELECT coalesce(sum(CASE WHEN substr(delta_microusd,1,1)<>'-' AND delta_microusd<>'0' THEN CAST(delta_microusd AS INTEGER) ELSE 0 END), 0) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>();
   const rows = matchesLedger
-    ? await env.DB.prepare("SELECT rowid AS id, adjustment_type, reason, delta_microusd, balance_before_microusd, balance_after_microusd, created_at FROM balance_ledger WHERE target_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").bind(user.id, pageSize, (page - 1) * pageSize).all<Record<string, unknown>>()
+    ? await env.DB.prepare("SELECT CAST(rowid AS TEXT) AS id, adjustment_type, reason, delta_microusd, balance_before_microusd, balance_after_microusd, created_at FROM balance_ledger WHERE target_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").bind(user.id, pageSize, (page - 1) * pageSize).all<Record<string, unknown>>()
     : { results: [] as Record<string, unknown>[] };
   const items = rows.results.map((row) => ({
     id: String(row.id),

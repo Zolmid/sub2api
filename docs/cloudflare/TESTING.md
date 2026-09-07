@@ -48,12 +48,13 @@ check passed. The package and both lockfiles therefore remain unchanged.
 | Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
 | Local composed API runtime | Start Wrangler 4.129.0 with the fresh D1 state and local-only secrets, then drive the embedded console and admin/user/key HTTP lifecycle | Passed: console/CSP nonce 200, admin login 200, create/replay 200 with one ID, semantic conflict 409, update and updated-password login 200, normalized-email conflict 409, API-key create and fixture gateway request 200, delete 200, then deleted-user login/key 401 and admin read 404. D1 readback confirmed both tombstones and no foreign-key violations. |
 | Local embedded-browser rebind | Drive the embedded console in real Chromium against local Wrangler/Container/D1 state, then reload and query D1 directly | Passed after reproducing the former 404 and correcting the GET client's automatic `timezone` parameter. The modal showed the truthful current group, exposed only active standard OpenAI groups, hid disabled/unbind choices, completed GET/GET/PUT with 200, showed the exclusive-grant notification, and retained the new group after reload. D1 readback confirmed key `3001` -> group `2002` and one copy each of allowed groups `2001` and `2002`. |
+| Local embedded-browser account CRUD | Drive the bounded account list/detail/create/edit/toggle/delete console in real Chromium at `507a64cf6`, inspect its fetch traffic, and query persisted D1 state | Passed. List and detail accepted the shared `timezone` parameter; create, omitted-key edit, credential replacement, status/scheduling toggles, and delete returned 200. The corrected create made no unsupported Antigravity mapping, TLS, quota, or Web Search request, and account responses disclosed no credential fields. D1 showed both exercised accounts disabled, unschedulable, tombstoned, AES-GCM-enveloped, and group-linked, with 2 create, 3 update, and 2 delete operation rows and no foreign-key violations. |
 | Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
-| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the owner-list/browser correction: 160.55 KiB Worker upload / 35.22 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 at `507a64cf6`: 169.43 KiB Worker upload / 36.32 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
 
-The composed API row is an HTTP harness; the following bounded rebind row is a
-real Chromium interaction. Neither claims broad console, remote Cloudflare,
-real-upstream, or production acceptance.
+The composed API row is an HTTP harness; the bounded rebind and account CRUD
+rows are real Chromium interactions. None claims broad console, remote
+Cloudflare, real-upstream, or production acceptance.
 
 ## Baseline regression
 
@@ -199,6 +200,33 @@ Console messages specific to this modal/rebind flow were absent after reload.
 The page still reports expected 404s for unrelated, not-yet-migrated console
 surfaces and third-party checkout scripts still fail CORS in this localhost
 environment; neither is counted as acceptance for those broader features.
+
+## Stage C local browser account CRUD gate
+
+The bounded OpenAI API-key account contract was exercised through the embedded
+JavaScript console in real Chromium against Wrangler, the built Go Container,
+and persisted local D1 state. The first browser pass exposed two integration
+gaps that isolated API tests had not: the shared GET interceptor appends
+`timezone` to both list and detail reads, and resetting the create modal tried
+to fetch the traditional Antigravity default-model mapping. The accepted
+revision explicitly accepts and ignores only that GET compatibility parameter
+and does not initialize the unsupported mapping in Cloudflare mode.
+
+At `507a64cf6`, list and detail reads, account creation, an edit that omitted the
+API key, a replacement-credential edit, status and schedulable toggles, and
+deletion all returned 200. Inspecting the create response found only the safe
+account projection. The create sequence made no Antigravity mapping, TLS,
+quota, or Web Search request; unrelated page-level 404s remain outside this
+bounded gate. A second clean create/delete pass specifically verified the
+modal-reset correction on the accepted revision.
+
+Direct persisted-state readback returned both browser-created accounts with
+`status=disabled`, `schedulable=0`, and non-null tombstones. Their envelopes had
+the `aes-gcm:v1:` prefix, contained no synthetic plaintext marker, and retained
+one selected-group link each. The operation log contained two creates, three
+updates, and two deletes, and `PRAGMA foreign_key_check` returned no rows. The
+ambiguous private-5xx create retry remains automated coverage rather than a
+claimed browser result.
 
 ## Local vertical-slice gate
 

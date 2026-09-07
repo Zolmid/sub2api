@@ -21,8 +21,18 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   The automated local gate passed the Go 1.27 bridge package, Worker TypeScript
   and generated types, workerd (8 files / 55 tests), the five focused frontend
   files (106 tests), and the full frontend suite (257 files / 1884 tests),
-  typecheck, read-only lint, and production build. Composed browser and current
-  production-config dry-run evidence are recorded separately when completed.
+  typecheck, read-only lint, and production build. At revision `507a64cf6`, a
+  fresh real-Chromium composition then passed account list/detail (including
+  the shared `timezone` parameter), create, edit with omitted-credential
+  preservation, credential replacement, status/scheduling toggles, and delete.
+  The corrected create modal made no Antigravity mapping, TLS, quota, or Web
+  Search request; every account request returned 200 and no response disclosed
+  credentials. Persisted D1 readback found both exercised accounts disabled,
+  unschedulable, tombstoned, AES-GCM-enveloped, and linked to their selected
+  group, with the expected operation rows and no foreign-key violations. A
+  production-config Wrangler dry-run at the same revision rebuilt the frontend,
+  Go binary, and distroless Container image and produced a 169.43 KiB Worker
+  bundle (36.32 KiB gzip) without mutating Cloudflare resources.
   OAuth/import/test/refresh/batch/export and other platform/type paths remain
   unavailable; this is not remote deployment or real-upstream evidence.
 
@@ -201,8 +211,9 @@ product such as R2; they have not been silently removed or stored in D1/KV.
 
 1. Retain a dedicated concurrency probe for a group-reference change racing a
    user mutation, and drive the remaining embedded-console flows—especially
-   ambiguous admin-user create retry—in a real browser. The bounded API-key
-   rebind browser flow and composed API lifecycle now pass separately.
+   ambiguous admin-user create retry—in a real browser. The bounded account
+   CRUD and API-key rebind browser flows plus the composed API lifecycle now
+   pass separately.
 2. Treat the existing user-owned API-key lifecycle plus the administrator
    owner-list/group-rebind contract as the complete current API-key management
    surface; do not invent administrator CRUD routes absent from the upstream

@@ -58,8 +58,9 @@
       :style="{ top: dropdownPosition.top + 'px', left: dropdownPosition.left + 'px' }"
     >
       <div class="max-h-64 overflow-y-auto p-1.5">
-        <!-- Unbind option -->
+        <!-- Cloudflare only supports binding to a live standard OpenAI group. -->
         <button
+          v-if="!isCloudflareMode"
           @click="changeGroup(selectedKeyForGroup!, null)"
           :class="[
             'flex w-full items-center rounded-lg px-3 py-2 text-sm transition-colors',
@@ -77,12 +78,12 @@
         </button>
         <!-- Group options -->
         <button
-          v-for="group in allGroups"
+          v-for="group in selectableGroups"
           :key="group.id"
           @click="changeGroup(selectedKeyForGroup!, group.id)"
           :class="[
             'flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors',
-            selectedKeyForGroup?.group_id === group.id
+            sameID(selectedKeyForGroup?.group_id, group.id)
               ? 'bg-primary-50 dark:bg-primary-900/20'
               : 'hover:bg-gray-100 dark:hover:bg-dark-700'
           ]"
@@ -97,7 +98,7 @@
             :peak-end="group.peak_end"
             :peak-rate-multiplier="group.peak_rate_multiplier"
             :description="group.description"
-            :selected="selectedKeyForGroup?.group_id === group.id"
+            :selected="sameID(selectedKeyForGroup?.group_id, group.id)"
           />
         </button>
       </div>
@@ -120,27 +121,41 @@ const props = defineProps<{ show: boolean; user: AdminUser | null }>()
 const emit = defineEmits(['close'])
 const { t } = useI18n()
 const appStore = useAppStore()
+const isCloudflareMode = computed(() => appStore.cachedPublicSettings?.version === 'cloudflare')
+
+type RuntimeID = number | string
 
 const apiKeys = ref<ApiKey[]>([])
 const allGroups = ref<AdminGroup[]>([])
 const loading = ref(false)
-const updatingKeyIds = ref(new Set<number>())
-const groupSelectorKeyId = ref<number | null>(null)
+const updatingKeyIds = ref(new Set<RuntimeID>())
+const groupSelectorKeyId = ref<RuntimeID | null>(null)
 const dropdownPosition = ref<{ top: number; left: number } | null>(null)
 const dropdownRef = ref<HTMLElement | null>(null)
 const scrollContainerRef = ref<HTMLElement | null>(null)
-const groupButtonRefs = ref<Map<number, HTMLElement>>(new Map())
+const groupButtonRefs = ref<Map<string, HTMLElement>>(new Map())
 
 const selectedKeyForGroup = computed(() => {
   if (groupSelectorKeyId.value === null) return null
-  return apiKeys.value.find((k) => k.id === groupSelectorKeyId.value) || null
+  return apiKeys.value.find((k) => String(k.id) === String(groupSelectorKeyId.value)) || null
 })
 
-const setGroupButtonRef = (keyId: number, el: Element | ComponentPublicInstance | null) => {
+const sameID = (left: RuntimeID | null | undefined, right: RuntimeID | null | undefined) =>
+  left !== null && left !== undefined && right !== null && right !== undefined && String(left) === String(right)
+
+const selectableGroups = computed(() => {
+  if (!isCloudflareMode.value) return allGroups.value
+  return allGroups.value.filter((group) =>
+    group.status === 'active' && group.subscription_type === 'standard' && group.platform === 'openai'
+  )
+})
+
+const setGroupButtonRef = (keyId: RuntimeID, el: Element | ComponentPublicInstance | null) => {
+  const referenceID = String(keyId)
   if (el instanceof HTMLElement) {
-    groupButtonRefs.value.set(keyId, el)
+    groupButtonRefs.value.set(referenceID, el)
   } else {
-    groupButtonRefs.value.delete(keyId)
+    groupButtonRefs.value.delete(referenceID)
   }
 }
 
@@ -180,10 +195,10 @@ const DROPDOWN_HEIGHT = 272 // max-h-64 = 16rem = 256px + padding
 const DROPDOWN_GAP = 4
 
 const openGroupSelector = (key: ApiKey) => {
-  if (groupSelectorKeyId.value === key.id) {
+  if (String(groupSelectorKeyId.value) === String(key.id)) {
     closeGroupSelector()
   } else {
-    const buttonEl = groupButtonRefs.value.get(key.id)
+    const buttonEl = groupButtonRefs.value.get(String(key.id))
     if (buttonEl) {
       const rect = buttonEl.getBoundingClientRect()
       const spaceBelow = window.innerHeight - rect.bottom
@@ -202,15 +217,17 @@ const closeGroupSelector = () => {
   dropdownPosition.value = null
 }
 
-const changeGroup = async (key: ApiKey, newGroupId: number | null) => {
+const changeGroup = async (key: ApiKey, newGroupId: RuntimeID | null) => {
+  if (isCloudflareMode.value && newGroupId === null) return
   closeGroupSelector()
-  if (key.group_id === newGroupId || (!key.group_id && newGroupId === null)) return
+  if (newGroupId !== null && String(key.group_id) === String(newGroupId)) return
+  if (!key.group_id && newGroupId === null) return
 
   updatingKeyIds.value.add(key.id)
   try {
     const result = await adminAPI.apiKeys.updateApiKeyGroup(key.id, newGroupId)
     // Update local data
-    const idx = apiKeys.value.findIndex((k) => k.id === key.id)
+    const idx = apiKeys.value.findIndex((k) => String(k.id) === String(key.id))
     if (idx !== -1) {
       apiKeys.value[idx] = result.api_key
     }

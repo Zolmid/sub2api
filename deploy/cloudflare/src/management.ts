@@ -621,6 +621,7 @@ async function activeKeyReferences(env: Env, value: APIKey) {
   return !!user&&!!group&&user.status==="active"&&user.deleted_at===null&&group.status==="active"&&group.deleted_at===null&&(!group.is_exclusive&&!user.restrict_public_groups||user.allowed_group_ids.includes(group.id));
 }
 async function keyMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
+  if (route.endsWith("/rebind-group")) return rebindKeyGroup(env, route, body, operation);
   const create=route.endsWith("/create");const rotate=route.endsWith("/rotate");const revoke=route.endsWith("/revoke");const keys=create?["operation_id","id","user_id","group_id","name","status","raw_key","ip_whitelist","ip_blacklist","expires_at"]:rotate?["operation_id","id","raw_key"]:revoke?["operation_id","id","expected_user_id"]:["operation_id","id","name","status","ip_whitelist","ip_blacklist","expires_at"];
   if(!only(body,keys)||!id(body.id)||(body.expected_user_id!==undefined&&!id(body.expected_user_id)))return error("INVALID_REQUEST");const fingerprint=(create||rotate)?{...body,raw_key:"sha256:"+await sha256(String(body.raw_key))}:body;const prior=await lookupOperation(env,route,operation,fingerprint);if(prior)return prior.kind==="replay"?json(prior.response):error("CONFLICT",409);const old=await getKey(env,body.id);if(create&&old)return error("CONFLICT",409);if(!create&&!old)return error("NOT_FOUND",404);if(revoke&&body.expected_user_id!==undefined&&old!.user_id!==body.expected_user_id)return error("NOT_FOUND",404);if(old!==null&&old.deleted_at!==null){if(revoke)return replyNoopMutation(env,route,operation,fingerprint,{api_key:old});return error("CONFLICT",409);}if((create||rotate)&&(!isBoundedString(body.raw_key,128,16)||!/^[A-Za-z0-9_-]+$/.test(body.raw_key)))return error("INVALID_REQUEST");
   if(rotate){const rawKey=body.raw_key as string;const hash=await sha256(rawKey);const duplicate=await env.DB.prepare("SELECT id FROM api_keys WHERE key_hash=? AND id<>?").bind(hash,body.id).first();if(duplicate)return error("CONFLICT",409);const response={api_key:old!};const saved=await managedOperation(env,route,operation,{...body,raw_key:"sha256:"+hash},response,[env.DB.prepare("UPDATE api_keys SET key_hash=?,updated_at=? WHERE id=? AND deleted_at IS NULL").bind(hash,now(),body.id)]);return saved?json(saved.response):error("CONFLICT",409);}
@@ -630,6 +631,60 @@ async function keyMutation(env: Env, route: string, body: Record<string, unknown
   const white=stringArray(api_key.ip_whitelist);const black=stringArray(api_key.ip_blacklist);if(!id(api_key.user_id)||!id(api_key.group_id)||!isBoundedString(api_key.name,100)||!status(api_key.status)||!white||!black||expires===undefined||!(await activeKeyReferences(env,api_key)))return error("REFERENCE_REJECTED",409);api_key.ip_whitelist=white;api_key.ip_blacklist=black;
   if(create){const rawKey=body.raw_key as string;const hash=await sha256(rawKey);const duplicate=await env.DB.prepare("SELECT id FROM api_keys WHERE key_hash=?").bind(hash).first();if(duplicate)return error("CONFLICT",409);const response={api_key};const saved=await managedOperation(env,route,operation,{...body,raw_key:"sha256:"+hash},response,[env.DB.prepare("INSERT INTO api_keys(id,user_id,group_id,name,status,key_hash,ip_whitelist_json,ip_blacklist_json,expires_at,last_used_at,created_at,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(api_key.id,api_key.user_id,api_key.group_id,api_key.name,api_key.status,hash,sqlJSON(white),sqlJSON(black),api_key.expires_at,null,api_key.created_at,api_key.updated_at,api_key.deleted_at)]);return saved?json(saved.response):error("CONFLICT",409);}
   const statement=env.DB.prepare("UPDATE api_keys SET name=?,status=?,ip_whitelist_json=?,ip_blacklist_json=?,expires_at=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(api_key.name,api_key.status,sqlJSON(white),sqlJSON(black),api_key.expires_at,api_key.updated_at,api_key.deleted_at,api_key.id);return replyMutation(env,route,operation,body,{api_key},[statement]);
+}
+
+// This is intentionally distinct from the generic API-key patch. Rebinding an
+// exclusive group can grant a user access, so it owns its exact allowlist,
+// liveness checks, operation replay, and one D1 transaction.
+async function rebindKeyGroup(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
+  if (!only(body, ["operation_id", "id", "group_id"]) || !id(body.id) || !id(body.group_id)) return error("INVALID_REQUEST");
+  const fingerprint = body;
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) return prior.kind === "replay" ? json(prior.response) : error("CONFLICT", 409);
+
+  const api_key = await getKey(env, body.id);
+  if (!api_key || api_key.deleted_at !== null || api_key.status !== "active") return error("NOT_FOUND", 404);
+  const user = await getUser(env, api_key.user_id);
+  const group = await getGroup(env, body.group_id);
+  if (!user || user.deleted_at !== null || user.status !== "active" || !group || group.deleted_at !== null ||
+      group.status !== "active" || group.platform !== "openai" || group.subscription_type !== "standard") {
+    return error("REFERENCE_REJECTED", 409);
+  }
+  if (api_key.group_id === group.id) {
+    return replyNoopMutation(env, route, operation, fingerprint, {
+      api_key, group, auto_granted_group_access: false,
+    });
+  }
+
+  const grantsAccess = group.is_exclusive && !user.allowed_group_ids.includes(group.id);
+  const stamp = now();
+  const rebound: APIKey = { ...api_key, group_id: group.id, updated_at: stamp };
+  const response: Record<string, unknown> = {
+    api_key: rebound,
+    group,
+    auto_granted_group_access: grantsAccess,
+  };
+  if (grantsAccess) {
+    response.granted_group_id = group.id;
+    response.granted_group_name = group.name;
+  }
+  const keyUpdate = env.DB.prepare(
+    "UPDATE api_keys SET group_id=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND status='active' AND EXISTS(SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL AND status='active') AND EXISTS(SELECT 1 FROM groups WHERE id=? AND deleted_at IS NULL AND status='active' AND platform='openai' AND subscription_type='standard' AND is_exclusive=?)",
+  ).bind(group.id, stamp, api_key.id, api_key.user_id, group.id, group.is_exclusive ? 1 : 0);
+  const statements: D1PreparedStatement[] = [keyUpdate];
+  if (grantsAccess) {
+    statements.push(env.DB.prepare(
+      "UPDATE users SET allowed_group_ids_json=json_insert(allowed_group_ids_json, '$[#]', ?),updated_at=? WHERE id=? AND deleted_at IS NULL AND status='active' AND json_valid(allowed_group_ids_json) AND json_type(allowed_group_ids_json)='array' AND json_array_length(allowed_group_ids_json)<100 AND NOT EXISTS(SELECT 1 FROM json_each(users.allowed_group_ids_json) WHERE value=?) AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)",
+    ).bind(group.id, stamp, user.id, group.id, operation));
+    // managedOperation records the operation immediately after the primary key
+    // update. If this conditional user update touches no row, deliberately
+    // collide with that record so D1 rolls the whole sequential batch back.
+    // This asserts the non-primary row count without a schema change.
+    statements.push(env.DB.prepare(
+      "INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT operation_id,route,request_hash,response_json,created_at FROM management_operations WHERE operation_id=? AND changes()=0",
+    ).bind(operation));
+  }
+  return replyMutation(env, route, operation, fingerprint, response, statements);
 }
 
 async function accountMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {

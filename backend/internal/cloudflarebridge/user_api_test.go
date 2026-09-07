@@ -294,6 +294,46 @@ func (f *userAPIControlPlane) RevokeManagedAPIKey(_ context.Context, id int64, o
 	return nil
 }
 
+func (f *userAPIControlPlane) RebindManagedAPIKeyGroup(_ context.Context, keyID, groupID int64) (*ManagedAPIKeyGroupRebindResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := f.keys[keyID]
+	group := f.groups[groupID]
+	if key == nil || group == nil || f.deletedGroups[groupID] {
+		return nil, service.ErrAPIKeyNotFound
+	}
+	user := f.users[key.UserID]
+	if user == nil || user.DeletedAt != nil || user.Status != service.StatusActive || group.Status != service.StatusActive ||
+		group.Platform != service.PlatformOpenAI || group.SubscriptionType != service.SubscriptionTypeStandard {
+		return nil, service.ErrGroupNotAllowed
+	}
+	updated := *key
+	updated.GroupID = &groupID
+	updated.Group = group
+	updated.UpdatedAt = time.Now().UTC()
+	result := &ManagedAPIKeyGroupRebindResult{APIKey: &updated, Group: group}
+	if key.GroupID != nil && *key.GroupID == groupID {
+		return result, nil
+	}
+	if group.IsExclusive {
+		granted := true
+		for _, allowed := range user.AllowedGroups {
+			if allowed == groupID {
+				granted = false
+				break
+			}
+		}
+		if granted {
+			user.AllowedGroups = append(user.AllowedGroups, groupID)
+			result.AutoGrantedGroupAccess = true
+			result.GrantedGroupID = &groupID
+			result.GrantedGroupName = group.Name
+		}
+	}
+	f.keys[keyID] = &updated
+	return result, nil
+}
+
 func (f *userAPIControlPlane) ListManagedAPIKeysByOwner(_ context.Context, userID int64, params pagination.PaginationParams, filters service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -697,7 +737,7 @@ func TestCloudflareCurrentUserUsesJWTSubjectAndFailsClosed(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, invalid.Code, invalid.Body.String())
 }
 
-func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testing.T) {
+func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testing.T) {
 	control, password, userID, _ := newUserAPIControlPlane(t)
 	disabledGroupID := int64(9007199254741098)
 	control.mu.Lock()
@@ -762,7 +802,8 @@ func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(
 	duplicateBoolean := callJSON(t, handler, http.MethodGet, "/api/v1/admin/groups/all?include_inactive=true&include_inactive=false", adminToken, "")
 	require.Equal(t, http.StatusBadRequest, duplicateBoolean.Code, duplicateBoolean.Body.String())
 	mutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/users", adminToken, "{}")
-	require.Equal(t, http.StatusNotFound, mutation.Code, mutation.Body.String())
+	require.Equal(t, http.StatusBadRequest, mutation.Code, mutation.Body.String())
+	require.NotContains(t, mutation.Body.String(), "control plane")
 
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users", nil)
 	request.Header.Set("x-api-key", "some-admin-key")
@@ -828,6 +869,65 @@ func TestCloudflareAdminReadOnlyRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(
 	require.Equal(t, http.StatusNotFound, tombstone.Code, tombstone.Body.String())
 	accountMutation := callJSON(t, handler, http.MethodPost, "/api/v1/admin/accounts", adminToken, "{}")
 	require.Equal(t, http.StatusNotFound, accountMutation.Code, accountMutation.Body.String())
+}
+
+func TestCloudflareAdminAPIKeyGroupRebindRequiresAdminAndUsesStrictPublicContract(t *testing.T) {
+	control, password, userID, _ := newUserAPIControlPlane(t)
+	const targetGroupID int64 = 9007199254741197
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.groups[targetGroupID] = &service.Group{
+		ID: targetGroupID, Name: "exclusive", Platform: service.PlatformOpenAI, Status: service.StatusActive,
+		SubscriptionType: service.SubscriptionTypeStandard, IsExclusive: true, Hydrated: true,
+	}
+	control.mu.Unlock()
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+
+	path := "/api/v1/admin/api-keys/9007199254740995"
+	unauthenticated := callJSON(t, handler, http.MethodPut, path, "", `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusUnauthorized, unauthenticated.Code, unauthenticated.Body.String())
+	ordinary := callJSON(t, handler, http.MethodPut, path, loginToken(t, handler, "other@example.test", "other-password"), `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusForbidden, ordinary.Code, ordinary.Body.String())
+	adminToken := loginToken(t, handler, "user@example.test", password)
+
+	for _, body := range []string{`{}`, `{"group_id":null}`, `{"group_id":0}`, `{"group_id":-1}`, `{"group_id":"09007199254741197"}`, `{"group_id":"not-a-decimal"}`, `{"group_id":"9223372036854775808"}`, `{"group_id":9007199254740993}`, `{"group_id":9007199254741197,"group_id":9007199254741197}`, `{"group_id":9007199254741197} {}`, `{"group_id":9007199254741197,"reset_rate_limit_usage":true}`} {
+		recorded := callJSON(t, handler, http.MethodPut, path, adminToken, body)
+		require.Equal(t, http.StatusBadRequest, recorded.Code, body+": "+recorded.Body.String())
+	}
+
+	success := callJSON(t, handler, http.MethodPut, path, adminToken, `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusOK, success.Code, success.Body.String())
+	var payload struct {
+		Data struct {
+			APIKey struct {
+				ID      string `json:"id"`
+				GroupID string `json:"group_id"`
+			} `json:"api_key"`
+			AutoGranted bool   `json:"auto_granted_group_access"`
+			GrantedID   string `json:"granted_group_id"`
+			GrantedName string `json:"granted_group_name"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(success.Body.Bytes(), &payload))
+	require.Equal(t, "9007199254740995", payload.Data.APIKey.ID)
+	require.Equal(t, "9007199254741197", payload.Data.APIKey.GroupID)
+	require.True(t, payload.Data.AutoGranted)
+	require.Equal(t, "9007199254741197", payload.Data.GrantedID)
+	require.Equal(t, "exclusive", payload.Data.GrantedName)
+
+	replay := callJSON(t, handler, http.MethodPut, path, adminToken, `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusOK, replay.Code, replay.Body.String())
+	require.Contains(t, replay.Body.String(), `"auto_granted_group_access":false`)
+	notFound := callJSON(t, handler, http.MethodPut, "/api/v1/admin/api-keys/9007199254741999", adminToken, `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusNotFound, notFound.Code, notFound.Body.String())
+	require.NotContains(t, notFound.Body.String(), "control plane")
+	control.mu.Lock()
+	control.groups[targetGroupID].SubscriptionType = service.SubscriptionTypeSubscription
+	control.mu.Unlock()
+	rejected := callJSON(t, handler, http.MethodPut, path, adminToken, `{"group_id":"9007199254741197"}`)
+	require.Equal(t, http.StatusForbidden, rejected.Code, rejected.Body.String())
+	require.NotContains(t, rejected.Body.String(), "subscription")
 }
 
 func TestCloudflareAdminGroupMutationsRequireActiveAdminJWTAndUsePrivateControlPlane(t *testing.T) {

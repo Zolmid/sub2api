@@ -416,6 +416,74 @@ describe("Stage C private management control plane", () => {
     await env.DB.prepare("DROP TRIGGER account_update_ignored").run();
   });
 
+  it("rebinds only live standard OpenAI groups and atomically grants an exclusive group", async () => {
+    const scope = await createScope("rebind-" + id());
+    const exclusiveID = id();
+    const subscriptionID = id();
+    const rawKey = "RebindKey_" + id();
+    expect((await call("/v1/manage/groups/create", {
+      operation_id: "exclusive-group-" + exclusiveID, id: exclusiveID, name: "exclusive", platform: "openai",
+      status: "active", is_exclusive: true, subscription_type: "standard",
+    })).status).toBe(200);
+    expect((await call("/v1/manage/groups/create", {
+      operation_id: "unsupported-group-" + subscriptionID, id: subscriptionID, name: "unsupported", platform: "openai",
+      status: "active", is_exclusive: false, subscription_type: "standard",
+    })).status).toBe(200);
+    expect((await call("/v1/manage/api-keys/create", {
+      operation_id: "rebind-key-" + scope.keyID, id: scope.keyID, user_id: scope.userID, group_id: scope.groupID,
+      name: "key", status: "active", raw_key: rawKey, ip_whitelist: [], ip_blacklist: [], expires_at: null,
+    })).status).toBe(200);
+
+    // The public group route deliberately does not create unsupported groups,
+    // so seed these adversarial rows directly to exercise rebind validation.
+    await env.DB.prepare("UPDATE groups SET subscription_type='subscription' WHERE id=?").bind(subscriptionID).run();
+    const rejected = await call("/v1/manage/api-keys/rebind-group", { operation_id: "reject-subscription-" + scope.keyID, id: scope.keyID, group_id: subscriptionID });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({ error: { code: "REFERENCE_REJECTED" } });
+    await env.DB.prepare("UPDATE groups SET platform='anthropic',subscription_type='standard' WHERE id=?").bind(subscriptionID).run();
+    expect((await call("/v1/manage/api-keys/rebind-group", { operation_id: "reject-platform-" + scope.keyID, id: scope.keyID, group_id: subscriptionID })).status).toBe(409);
+    await env.DB.prepare("UPDATE groups SET platform='openai',status='disabled' WHERE id=?").bind(subscriptionID).run();
+    expect((await call("/v1/manage/api-keys/rebind-group", { operation_id: "reject-inactive-group-" + scope.keyID, id: scope.keyID, group_id: subscriptionID })).status).toBe(409);
+    await env.DB.prepare("UPDATE groups SET status='active',deleted_at=? WHERE id=?").bind(new Date().toISOString(), subscriptionID).run();
+    expect((await call("/v1/manage/api-keys/rebind-group", { operation_id: "reject-deleted-group-" + scope.keyID, id: scope.keyID, group_id: subscriptionID })).status).toBe(409);
+
+    const request = { operation_id: "grant-exclusive-" + scope.keyID, id: scope.keyID, group_id: exclusiveID };
+    await env.DB.prepare("UPDATE users SET status='disabled' WHERE id=?").bind(scope.userID).run();
+    expect((await call("/v1/manage/api-keys/rebind-group", request)).status).toBe(409);
+    await env.DB.prepare("UPDATE users SET status='active' WHERE id=?").bind(scope.userID).run();
+    const first = await call("/v1/manage/api-keys/rebind-group", request);
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      api_key: { id: scope.keyID, group_id: exclusiveID }, group: { id: exclusiveID, name: "exclusive" },
+      auto_granted_group_access: true, granted_group_id: exclusiveID, granted_group_name: "exclusive",
+    });
+    expect(await env.DB.prepare("SELECT allowed_group_ids_json FROM users WHERE id=?").bind(scope.userID).first("allowed_group_ids_json")).toBe(JSON.stringify([scope.groupID, exclusiveID]));
+    expect(await env.DB.prepare("SELECT group_id FROM api_keys WHERE id=?").bind(scope.keyID).first("group_id")).toBe(exclusiveID);
+    expect((await call("/v1/manage/api-keys/rebind-group", request)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(request.operation_id).first("count")).toBe(1);
+    expect((await call("/v1/manage/api-keys/rebind-group", { ...request, group_id: scope.groupID })).status).toBe(409);
+
+    const same = await call("/v1/manage/api-keys/rebind-group", { operation_id: "same-group-" + scope.keyID, id: scope.keyID, group_id: exclusiveID });
+    expect(same.status).toBe(200);
+    expect(await same.json()).toMatchObject({ api_key: { group_id: exclusiveID }, auto_granted_group_access: false });
+    await env.DB.prepare("UPDATE api_keys SET status='disabled' WHERE id=?").bind(scope.keyID).run();
+    expect((await call("/v1/manage/api-keys/rebind-group", { operation_id: "reject-inactive-key-" + scope.keyID, id: scope.keyID, group_id: scope.groupID })).status).toBe(404);
+    await env.DB.prepare("UPDATE api_keys SET status='active' WHERE id=?").bind(scope.keyID).run();
+
+    const secondExclusiveID = id();
+    expect((await call("/v1/manage/groups/create", {
+      operation_id: "exclusive-group-two-" + secondExclusiveID, id: secondExclusiveID, name: "exclusive-two", platform: "openai",
+      status: "active", is_exclusive: true, subscription_type: "standard",
+    })).status).toBe(200);
+    await env.DB.prepare("CREATE TRIGGER reject_exclusive_grant BEFORE UPDATE ON users WHEN OLD.id='" + scope.userID + "' BEGIN SELECT RAISE(IGNORE); END").run();
+    const failed = await call("/v1/manage/api-keys/rebind-group", { operation_id: "atomic-failure-" + scope.keyID, id: scope.keyID, group_id: secondExclusiveID });
+    expect(failed.status).toBe(409);
+    expect(await env.DB.prepare("SELECT group_id FROM api_keys WHERE id=?").bind(scope.keyID).first("group_id")).toBe(exclusiveID);
+    expect(await env.DB.prepare("SELECT allowed_group_ids_json FROM users WHERE id=?").bind(scope.userID).first("allowed_group_ids_json")).toBe(JSON.stringify([scope.groupID, exclusiveID]));
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind("atomic-failure-" + scope.keyID).first("count")).toBe(0);
+    await env.DB.prepare("DROP TRIGGER reject_exclusive_grant").run();
+  });
+
   it("rejects malformed and unsupported role, platform, and subscription values", async () => {
     expect((await call("/v1/manage/users/list", { limit: 101 })).status).toBe(400);
     expect((await call("/v1/manage/users/create", { operation_id: "bad-role-" + id(), semantic_digest: "b".repeat(64), id: id(), email: "bad-role-" + id() + "@example.test", password_hash: "password-hash-123456789", username: "x", notes: "", status: "active", role: "operator", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false })).status).toBe(400);

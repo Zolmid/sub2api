@@ -220,3 +220,61 @@ func TestHTTPControlPlaneTreatsManagedTombstoneAsNotFound(t *testing.T) {
 	_, err = control.GetManagedAPIKey(context.Background(), 3001)
 	require.ErrorIs(t, err, service.ErrAPIKeyNotFound)
 }
+
+func TestHTTPControlPlaneRebindManagedAPIKeyGroupUsesDedicatedProtocol(t *testing.T) {
+	t.Parallel()
+	const timestamp = "2026-09-07T01:02:03Z"
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/manage/api-keys/rebind-group", r.URL.Path)
+		require.Equal(t, ProtocolVersion, r.Header.Get("X-Sub2API-Bridge-Version"))
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"api_key": map[string]any{
+				"id": captured["id"], "user_id": "9007199254740993", "group_id": captured["group_id"],
+				"name": "managed", "status": "active", "ip_whitelist": []string{}, "ip_blacklist": []string{},
+				"expires_at": nil, "last_used_at": nil, "created_at": timestamp, "updated_at": timestamp, "deleted_at": nil,
+			},
+			"group": map[string]any{
+				"id": captured["group_id"], "name": "exclusive", "platform": "openai", "status": "active",
+				"is_exclusive": true, "subscription_type": "standard", "created_at": timestamp, "updated_at": timestamp, "deleted_at": nil,
+			},
+			"auto_granted_group_access": true,
+			"granted_group_id":          captured["group_id"],
+			"granted_group_name":        "exclusive",
+		}))
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	result, err := control.RebindManagedAPIKeyGroup(context.Background(), 9007199254740995, 9007199254741197)
+	require.NoError(t, err)
+	require.Equal(t, "9007199254740995", captured["id"])
+	require.Equal(t, "9007199254741197", captured["group_id"])
+	require.NotEmpty(t, captured["operation_id"])
+	require.NotContains(t, captured, "reset_rate_limit_usage")
+	require.Equal(t, int64(9007199254740995), result.APIKey.ID)
+	require.Equal(t, int64(9007199254741197), result.Group.ID)
+	require.True(t, result.AutoGrantedGroupAccess)
+	require.Equal(t, int64(9007199254741197), *result.GrantedGroupID)
+	require.Equal(t, "exclusive", result.GrantedGroupName)
+}
+
+func TestHTTPControlPlaneRebindManagedAPIKeyGroupMapsErrorsWithoutLeakingBody(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/manage/api-keys/rebind-group", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"REFERENCE_REJECTED","message":"private subscription row detail"}}`))
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = control.RebindManagedAPIKeyGroup(context.Background(), 3001, 2001)
+	require.ErrorIs(t, err, service.ErrGroupNotAllowed)
+	require.NotContains(t, err.Error(), "private subscription row detail")
+}

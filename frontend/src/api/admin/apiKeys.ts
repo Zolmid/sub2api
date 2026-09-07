@@ -9,7 +9,7 @@ import type { ApiKey } from '@/types'
 export interface UpdateApiKeyGroupResult {
   api_key: ApiKey
   auto_granted_group_access: boolean
-  granted_group_id?: number
+  granted_group_id?: number | string
   granted_group_name?: string
 }
 
@@ -19,7 +19,7 @@ export interface UpdateApiKeyGroupResult {
  * @param groupId - Group ID (0 to unbind, positive to bind, null/undefined to skip)
  * @returns Updated API key with auto-grant info
  */
-export async function updateApiKeyGroup(id: number, groupId: number | null): Promise<UpdateApiKeyGroupResult> {
+export async function updateApiKeyGroup(id: number | string, groupId: number | string | null): Promise<UpdateApiKeyGroupResult> {
   const { data } = await apiClient.put<UpdateApiKeyGroupResult>(`/admin/api-keys/${id}`, {
     group_id: groupId === null ? 0 : groupId
   })

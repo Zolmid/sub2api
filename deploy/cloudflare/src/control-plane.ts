@@ -141,6 +141,7 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
       case "/v1/manage/api-keys/get":
       case "/v1/manage/api-keys/list":
       case "/v1/manage/api-keys/update":
+      case "/v1/manage/api-keys/rebind-group":
       case "/v1/manage/api-keys/revoke":
       case "/v1/manage/api-keys/rotate":
       case "/v1/manage/accounts/create":

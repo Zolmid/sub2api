@@ -104,6 +104,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	admin.DELETE("/groups/:id", adminAPIHandler.DeleteGroup)
 	admin.GET("/accounts", adminAPIHandler.ListAccounts)
 	admin.GET("/accounts/:id", adminAPIHandler.GetAccount)
+	admin.PUT("/api-keys/:id", adminAPIHandler.RebindAPIKeyGroup)
 
 	gateway := router.Group("/v1")
 	gateway.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))

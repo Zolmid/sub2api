@@ -23,6 +23,15 @@ type APIKeyManagementControlPlane interface {
 	RevokeManagedAPIKey(context.Context, int64, *int64) error
 }
 
+type managedAPIKeyGroupRebindResponse struct {
+	APIKey                 managedAPIKeyWire `json:"api_key"`
+	Group                  managedGroupWire  `json:"group"`
+	AutoGrantedGroupAccess bool              `json:"auto_granted_group_access"`
+	GrantedGroupID         *string           `json:"granted_group_id,omitempty"`
+	GrantedGroupName       string            `json:"granted_group_name,omitempty"`
+	RawKey                 string            `json:"raw_key,omitempty"`
+}
+
 type managedAPIKeyWire struct {
 	ID          string   `json:"id"`
 	UserID      string   `json:"user_id"`
@@ -289,4 +298,58 @@ func (c *HTTPControlPlane) RevokeManagedAPIKey(ctx context.Context, id int64, ex
 	return mapManagedAPIKeyError(err, conflict)
 }
 
+func (c *HTTPControlPlane) RebindManagedAPIKeyGroup(ctx context.Context, keyID, groupID int64) (*ManagedAPIKeyGroupRebindResult, error) {
+	request := struct {
+		OperationID string `json:"operation_id"`
+		ID          string `json:"id"`
+		GroupID     string `json:"group_id"`
+	}{
+		OperationID: managementOperationID("api-key-rebind-group"),
+		ID:          strconv.FormatInt(keyID, 10),
+		GroupID:     strconv.FormatInt(groupID, 10),
+	}
+	var response managedAPIKeyGroupRebindResponse
+	if err := c.postManagedMutation(ctx, "/v1/manage/api-keys/rebind-group", request, &response); err != nil {
+		return nil, mapManagedAPIKeyError(err, service.ErrGroupNotAllowed)
+	}
+	key, err := decodeManagedAPIKey(response.APIKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid api key group rebind response: %w", err)
+	}
+	group, deleted, err := decodeManagedGroup(response.Group)
+	if err != nil {
+		return nil, fmt.Errorf("invalid api key group rebind response: %w", err)
+	}
+	if response.RawKey != "" {
+		return nil, errors.New("invalid api key group rebind response: unexpected credential")
+	}
+	if deleted || key.Status != service.StatusAPIKeyActive || group.Status != service.StatusActive ||
+		group.Platform != service.PlatformOpenAI || group.SubscriptionType != service.SubscriptionTypeStandard {
+		return nil, errors.New("invalid api key group rebind response: invalid live reference")
+	}
+	if key.ID != keyID || key.GroupID == nil || *key.GroupID != groupID || group.ID != groupID {
+		return nil, errors.New("invalid api key group rebind response: identity mismatch")
+	}
+	result := &ManagedAPIKeyGroupRebindResult{
+		APIKey: key, Group: group, AutoGrantedGroupAccess: response.AutoGrantedGroupAccess,
+		GrantedGroupName: response.GrantedGroupName,
+	}
+	if response.GrantedGroupID != nil {
+		grantedID, err := parsePositiveID("granted group id", *response.GrantedGroupID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid api key group rebind response: %w", err)
+		}
+		result.GrantedGroupID = &grantedID
+	}
+	if result.AutoGrantedGroupAccess {
+		if !group.IsExclusive || result.GrantedGroupID == nil || *result.GrantedGroupID != groupID || result.GrantedGroupName != group.Name {
+			return nil, errors.New("invalid api key group rebind response: grant mismatch")
+		}
+	} else if result.GrantedGroupID != nil || result.GrantedGroupName != "" {
+		return nil, errors.New("invalid api key group rebind response: unexpected grant")
+	}
+	return result, nil
+}
+
 var _ APIKeyManagementControlPlane = (*HTTPControlPlane)(nil)
+var _ AdminAPIKeyGroupRebindControlPlane = (*HTTPControlPlane)(nil)

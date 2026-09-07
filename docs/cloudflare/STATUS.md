@@ -25,7 +25,8 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   release, renew, runtime fail-closed settings, and cancellation semantics.
 - Added Cloudflare-mode login/current-user, user-owned API-key CRUD, available
   groups, offline first-admin bootstrap, admin read projections, admin group
-  mutations, and the bounded admin-user mutation slice described below.
+  mutations, the bounded admin-user mutation slice, and the bounded admin
+  API-key group-rebind slice described below.
 
 ## Stage B vertical slice: local gate complete
 
@@ -96,10 +97,37 @@ the embedded console document and nonce were checked over HTTP, but its
 JavaScript UI was not driven in a real browser. Remote Cloudflare verification,
 real-upstream verification, and production acceptance remain separate gates.
 
+## Stage C admin API-key group rebind: automated local gate passed
+
+- Cloudflare mode now implements the existing
+  `PUT /api/v1/admin/api-keys/:id` contract only for binding a live key owned by
+  an active user to a live, active, standard OpenAI group. The traditional
+  handler and the generic private API-key patch allowlist are unchanged.
+- The public request accepts exactly one positive `group_id`; unbind, reset,
+  quota/rate, unknown, duplicate, malformed, and unsafe numeric fields fail
+  closed. Decimal-string IDs preserve values above JavaScript's safe range.
+- Exclusive-group access is appended from the current D1 JSON array in the same
+  sequential batch as the key update. Conditional zero-row writes deliberately
+  fail the batch, so concurrent grants, liveness changes, the 100-group limit,
+  or an `is_exclusive` transition cannot leave only one side committed.
+- The embedded console detects Cloudflare mode from injected public settings,
+  hides unbind, and offers only active standard OpenAI groups. Traditional mode
+  retains its existing selector behavior.
+- Isolated automated evidence passed: Go 1.27 cloudflarebridge package tests;
+  workerd-backed Worker tests (8 files / 52 tests); the focused frontend
+  component suite (3 tests), typecheck, and lint; and a Wrangler 4.129.0
+  production-config dry-run that rebuilt the frontend, Go binary, distroless
+  image, and 160.75 KiB Worker bundle (35.29 KiB gzip).
+
+This increment has not yet been driven through the composed local HTTP server
+or a real browser. It is not remote Cloudflare, production, or real-upstream
+acceptance.
+
 ## Explicitly not complete
 
 This branch is not yet a full Sub2API Cloudflare migration. Remaining admin API
-key and account writes, user role/step-up operations, dedicated balance changes,
+key writes beyond standard-group rebind and all account writes, user
+role/step-up operations, dedicated balance changes,
 default subscriptions/default balance, complete repositories, subscriptions,
 pricing, reservation and authoritative monetary ledger, multi-account
 scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
@@ -133,8 +161,8 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    acceptance, and retain a dedicated concurrency probe for a group-reference
    change racing a user mutation. The composed API lifecycle itself now passes.
 2. Complete the remaining bounded stage C management surfaces: admin API-key
-   routes and API-key-account writes, with shared contract tests and no
-   PostgreSQL/Redis fallback.
+   writes beyond standard-group rebind and API-key-account writes, with shared
+   contract tests and no PostgreSQL/Redis fallback.
 3. Design role promotion/demotion and balance changes only with their required
    step-up, audit, reservation, and ledger semantics. Default subscription and
    default-balance behavior must also be made explicit.

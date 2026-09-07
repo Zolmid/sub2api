@@ -96,7 +96,7 @@ func preflightRow(overrides map[string]any) map[string]any {
 	row := map[string]any{
 		"metadata_rows": 1, "metadata_matches": 1, "stage_c_columns": 15,
 		"email_index_flags": 1,
-		"email_index_sql":   "CREATE UNIQUE INDEX users_email_live_idx ON users(email) WHERE email <> '' AND deleted_at IS NULL",
+		"email_index_sql":   "CREATE UNIQUE INDEX users_email_live_identity_idx ON users(lower(trim(email))) WHERE email <> '' AND deleted_at IS NULL",
 		"users_count":       0,
 	}
 	for key, value := range overrides {
@@ -409,7 +409,7 @@ func TestReadbackHashMismatchFailsWithoutHashOutput(t *testing.T) {
 }
 
 func TestGuardedInsertSQLExecutesExactlyOnceOnStageCSchema(t *testing.T) {
-	db := openBootstrapTestDB(t, "CREATE UNIQUE INDEX users_email_live_idx ON users(email) WHERE email <> '' AND deleted_at IS NULL;")
+	db := openBootstrapTestDB(t, "CREATE UNIQUE INDEX users_email_live_identity_idx ON users(lower(trim(email))) WHERE email <> '' AND deleted_at IS NULL;")
 	a := firstAdmin{
 		options:      options{id: "1", email: "admin@example.com", username: "admin"},
 		passwordHash: "$2a$10$01234567890123456789012345678901234567890123456789012",
@@ -435,7 +435,7 @@ func TestGuardedInsertSQLExecutesExactlyOnceOnStageCSchema(t *testing.T) {
 }
 
 func TestGuardedInsertSQLRejectsWrongPartialIndexShape(t *testing.T) {
-	db := openBootstrapTestDB(t, "CREATE UNIQUE INDEX users_email_live_idx ON users(email) WHERE deleted_at IS NULL;")
+	db := openBootstrapTestDB(t, "CREATE UNIQUE INDEX users_email_live_identity_idx ON users(email) WHERE email <> '' AND deleted_at IS NULL;")
 	a := firstAdmin{
 		options:      options{id: "1", email: "admin@example.com", username: "admin"},
 		passwordHash: "$2a$10$01234567890123456789012345678901234567890123456789012",

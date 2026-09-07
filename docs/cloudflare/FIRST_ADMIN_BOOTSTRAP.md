@@ -8,11 +8,12 @@ not add or enable an HTTP setup endpoint. Remote mode still connects to D1.
 It refuses to mutate unless D1 reports the `2026-09-06.v1` bridge metadata,
 the complete Stage C `users` shape (including `email`, `password_hash`,
 `username`, `notes`, `rpm_limit`, `updated_at`, and `deleted_at`), the partial
-unique `users_email_live_idx`, and zero rows in `users`. The insert repeats the
-empty-table/schema guards, so a preflight race cannot overwrite or reset an
-existing account. It creates one active `admin` with ID `1` unless `-id` is
-supplied. IDs and balances are decimal TEXT; IDs must be positive Go `int64`
-values and are intentionally never converted to JavaScript numbers.
+unique `users_email_live_identity_idx` over `lower(trim(email))`, and zero rows
+in `users`. The insert repeats the empty-table/schema guards, so a preflight
+race cannot overwrite or reset an existing account. It creates one active
+`admin` with ID `1` unless `-id` is supplied. IDs and balances are decimal
+TEXT; IDs must be positive Go `int64` values and are intentionally never
+converted to JavaScript numbers.
 
 The password has no default, must contain 20 through 72 bytes (bcrypt's input
 limit), and is read twice from a real TTY with echo disabled. The command
@@ -66,4 +67,6 @@ or failed readback is a failure. A command error after apply is reported as
 success. Inspect or restore from the verified backup before another operator
 action.
 
-No local or remote D1/Wrangler mutation was executed while adding this tool.
+The isolated local inspect/apply/readback path has passed against a fresh D1
+with migrations `0001` through `0004`. Only synthetic local credentials and
+`/private/tmp` state were used; no remote D1 or Cloudflare resource was mutated.

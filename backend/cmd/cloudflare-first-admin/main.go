@@ -26,7 +26,7 @@ const (
 	remoteAcknowledgement = "I_HAVE_EXPORTED_A_D1_BACKUP_AND_ACCEPT_REMOTE_FIRST_ADMIN_BOOTSTRAP"
 	localDatabaseName     = "sub2api-cloudflare-local"
 	remoteDatabaseName    = "sub2api-cloudflare"
-	stageCEmailIndexSQL   = "createuniqueindexusers_email_live_idxonusers(email)whereemail<>''anddeleted_atisnull"
+	stageCEmailIndexSQL   = "createuniqueindexusers_email_live_identity_idxonusers(lower(trim(email)))whereemail<>''anddeleted_atisnull"
 	minimumPasswordBytes  = 20
 	maximumPasswordBytes  = 72 // bcrypt rejects inputs longer than 72 bytes.
 )
@@ -340,7 +340,7 @@ func inspect(ctx context.Context, t target, deps dependencies) error {
 		return errors.New("preflight refused: required Stage C users columns/shape are incompatible")
 	}
 	if integer(row, "email_index_flags") != 1 || normalizeIndexSQL(stringField(row, "email_index_sql")) != stageCEmailIndexSQL {
-		return errors.New("preflight refused: users_email_live_idx shape is incompatible")
+		return errors.New("preflight refused: users_email_live_identity_idx shape is incompatible")
 	}
 	if integer(row, "users_count") != 0 {
 		return errors.New("preflight refused: users table is not empty")
@@ -360,8 +360,8 @@ SELECT
     (name IN ('concurrency','restrict_public_groups','rpm_limit') AND type='integer' AND nn=1 AND pk=0) OR
     (name='deleted_at' AND type='text' AND nn=0 AND pk=0)
   ) AS stage_c_columns,
-  (SELECT count(*) FROM pragma_index_list('users') WHERE name='users_email_live_idx' AND "unique"=1 AND partial=1) AS email_index_flags,
-  (SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_idx') AS email_index_sql,
+  (SELECT count(*) FROM pragma_index_list('users') WHERE name='users_email_live_identity_idx' AND "unique"=1 AND partial=1) AS email_index_flags,
+  (SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_identity_idx') AS email_index_sql,
   (SELECT count(*) FROM users) AS users_count`, sqlLiteral(bridgeSchemaVersion))
 }
 
@@ -377,8 +377,8 @@ WHERE NOT EXISTS (SELECT 1 FROM users)
     (name IN ('concurrency','restrict_public_groups','rpm_limit') AND lower(type)='integer' AND "notnull"=1 AND pk=0) OR
     (name='deleted_at' AND lower(type)='text' AND "notnull"=0 AND pk=0)
   )=15
-  AND EXISTS (SELECT 1 FROM pragma_index_list('users') WHERE name='users_email_live_idx' AND "unique"=1 AND partial=1)
-  AND replace(replace(replace(replace(lower((SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_idx')), ' ', ''), char(9), ''), char(10), ''), char(13), '')=%s
+  AND EXISTS (SELECT 1 FROM pragma_index_list('users') WHERE name='users_email_live_identity_idx' AND "unique"=1 AND partial=1)
+  AND replace(replace(replace(replace(lower((SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_identity_idx')), ' ', ''), char(9), ''), char(10), ''), char(13), '')=%s
 RETURNING id AS inserted_id`,
 		sqlLiteral(a.id()), sqlLiteral(a.createdAt), sqlLiteral(a.email()), sqlLiteral(a.passwordHash), sqlLiteral(a.username), sqlLiteral(a.notes), sqlLiteral(a.createdAt), sqlLiteral(bridgeSchemaVersion), sqlLiteral(stageCEmailIndexSQL))
 }

@@ -50,7 +50,7 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   same D1 data. The pending record is intentionally retained for the stage D
   reconciler rather than relabeled as known zero usage.
 
-## Stage C admin-user increment: automated local gate passed
+## Stage C admin-user increment: local composed API gate passed
 
 - The existing `POST`, `PUT`, and `DELETE /api/v1/admin/users` console contracts
   now route through the Cloudflare composition root to private Worker handlers
@@ -75,10 +75,26 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   typecheck, lint, full suite (254 files / 1865 tests), fresh/repeated D1
   migration and fixture import, embedded Go build, and production-config
   Wrangler dry-run (157.50 KiB Worker / 34.70 KiB gzip plus Container image).
+- The offline first-admin tool passed its real local preflight, guarded insert,
+  and exact readback against a fresh `0001` through `0004` D1 chain. Its schema
+  guard now follows the normalized `users_email_live_identity_idx` introduced
+  by `0004` instead of requiring the superseded index.
+- The post-migration local fixture now supplies non-empty `updated_at` values.
+  A real composed request had exposed that the previous legacy-column insert
+  produced an invalid group readback even though fixture import itself exited
+  successfully.
+- A fresh local `wrangler dev` composition passed an HTTP lifecycle through the
+  embedded Go Container and private Worker/D1 control plane: console HTML and
+  its CSP nonce matched, admin login succeeded, create replay returned the same
+  user, a changed payload and normalized duplicate email returned 409, a
+  password update supported a new login, a created API key reached the fixture
+  upstream, and deleting the user made login and that key return 401. D1
+  readback confirmed both user and key tombstones and no foreign-key failures.
 
-This is not yet a composed browser -> Go Container -> private Worker -> D1
-runtime acceptance for the new user-write flow. That local probe, remote
-Cloudflare verification, and production acceptance remain separate gates.
+This is a local composed **API** runtime result, not visual browser acceptance:
+the embedded console document and nonce were checked over HTTP, but its
+JavaScript UI was not driven in a real browser. Remote Cloudflare verification,
+real-upstream verification, and production acceptance remain separate gates.
 
 ## Explicitly not complete
 
@@ -113,9 +129,9 @@ product such as R2; they have not been silently removed or stored in D1/KV.
 
 ## Next executable acceptance sequence
 
-1. Run the new admin-user flow through a live local `wrangler dev` composition
-   and real embedded console, including ambiguous create retry, password update,
-   group-reference race, normalized-email conflict, and API-key tombstoning.
+1. Drive the embedded console in a real browser for visual/interaction
+   acceptance, and retain a dedicated concurrency probe for a group-reference
+   change racing a user mutation. The composed API lifecycle itself now passes.
 2. Complete the remaining bounded stage C management surfaces: admin API-key
    routes and API-key-account writes, with shared contract tests and no
    PostgreSQL/Redis fallback.

@@ -838,7 +838,7 @@ func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testi
 
 	// lite and include_scheduler_score are accepted UI defaults. The D1 slice
 	// does not fabricate the omitted expanded fields or a scheduler score.
-	accounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=1&lite=1&include_scheduler_score=0&sort_by=name&sort_order=asc", adminToken, "")
+	accounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=1&lite=1&include_scheduler_score=0&sort_by=name&sort_order=asc&timezone=Asia%2FShanghai", adminToken, "")
 	require.Equal(t, http.StatusOK, accounts.Code, accounts.Body.String())
 	var accountEnvelope map[string]any
 	require.NoError(t, json.Unmarshal(accounts.Body.Bytes(), &accountEnvelope))
@@ -880,6 +880,9 @@ func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testi
 	require.Equal(t, http.StatusBadRequest, unsupportedPrivacy.Code, unsupportedPrivacy.Body.String())
 	unsupportedAccountSort := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&sort_by=last_used_at", adminToken, "")
 	require.Equal(t, http.StatusBadRequest, unsupportedAccountSort.Code, unsupportedAccountSort.Body.String())
+	unsupportedQuery := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&legacy_probe=1", adminToken, "")
+	require.Equal(t, http.StatusBadRequest, unsupportedQuery.Code, unsupportedQuery.Body.String())
+	require.Contains(t, unsupportedQuery.Body.String(), "legacy_probe is not migrated")
 	duplicateFilter := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=1&lite=0", adminToken, "")
 	require.Equal(t, http.StatusBadRequest, duplicateFilter.Code, duplicateFilter.Body.String())
 	fullProjection := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts?lite=0", adminToken, "")

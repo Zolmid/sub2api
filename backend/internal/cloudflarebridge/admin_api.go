@@ -306,7 +306,7 @@ func cloudflareAdminAccountQueryOK(c *gin.Context) bool {
 	allowed := map[string]bool{
 		"page": true, "page_size": true, "platform": true, "type": true, "status": true,
 		"privacy_mode": true, "group": true, "search": true, "lite": true,
-		"include_scheduler_score": true, "sort_by": true, "sort_order": true,
+		"include_scheduler_score": true, "sort_by": true, "sort_order": true, "timezone": true,
 	}
 	for name, values := range c.Request.URL.Query() {
 		if allowed[name] {

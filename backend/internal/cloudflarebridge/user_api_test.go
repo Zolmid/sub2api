@@ -751,12 +751,37 @@ func TestCloudflareAdminRoutesRequireActiveAdminJWTAndPreserveUnsafeIDs(t *testi
 	require.Equal(t, http.StatusUnauthorized, unauthenticated.Code, unauthenticated.Body.String())
 	unauthenticatedAccounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts", "", "")
 	require.Equal(t, http.StatusUnauthorized, unauthenticatedAccounts.Code, unauthenticatedAccounts.Body.String())
+	unauthenticatedKeys := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users/9007199254740993/api-keys", "", "")
+	require.Equal(t, http.StatusUnauthorized, unauthenticatedKeys.Code, unauthenticatedKeys.Body.String())
 	ordinaryToken := loginToken(t, handler, "other@example.test", "other-password")
 	ordinary := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users", ordinaryToken, "")
 	require.Equal(t, http.StatusForbidden, ordinary.Code, ordinary.Body.String())
 	ordinaryAccounts := callJSON(t, handler, http.MethodGet, "/api/v1/admin/accounts", ordinaryToken, "")
 	require.Equal(t, http.StatusForbidden, ordinaryAccounts.Code, ordinaryAccounts.Body.String())
+	ordinaryKeys := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users/9007199254740993/api-keys", ordinaryToken, "")
+	require.Equal(t, http.StatusForbidden, ordinaryKeys.Code, ordinaryKeys.Body.String())
 	adminToken := loginToken(t, handler, "user@example.test", password)
+	adminKeys := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users/9007199254740993/api-keys", adminToken, "")
+	require.Equal(t, http.StatusOK, adminKeys.Code, adminKeys.Body.String())
+	require.NotContains(t, adminKeys.Body.String(), "raw_key")
+	var adminKeyEnvelope struct {
+		Data struct {
+			Items []struct {
+				ID    string `json:"id"`
+				User  string `json:"user_id"`
+				Key   string `json:"key"`
+				Group struct {
+					ID string `json:"id"`
+				} `json:"group"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(adminKeys.Body.Bytes(), &adminKeyEnvelope))
+	require.Len(t, adminKeyEnvelope.Data.Items, 1)
+	require.Equal(t, "9007199254740995", adminKeyEnvelope.Data.Items[0].ID)
+	require.Equal(t, "9007199254740993", adminKeyEnvelope.Data.Items[0].User)
+	require.Empty(t, adminKeyEnvelope.Data.Items[0].Key)
+	require.Equal(t, "9007199254741097", adminKeyEnvelope.Data.Items[0].Group.ID)
 
 	users := callJSON(t, handler, http.MethodGet, "/api/v1/admin/users?page=1&page_size=1&role=admin&include_subscriptions=true&sort_by=created_at&sort_order=desc", adminToken, "")
 	require.Equal(t, http.StatusOK, users.Code, users.Body.String())

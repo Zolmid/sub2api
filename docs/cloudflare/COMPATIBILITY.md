@@ -9,15 +9,16 @@ pass its listed acceptance test before it is treated as a replacement.
 ## Stage C management evidence overlay
 
 The branch now has a bounded D1-backed management surface in addition to the
-stage B gateway slice. These results are layer-level local evidence; they do not
-replace the pending composed browser/runtime, remote, or production gates.
+stage B gateway slice. The API-key rebind has a local composed-browser result;
+the other rows remain layer-level local evidence. None replaces the pending
+broad-console, remote, real-upstream, or production gates.
 
 | Feature slice | Implemented target | Local evidence | Status |
 | --- | --- | --- | --- |
 | Admin user create | Existing console API -> Cloudflare Go handler -> private Worker mutation -> D1 user and operation rows | Go HTTP/control-plane tests, workerd D1 tests, frontend retry tests, fresh migration, and full image build cover semantic replay across new IDs/bcrypt hashes, exact microUSD conversion, normalized email conflicts, group references, and private auth readback | Automated layers locally verified for ordinary `user` creation; admin creation, default balance/subscriptions, internationalized email, and a composed browser/runtime probe remain open |
 | Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role and balance changes deliberately fail closed |
 | Admin user delete | One D1 batch tombstones the non-admin user and every live owned API key | Workerd tests cover successful tombstoning, private-auth absence, operation replay, and a zero-row admin guard that leaves keys untouched | Automated layers locally verified for non-admin users; admins remain protected and subscription/ledger cleanup is not implied |
-| Admin API-key group rebind | Existing console route -> strict Cloudflare Go handler -> dedicated private Worker operation -> one D1 batch | Go and workerd tests cover admin auth, exact request/response protocol, large IDs, active owner/key/group guards, same-group replay, exclusive access append, concurrent-state guards, and zero-row rollback; frontend tests cover Cloudflare filtering and traditional behavior | Automated layers locally verified only for binding to active standard OpenAI groups; unbind, reset, quota/rate, subscription-group, and other admin key writes deliberately fail closed |
+| Admin API-key group rebind | Existing console owner-key list and rebind routes -> strict Cloudflare Go handlers -> private Worker reads/mutation -> D1 | Go and workerd tests cover admin auth, exact request/response protocol, large IDs, key non-disclosure, active owner/key/group guards, same-group replay, exclusive access append, concurrent-state guards, and zero-row rollback; frontend tests cover Cloudflare filtering and traditional behavior; real Chromium plus persisted D1 readback covers the local composed interaction | Locally composed-browser verified only for binding to active standard OpenAI groups; unbind, reset, quota/rate, subscription-group, and other admin key writes deliberately fail closed |
 | Browser create retry | Administrator-scoped `Idempotency-Key`; full payload fingerprint in memory and non-secret retry state in session storage | Frontend tests cover ambiguous retry reuse, password-change conflict isolation, definitive 4xx clearing, administrator separation, and absence of password/email in stored state | Locally verified at API-helper level; real embedded-console retry behavior remains open |
 
 Migration `0004_user_live_email_identity.sql` replaces the prior live-email

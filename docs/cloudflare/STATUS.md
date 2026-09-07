@@ -92,12 +92,13 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   upstream, and deleting the user made login and that key return 401. D1
   readback confirmed both user and key tombstones and no foreign-key failures.
 
-This is a local composed **API** runtime result, not visual browser acceptance:
-the embedded console document and nonce were checked over HTTP, but its
-JavaScript UI was not driven in a real browser. Remote Cloudflare verification,
-real-upstream verification, and production acceptance remain separate gates.
+For the admin-user lifecycle above, this is a local composed **API** runtime
+result, not visual browser acceptance: the embedded console document and nonce
+were checked over HTTP, but that create/update/delete sequence was not driven in
+a real browser. Remote Cloudflare verification, real-upstream verification, and
+production acceptance remain separate gates.
 
-## Stage C admin API-key group rebind: automated local gate passed
+## Stage C admin API-key group rebind: local composed browser gate passed
 
 - Cloudflare mode now implements the existing
   `PUT /api/v1/admin/api-keys/:id` contract only for binding a live key owned by
@@ -106,6 +107,11 @@ real-upstream verification, and production acceptance remain separate gates.
 - The public request accepts exactly one positive `group_id`; unbind, reset,
   quota/rate, unknown, duplicate, malformed, and unsafe numeric fields fail
   closed. Decimal-string IDs preserve values above JavaScript's safe range.
+- The modal read path now has a strict owner-scoped
+  `GET /api/v1/admin/users/:id/api-keys` bridge. It caps pages at the private D1
+  contract's 100-row limit, enriches each key with its current group, clears raw
+  key material again at the public boundary, and accepts only pagination/sort
+  parameters plus the shared frontend client's ignored `timezone` parameter.
 - Exclusive-group access is appended from the current D1 JSON array in the same
   sequential batch as the key update. Conditional zero-row writes deliberately
   fail the batch, so concurrent grants, liveness changes, the 100-group limit,
@@ -117,11 +123,25 @@ real-upstream verification, and production acceptance remain separate gates.
   workerd-backed Worker tests (8 files / 52 tests); the focused frontend
   component suite (3 tests), typecheck, and lint; and a Wrangler 4.129.0
   production-config dry-run that rebuilt the frontend, Go binary, distroless
-  image, and 160.75 KiB Worker bundle (35.29 KiB gzip).
+  image, and 160.55 KiB Worker bundle (35.22 KiB gzip).
+- A before/after local composition first reproduced the previous candidate's
+  missing owner-key route as HTTP 404. Real Chromium then exposed and closed a
+  second integration gap: every GET receives the browser timezone, which the
+  strict new route initially rejected. The final route returned 200 in the
+  embedded console without weakening its actual filter allowlist.
+- In real Chromium, the key modal showed `fixture-group` as the initial group,
+  offered only the two active standard OpenAI groups, omitted both the disabled
+  group and unbind, and sent a successful rebind to
+  `exclusive-browser-target`. The UI displayed the automatic exclusive-access
+  grant notification; after a full reload it still showed the new group.
+  Wrangler logged the owner-key GET, group-list GET, and rebind PUT as 200.
+  Direct D1 readback found key `3001` on group `2002` and user `1001` with
+  exactly `["2001","2002"]` in its allowed-group array.
 
-This increment has not yet been driven through the composed local HTTP server
-or a real browser. It is not remote Cloudflare, production, or real-upstream
-acceptance.
+This is a bounded local browser/composition result. It is not remote
+Cloudflare, production, real-upstream, or broad console acceptance; unrelated
+console surfaces that are still outside the migration contract continue to
+fail closed.
 
 ## Explicitly not complete
 
@@ -157,9 +177,10 @@ product such as R2; they have not been silently removed or stored in D1/KV.
 
 ## Next executable acceptance sequence
 
-1. Drive the embedded console in a real browser for visual/interaction
-   acceptance, and retain a dedicated concurrency probe for a group-reference
-   change racing a user mutation. The composed API lifecycle itself now passes.
+1. Retain a dedicated concurrency probe for a group-reference change racing a
+   user mutation, and drive the remaining embedded-console flows—especially
+   ambiguous admin-user create retry—in a real browser. The bounded API-key
+   rebind browser flow and composed API lifecycle now pass separately.
 2. Complete the remaining bounded stage C management surfaces: admin API-key
    writes beyond standard-group rebind and API-key-account writes, with shared
    contract tests and no PostgreSQL/Redis fallback.

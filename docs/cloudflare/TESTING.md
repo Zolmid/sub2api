@@ -11,18 +11,19 @@ Verified date: 2026-09-07. Commands below are run from the locked checkout.
 | Scope | Command | Result |
 | --- | --- | --- |
 | Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, admin protection, field-level updates, and unrelated concurrent balance preservation. |
-| Admin API-key group rebind | `docker run --rm -v <clean-checkout>:/src -w /src/backend golang:1.27-alpine /usr/local/go/bin/go test -tags=unit ./internal/cloudflarebridge`; focused frontend Vitest; frontend typecheck and ESLint | Passed. Coverage includes admin auth, strict JSON, unsafe decimal IDs, the dedicated private route/body, response validation, error non-disclosure, Cloudflare-only selector filtering, traditional selector preservation, and large string-ID forwarding. |
+| Admin API-key group rebind | `docker run --rm -v <clean-checkout>:/src -w /src/backend golang:1.27-alpine /usr/local/go/bin/go test -tags=unit ./internal/cloudflarebridge`; focused frontend Vitest; frontend typecheck and ESLint | Passed. Coverage includes admin auth, strict JSON, unsafe decimal IDs, the dedicated private route/body, owner-scoped key listing with browser-timezone compatibility, response validation and key non-disclosure, Cloudflare-only selector filtering, traditional selector preservation, and large string-ID forwarding. |
 | Frontend API helper | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 254 test files / 1865 tests, typecheck, read-only lint, and production build. After the explicit null-narrowing cleanup, the 7 user API tests, typecheck, and lint were rerun and passed. The Cloudflare Docker build independently rebuilt the frontend with its pinned pnpm 9 toolchain. |
 | Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` with Wrangler 4.129.0 | Passed: generated types current, `tsc --noEmit`, and 8 test files / 52 tests. Rebind tests cover active/reference constraints, replay conflict, same-group no-op, monotonic exclusive grant, and rollback after a zero-row secondary write. Missing source files referenced by published Container package sourcemaps remain warning-only. |
 | D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0004` applied, the second run reported no pending migrations, and all 8 corrected fixture statements succeeded with non-empty management timestamps. Worker test setup no longer repairs empty fixture timestamps after import, so the 52-test suite enforces this invariant. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
 | Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
 | Local composed API runtime | Start Wrangler 4.129.0 with the fresh D1 state and local-only secrets, then drive the embedded console and admin/user/key HTTP lifecycle | Passed: console/CSP nonce 200, admin login 200, create/replay 200 with one ID, semantic conflict 409, update and updated-password login 200, normalized-email conflict 409, API-key create and fixture gateway request 200, delete 200, then deleted-user login/key 401 and admin read 404. D1 readback confirmed both tombstones and no foreign-key violations. |
+| Local embedded-browser rebind | Drive the embedded console in real Chromium against local Wrangler/Container/D1 state, then reload and query D1 directly | Passed after reproducing the former 404 and correcting the GET client's automatic `timezone` parameter. The modal showed the truthful current group, exposed only active standard OpenAI groups, hid disabled/unbind choices, completed GET/GET/PUT with 200, showed the exclusive-grant notification, and retained the new group after reload. D1 readback confirmed key `3001` -> group `2002` and one copy each of allowed groups `2001` and `2002`. |
 | Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
-| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the rebind increment: 160.75 KiB Worker upload / 35.29 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the owner-list/browser correction: 160.55 KiB Worker upload / 35.22 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
 
-The last row before the build checks is a real local HTTP composition, but it
-does not claim browser visual/JavaScript interaction or production acceptance.
-Remote Cloudflare and real-upstream gates remain unrun.
+The composed API row is an HTTP harness; the following bounded rebind row is a
+real Chromium interaction. Neither claims broad console, remote Cloudflare,
+real-upstream, or production acceptance.
 
 ## Baseline regression
 
@@ -87,7 +88,7 @@ pnpm exec wrangler d1 execute sub2api-cloudflare-local --local \
 
 Current result: frozen install passed the lockfile supply-chain policy;
 generated types were current; `tsc --noEmit` passed; Vitest passed 8 files / 52
-tests; and the production dry-run built a 160.75 KiB Worker bundle (35.29 KiB
+tests; and the production dry-run built a 160.55 KiB Worker bundle (35.22 KiB
 gzip) plus the distroless Container image. The package's published sourcemaps
 reference missing source files and produce warnings, but no test failure.
 
@@ -144,6 +145,30 @@ without printing them. It verified the following observable sequence:
 This proves the HTTP/Container/private-control-plane/D1 composition for the
 bounded flow. It does not prove real browser rendering/interaction, a remote
 Cloudflare deployment, production traffic, or a real upstream account.
+
+## Stage C local browser rebind gate
+
+The API-key rebind increment was separately exercised through the embedded
+JavaScript console in real Chromium. A pre-fix checkout reproduced
+`GET /api/v1/admin/users/1001/api-keys` as 404. Adding the owner-scoped list
+bridge made the direct HTTP response correct; the first browser attempt then
+returned 400 because the shared GET interceptor appends `timezone`. The final
+handler explicitly accepts and ignores that compatibility parameter while
+continuing to reject unsupported filters.
+
+The accepted browser sequence showed the original `fixture-group` badge,
+offered `fixture-group` and `exclusive-browser-target`, and omitted both an
+inactive group and the unbind choice. Selecting the exclusive group produced
+200 responses for the owner-key GET, all-groups GET, and key-rebind PUT, plus
+the expected automatic-access-grant notification. A full page reload showed
+`exclusive-browser-target` as the current group. Direct persisted-state
+readback returned key `3001` with `group_id=2002` and user `1001` with
+`allowed_group_ids_json=["2001","2002"]`.
+
+Console messages specific to this modal/rebind flow were absent after reload.
+The page still reports expected 404s for unrelated, not-yet-migrated console
+surfaces and third-party checkout scripts still fail CORS in this localhost
+environment; neither is counted as acceptance for those broader features.
 
 ## Local vertical-slice gate
 

@@ -4,7 +4,23 @@ This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.
 
-Verified date: 2026-09-06. Commands below are run from the locked checkout.
+Verified date: 2026-09-07. Commands below are run from the locked checkout.
+
+## Current stage C admin-user increment
+
+| Scope | Command | Result |
+| --- | --- | --- |
+| Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, admin protection, field-level updates, and unrelated concurrent balance preservation. |
+| Frontend API helper | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 254 test files / 1865 tests, typecheck, read-only lint, and production build. After the explicit null-narrowing cleanup, the 7 user API tests, typecheck, and lint were rerun and passed. The Cloudflare Docker build independently rebuilt the frontend with its pinned pnpm 9 toolchain. |
+| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` with Wrangler 4.129.0 | Passed: generated types current, `tsc --noEmit`, and 8 test files / 51 tests. Missing source files referenced by published Container package sourcemaps remain warning-only. |
+| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0004` applied, the second run reported no pending migrations, and all 8 fixture statements succeeded. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
+| Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0: 157.50 KiB Worker upload / 34.70 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+
+These are automated and build-layer checks. The new admin-user write path has
+not yet been exercised as one live browser -> embedded Go Container -> private
+Worker -> D1 flow, so it is not a local composed-runtime or production
+acceptance result.
 
 ## Baseline regression
 
@@ -67,11 +83,11 @@ pnpm exec wrangler d1 execute sub2api-cloudflare-local --local \
   --file fixtures/local.sql
 ```
 
-Actual result: frozen install passed the lockfile supply-chain policy; generated
-types were current; `tsc --noEmit` passed; Vitest passed 5 files / 27 tests; and
-the production dry-run built a 101.17 KiB Worker bundle (23.87 KiB gzip) plus the
-distroless Container image. The package's published sourcemaps reference missing
-source files and produce warnings, but no test failure.
+Current result: frozen install passed the lockfile supply-chain policy;
+generated types were current; `tsc --noEmit` passed; Vitest passed 8 files / 51
+tests; and the production dry-run built a 157.50 KiB Worker bundle (34.70 KiB
+gzip) plus the distroless Container image. The package's published sourcemaps
+reference missing source files and produce warnings, but no test failure.
 
 Required unit/integration assertions include:
 
@@ -88,6 +104,11 @@ Required unit/integration assertions include:
 - AES-GCM envelope authentication failure and wrong/missing key version;
 - external Worker-to-Container streaming without response buffering, plus
   controlled mock SSE with a pause longer than the initial lease period.
+- user-create semantic replay across regenerated IDs and bcrypt hashes without
+  persisting credential material in management operations;
+- normalized live-email uniqueness, post-delete email reuse, field-level user
+  patches, conditional group validation, admin role guards, and atomic owned-key
+  tombstoning on user deletion.
 
 Pure Vitest/miniflare evidence and a real local `wrangler dev` process are
 reported separately because mocked bindings cannot prove Container routing or

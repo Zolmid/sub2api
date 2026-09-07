@@ -6,6 +6,25 @@ This is a source audit, not a migration design or a statement that any
 Cloudflare service below is suitable. A **candidate/unverified** target must
 pass its listed acceptance test before it is treated as a replacement.
 
+## Stage C management evidence overlay
+
+The branch now has a bounded D1-backed management surface in addition to the
+stage B gateway slice. These results are layer-level local evidence; they do not
+replace the pending composed browser/runtime, remote, or production gates.
+
+| Feature slice | Implemented target | Local evidence | Status |
+| --- | --- | --- | --- |
+| Admin user create | Existing console API -> Cloudflare Go handler -> private Worker mutation -> D1 user and operation rows | Go HTTP/control-plane tests, workerd D1 tests, frontend retry tests, fresh migration, and full image build cover semantic replay across new IDs/bcrypt hashes, exact microUSD conversion, normalized email conflicts, group references, and private auth readback | Automated layers locally verified for ordinary `user` creation; admin creation, default balance/subscriptions, internationalized email, and a composed browser/runtime probe remain open |
+| Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role and balance changes deliberately fail closed |
+| Admin user delete | One D1 batch tombstones the non-admin user and every live owned API key | Workerd tests cover successful tombstoning, private-auth absence, operation replay, and a zero-row admin guard that leaves keys untouched | Automated layers locally verified for non-admin users; admins remain protected and subscription/ledger cleanup is not implied |
+| Browser create retry | Administrator-scoped `Idempotency-Key`; full payload fingerprint in memory and non-secret retry state in session storage | Frontend tests cover ambiguous retry reuse, password-change conflict isolation, definitive 4xx clearing, administrator separation, and absence of password/email in stored state | Locally verified at API-helper level; real embedded-console retry behavior remains open |
+
+Migration `0004_user_live_email_identity.sql` replaces the prior live-email
+index with a unique `lower(trim(email))` identity. Existing D1 data must be
+preflighted for duplicates before applying it; failure is intentional because
+the migration must not choose an identity owner. The current write contract
+admits ASCII email only, matching SQLite's built-in case folding used here.
+
 ## Stage B evidence overlay
 
 The detailed rows below describe the full baseline surface and therefore remain
@@ -15,7 +34,7 @@ these bounded parts:
 | Feature slice | Implemented target | Local evidence | Status |
 | --- | --- | --- | --- |
 | Cloudflare bootstrap | Separate pre-setup composition root; Worker routes to a distroless Go Container | Cloudflare mode starts and serves with no PostgreSQL/Redis; traditional full unit suite remains green | Locally verified for `/health` and Chat Completions slice only |
-| API-key auth | D1 hash lookup with user/key/group status and balance checks | Active fixture succeeds; disabled/unknown states and public bridge forgery are covered in workerd tests | Locally verified for gateway auth; management/invalidation writes remain open |
+| API-key auth | D1 hash lookup with user/key/group status and balance checks | Active fixture succeeds; disabled/unknown states, user-owned key CRUD, and public bridge forgery are covered in Go/workerd tests | Locally verified for gateway auth and user-owned key CRUD; admin key management and broader invalidation contracts remain open |
 | Account concurrency | Account-keyed SQLite DO with persisted fenced leases, lazy expiry, alarms, renew/release | 24 Worker tests plus two real local Containers competing at max concurrency 1; forced kill recovers to zero | Locally verified for account leases; user/key limits, cooldown and full scheduler remain open |
 | Model mapping cache | D1-authoritative alias with bounded KV cache | KV miss, stale value and KV failure all resolve against D1 in tests | Locally verified for one alias path only |
 | Completion/outbox/usage | D1 completion and outbox, Queue publication, idempotent usage projection and conflict audit | Ten duplicates, conflict and out-of-order cases in tests; real local Queue produces one usage row per completed request | Locally verified as a usage projection; authoritative reservation/ledger remains open |

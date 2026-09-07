@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -113,7 +114,7 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 		return nil, err
 	}
 	normalizedEmail := strings.ToLower(strings.TrimSpace(wire.Email))
-	if normalizedEmail == "" || len(wire.Email) > 255 || len(wire.Username) > 100 || len(wire.PasswordHash) < 20 || len(wire.PasswordHash) > 255 ||
+	if normalizedEmail == "" || len(wire.Email) > 255 || len(utf16.Encode([]rune(wire.Username))) > 100 || len(wire.PasswordHash) < 20 || len(wire.PasswordHash) > 255 ||
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.Role != service.RoleUser && wire.Role != service.RoleAdmin) ||
 		wire.Concurrency < 1 || wire.Concurrency > 100000 || wire.RPMLimit < 0 || wire.RPMLimit > 1000000 ||

@@ -15,7 +15,6 @@ const ID_MAX = 20;
 const PAGE_MAX = 100;
 const OPERATION_MAX = 128;
 const statuses = new Set(["active", "disabled"]);
-const roles = new Set(["user", "admin"]);
 const readablePrivacyModes = new Set(["training_off", "training_set_failed", "training_set_cf_blocked"]);
 
 type User = {
@@ -60,7 +59,7 @@ const date = (value: unknown): string | null | undefined => {
   return new Date(value).toISOString();
 };
 const email = (value: unknown) =>
-  isBoundedString(value, 255, 3) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  isBoundedString(value, 255, 3) && /^[\x21-\x7e]+$/.test(value) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 const cursorOK = (value: unknown): value is string =>
   isCanonicalUnsignedDecimal(value) && value.length <= ID_MAX;
 const sqlJSON = (value: unknown) => canonical(value);
@@ -150,7 +149,7 @@ async function getAccount(env: Env, value: string): Promise<Account | null> {
 async function groupsExist(env: Env, values: string[], active = false): Promise<boolean> {
   if (values.length === 0) return true;
   const marks = values.map(() => "?").join(",");
-  const row = await env.DB.prepare("SELECT count(*) count FROM groups WHERE id IN (" + marks + ")" + (active ? " AND status='active' AND deleted_at IS NULL" : "")).bind(...values).first<{ count: number }>();
+  const row = await env.DB.prepare("SELECT count(*) count FROM groups WHERE id IN (" + marks + ") AND deleted_at IS NULL" + (active ? " AND status='active'" : "")).bind(...values).first<{ count: number }>();
   return row?.count === values.length;
 }
 async function managedOperation(
@@ -284,37 +283,275 @@ async function mutate(env: Env, route: string, body: Record<string, unknown>): P
   return accountMutation(env,route,body,body.operation_id);
 }
 
+const userCreateKeys = [
+  "operation_id", "semantic_digest", "id", "email", "password_hash",
+  "username", "notes", "status", "role", "concurrency", "rpm_limit",
+  "balance_microusd", "allowed_group_ids", "restrict_public_groups",
+];
+const userUpdateKeys = [
+  "operation_id", "id", "email", "password_hash", "username", "notes",
+  "status", "concurrency", "rpm_limit", "allowed_group_ids",
+  "restrict_public_groups",
+];
+const userPatchKeys = userUpdateKeys.filter((key) => key !== "operation_id" && key !== "id");
+const liveGroupPredicate =
+  "NOT EXISTS (SELECT 1 FROM json_each(?) requested LEFT JOIN groups g ON g.id=requested.value WHERE g.id IS NULL OR g.deleted_at IS NOT NULL)";
+
+function validPasswordHash(value: unknown): value is string {
+  return isBoundedString(value, 255, 20);
+}
+
+function validUserCreate(body: Record<string, unknown>, groups: string[] | null): boolean {
+  return email(body.email) &&
+    validPasswordHash(body.password_hash) &&
+    isBoundedString(body.semantic_digest, 64, 64) &&
+    /^[0-9a-f]{64}$/.test(body.semantic_digest) &&
+    isBoundedString(body.username, 100, 0) &&
+    isBoundedString(body.notes, 4096, 0) &&
+    body.status === "active" && body.role === "user" &&
+    Number.isInteger(body.concurrency) && Number(body.concurrency) >= 1 && Number(body.concurrency) <= 100000 &&
+    Number.isInteger(body.rpm_limit) && Number(body.rpm_limit) >= 0 && Number(body.rpm_limit) <= 1000000 &&
+    isCanonicalUnsignedDecimal(body.balance_microusd) && body.balance_microusd.length <= 40 &&
+    groups !== null && typeof body.restrict_public_groups === "boolean";
+}
+
+function validUserPatch(body: Record<string, unknown>, groups: string[] | null): boolean {
+  if (!userPatchKeys.some((key) => body[key] !== undefined)) return false;
+  if (body.email !== undefined && !email(body.email)) return false;
+  if (body.password_hash !== undefined && !validPasswordHash(body.password_hash)) return false;
+  if (body.username !== undefined && !isBoundedString(body.username, 100, 0)) return false;
+  if (body.notes !== undefined && !isBoundedString(body.notes, 4096, 0)) return false;
+  if (body.status !== undefined && !status(body.status)) return false;
+  if (body.concurrency !== undefined &&
+    (!Number.isInteger(body.concurrency) || Number(body.concurrency) < 1 || Number(body.concurrency) > 100000)) return false;
+  if (body.rpm_limit !== undefined &&
+    (!Number.isInteger(body.rpm_limit) || Number(body.rpm_limit) < 0 || Number(body.rpm_limit) > 1000000)) return false;
+  if (body.allowed_group_ids !== undefined && groups === null) return false;
+  return body.restrict_public_groups === undefined || typeof body.restrict_public_groups === "boolean";
+}
+
+async function liveEmailExists(env: Env, value: string, excludingID?: string): Promise<boolean> {
+  const query = excludingID === undefined
+    ? "SELECT id FROM users WHERE lower(trim(email))=lower(trim(?)) AND deleted_at IS NULL LIMIT 1"
+    : "SELECT id FROM users WHERE lower(trim(email))=lower(trim(?)) AND id<>? AND deleted_at IS NULL LIMIT 1";
+  const statement = env.DB.prepare(query);
+  const row = excludingID === undefined
+    ? await statement.bind(value).first<{ id: string }>()
+    : await statement.bind(value, excludingID).first<{ id: string }>();
+  return row !== null;
+}
+
 async function userMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
-  const create = route.endsWith("/create"); const remove = route.endsWith("/delete");
-  const keys = create ? ["operation_id","id","email","password_hash","username","notes","status","role","concurrency","rpm_limit","balance_microusd","allowed_group_ids","restrict_public_groups"] : remove ? ["operation_id","id"] : ["operation_id","id","email","password_hash","username","notes","status","role","concurrency","rpm_limit","balance_microusd","allowed_group_ids","restrict_public_groups"];
-  if (!only(body,keys) || !id(body.id)) return error("INVALID_REQUEST");
+  if (route.endsWith("/create")) return createUserMutation(env, route, body, operation);
+  if (route.endsWith("/delete")) return deleteUserMutation(env, route, body, operation);
+  return updateUserMutation(env, route, body, operation);
+}
+
+async function createUserMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  const groups = stringArray(body.allowed_group_ids, 100, true);
+  if (!only(body, userCreateKeys) || !id(body.id) || !validUserCreate(body, groups)) {
+    return error("INVALID_REQUEST");
+  }
+
+  const fingerprint = {
+    operation_id: operation,
+    semantic_digest: body.semantic_digest,
+    email: body.email,
+    username: body.username,
+    notes: body.notes,
+    status: body.status,
+    role: body.role,
+    concurrency: body.concurrency,
+    rpm_limit: body.rpm_limit,
+    balance_microusd: body.balance_microusd,
+    allowed_group_ids: groups,
+    restrict_public_groups: body.restrict_public_groups,
+  };
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    return prior.kind === "replay"
+      ? json({ ...prior.response, replayed: true })
+      : error("IDEMPOTENCY_CONFLICT", 409);
+  }
+  if (await getUser(env, body.id)) return error("CONFLICT", 409);
+  if (await liveEmailExists(env, body.email as string)) return error("EMAIL_EXISTS", 409);
+  if (!(await groupsExist(env, groups!))) return error("REFERENCE_REJECTED", 409);
+
+  const stamp = now();
+  const user: User = {
+    id: body.id,
+    email: body.email as string,
+    username: body.username as string,
+    notes: body.notes as string,
+    status: "active",
+    role: "user",
+    concurrency: body.concurrency as number,
+    rpm_limit: body.rpm_limit as number,
+    balance_microusd: body.balance_microusd as string,
+    allowed_group_ids: groups!,
+    restrict_public_groups: body.restrict_public_groups as boolean,
+    created_at: stamp,
+    updated_at: stamp,
+    deleted_at: null,
+  };
+  const statement = env.DB.prepare(
+    "INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) " +
+    "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE " + liveGroupPredicate,
+  ).bind(
+    user.id, user.status, user.role, user.concurrency, user.balance_microusd,
+    sqlJSON(user.allowed_group_ids), user.restrict_public_groups ? 1 : 0,
+    user.created_at, user.email, body.password_hash, user.username, user.notes,
+    user.rpm_limit, user.updated_at, user.deleted_at, sqlJSON(user.allowed_group_ids),
+  );
+  const saved = await managedOperation(env, route, operation, fingerprint, { user }, [statement]);
+  if (saved) return json({ ...saved.response, replayed: saved.replay });
+
+  if (await liveEmailExists(env, user.email)) return error("EMAIL_EXISTS", 409);
+  if (!(await groupsExist(env, user.allowed_group_ids))) return error("REFERENCE_REJECTED", 409);
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") return json({ ...raced.response, replayed: true });
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
+}
+
+async function updateUserMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  const groupsProvided = body.allowed_group_ids !== undefined;
+  const groups = groupsProvided ? stringArray(body.allowed_group_ids, 100, true) : null;
+  if (!only(body, userUpdateKeys) || !id(body.id) || !validUserPatch(body, groups)) {
+    return error("INVALID_REQUEST");
+  }
   const fingerprint = body.password_hash === undefined
     ? body
-    : { ...body, password_hash: "sha256:" + await sha256(String(body.password_hash)) };
+    : { ...body, password_hash: "sha256:" + await sha256(body.password_hash as string) };
   const prior = await lookupOperation(env, route, operation, fingerprint);
-  if (prior) return prior.kind === "replay" ? json(prior.response) : error("CONFLICT", 409);
-  const old = await getUser(env,body.id);
-  if (create && old) return error("CONFLICT",409);
-  if (!create && !old) return error("NOT_FOUND",404);
-  if (old !== null && old.deleted_at !== null) {
-    if (remove) return replyNoopMutation(env, route, operation, fingerprint, { user: old });
-    return error("CONFLICT",409);
+  if (prior) {
+    return prior.kind === "replay" ? json(prior.response) : error("IDEMPOTENCY_CONFLICT", 409);
   }
+
+  const old = await getUser(env, body.id);
+  if (!old) return error("NOT_FOUND", 404);
+  if (old.deleted_at !== null) return error("CONFLICT", 409);
+  if (groupsProvided && !(await groupsExist(env, groups!))) return error("REFERENCE_REJECTED", 409);
+  if (body.email !== undefined && await liveEmailExists(env, body.email as string, old.id)) {
+    return error("EMAIL_EXISTS", 409);
+  }
+
   const stamp = now();
-  const user: User = remove ? { ...old!, status:"disabled", deleted_at:stamp, updated_at:stamp } : {
-    id:body.id, email:(body.email ?? old?.email) as string, username:(body.username ?? old?.username) as string, notes:(body.notes ?? old?.notes) as string,
-    status:(body.status ?? old?.status) as string, role:(body.role ?? old?.role) as string, concurrency:(body.concurrency ?? old?.concurrency) as number,
-    rpm_limit:(body.rpm_limit ?? old?.rpm_limit) as number, balance_microusd:(body.balance_microusd ?? old?.balance_microusd) as string,
-    allowed_group_ids:(body.allowed_group_ids ?? old?.allowed_group_ids) as string[], restrict_public_groups:(body.restrict_public_groups ?? old?.restrict_public_groups) as boolean,
-    created_at:old?.created_at ?? stamp, updated_at:stamp, deleted_at:old?.deleted_at ?? null,
+  const user: User = {
+    ...old,
+    email: (body.email ?? old.email) as string,
+    username: (body.username ?? old.username) as string,
+    notes: (body.notes ?? old.notes) as string,
+    status: (body.status ?? old.status) as string,
+    concurrency: (body.concurrency ?? old.concurrency) as number,
+    rpm_limit: (body.rpm_limit ?? old.rpm_limit) as number,
+    allowed_group_ids: groupsProvided ? groups! : old.allowed_group_ids,
+    restrict_public_groups: (body.restrict_public_groups ?? old.restrict_public_groups) as boolean,
+    updated_at: stamp,
   };
-  const groups = stringArray(user.allowed_group_ids,100,true);
-  const password = body.password_hash === undefined ? undefined : body.password_hash;
-  if (!email(user.email) || !isBoundedString(user.username,100,0) || !isBoundedString(user.notes,4096,0) || !status(user.status) || !roles.has(user.role) || !Number.isInteger(user.concurrency) || user.concurrency < 1 || user.concurrency > 100000 || !Number.isInteger(user.rpm_limit) || user.rpm_limit < 0 || user.rpm_limit > 1000000 || !isCanonicalUnsignedDecimal(user.balance_microusd) || user.balance_microusd.length > 40 || !groups || typeof user.restrict_public_groups !== "boolean" || (password !== undefined && !isBoundedString(password,255,20)) || (create && !isBoundedString(password,255,20)) || !(await groupsExist(env,groups))) return error("INVALID_REQUEST");
-  user.allowed_group_ids=groups;
-  const response={user};
-  const statement=create ? env.DB.prepare("INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(user.id,user.status,user.role,user.concurrency,user.balance_microusd,sqlJSON(groups),user.restrict_public_groups?1:0,user.created_at,user.email,password ?? "",user.username,user.notes,user.rpm_limit,user.updated_at,user.deleted_at) : env.DB.prepare("UPDATE users SET email=?,password_hash=COALESCE(?,password_hash),username=?,notes=?,status=?,role=?,concurrency=?,rpm_limit=?,balance_microusd=?,allowed_group_ids_json=?,restrict_public_groups=?,updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL").bind(user.email,password ?? null,user.username,user.notes,user.status,user.role,user.concurrency,user.rpm_limit,user.balance_microusd,sqlJSON(groups),user.restrict_public_groups?1:0,user.updated_at,user.deleted_at,user.id);
-  return replyMutation(env,route,operation,fingerprint,response,[statement]);
+  const statement = patchUserStatement(env, body, user, stamp, groupsProvided);
+  const saved = await managedOperation(env, route, operation, fingerprint, { user }, [statement]);
+  if (saved) return json(saved.response);
+
+  const current = await getUser(env, user.id);
+  if (!current) return error("NOT_FOUND", 404);
+  if (current.deleted_at !== null) return error("CONFLICT", 409);
+  if (current.role === "admin" && (body.status ?? current.status) === "disabled") {
+    return error("ROLE_PROTECTED", 409);
+  }
+  if (groupsProvided && !(await groupsExist(env, groups!))) return error("REFERENCE_REJECTED", 409);
+  if (body.email !== undefined && await liveEmailExists(env, body.email as string, current.id)) {
+    return error("EMAIL_EXISTS", 409);
+  }
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") return json(raced.response);
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
+}
+
+async function deleteUserMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  if (!only(body, ["operation_id", "id"]) || !id(body.id)) return error("INVALID_REQUEST");
+  const prior = await lookupOperation(env, route, operation, body);
+  if (prior) {
+    return prior.kind === "replay" ? json(prior.response) : error("IDEMPOTENCY_CONFLICT", 409);
+  }
+
+  const old = await getUser(env, body.id);
+  if (!old) return error("NOT_FOUND", 404);
+  if (old.deleted_at !== null) {
+    return replyNoopMutation(env, route, operation, body, { user: old });
+  }
+  if (old.role === "admin") return error("ROLE_PROTECTED", 409);
+
+  const stamp = now();
+  const user: User = { ...old, status: "disabled", updated_at: stamp, deleted_at: stamp };
+  const saved = await managedOperation(env, route, operation, body, { user }, [
+    env.DB.prepare(
+      "UPDATE users SET status='disabled',updated_at=?,deleted_at=? WHERE id=? AND deleted_at IS NULL AND role!='admin'",
+    ).bind(stamp, stamp, user.id),
+    env.DB.prepare(
+      "UPDATE api_keys SET key_hash=lower(hex(randomblob(32))),status='disabled',updated_at=?,deleted_at=? " +
+      "WHERE user_id=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)",
+    ).bind(stamp, stamp, user.id, operation),
+  ]);
+  if (saved) return json(saved.response);
+
+  const current = await getUser(env, user.id);
+  if (current?.role === "admin" && current.deleted_at === null) return error("ROLE_PROTECTED", 409);
+  const raced = await lookupOperation(env, route, operation, body);
+  if (raced?.kind === "replay") return json(raced.response);
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  return error("CONFLICT", 409);
+}
+
+function patchUserStatement(
+  env: Env,
+  body: Record<string, unknown>,
+  user: User,
+  stamp: string,
+  groupsProvided: boolean,
+): D1PreparedStatement {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  const set = (column: string, value: unknown) => {
+    sets.push(column + "=?");
+    values.push(value);
+  };
+  if (body.email !== undefined) set("email", user.email);
+  if (body.password_hash !== undefined) set("password_hash", body.password_hash);
+  if (body.username !== undefined) set("username", user.username);
+  if (body.notes !== undefined) set("notes", user.notes);
+  if (body.status !== undefined) set("status", user.status);
+  if (body.concurrency !== undefined) set("concurrency", user.concurrency);
+  if (body.rpm_limit !== undefined) set("rpm_limit", user.rpm_limit);
+  if (groupsProvided) set("allowed_group_ids_json", sqlJSON(user.allowed_group_ids));
+  if (body.restrict_public_groups !== undefined) {
+    set("restrict_public_groups", user.restrict_public_groups ? 1 : 0);
+  }
+  set("updated_at", stamp);
+
+  let where = "id=? AND deleted_at IS NULL AND NOT (role='admin' AND COALESCE(?,status)='disabled')";
+  values.push(user.id, body.status ?? null);
+  if (groupsProvided) {
+    where += " AND " + liveGroupPredicate;
+    values.push(sqlJSON(user.allowed_group_ids));
+  }
+  return env.DB.prepare("UPDATE users SET " + sets.join(",") + " WHERE " + where).bind(...values);
 }
 
 async function groupMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {

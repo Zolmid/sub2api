@@ -1,6 +1,6 @@
 # Cloudflare migration status
 
-Updated: 2026-09-06. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
+Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
 
 ## Completed and locally evidenced
 
@@ -23,6 +23,9 @@ Updated: 2026-09-06. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
 - Added unit coverage for auth, unknown keys, raw-key transport boundaries,
   protocol validation, response limits, account/lease validation, completion,
   release, renew, runtime fail-closed settings, and cancellation semantics.
+- Added Cloudflare-mode login/current-user, user-owned API-key CRUD, available
+  groups, offline first-admin bootstrap, admin read projections, admin group
+  mutations, and the bounded admin-user mutation slice described below.
 
 ## Stage B vertical slice: local gate complete
 
@@ -47,15 +50,52 @@ Updated: 2026-09-06. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   same D1 data. The pending record is intentionally retained for the stage D
   reconciler rather than relabeled as known zero usage.
 
+## Stage C admin-user increment: automated local gate passed
+
+- The existing `POST`, `PUT`, and `DELETE /api/v1/admin/users` console contracts
+  now route through the Cloudflare composition root to private Worker handlers
+  and D1. Traditional Ent/PostgreSQL wiring is unchanged.
+- Create requires a browser-supplied, administrator-scoped idempotency key.
+  Retries use an operation-salted Argon2id semantic token so a new candidate ID
+  and randomized bcrypt hash can safely replay the committed user without
+  persisting plaintext or a reusable password verifier in D1.
+- Management responses and operation records exclude password hashes and the
+  semantic token. The Go bridge separately reads the private authentication
+  projection before accepting a create or password update.
+- D1 enforces one live `lower(trim(email))` identity. Group references are
+  checked again inside the mutation statement, user updates write only fields
+  actually supplied, and deleting a non-admin user tombstones all live API keys
+  in the same D1 batch.
+- Cloudflare mode intentionally rejects admin creation, role changes, balance
+  updates, disabling/deleting admins, disabled-user creation, and concurrency
+  zero. Those operations need the missing step-up/ledger policy rather than an
+  undeclared downgrade.
+- Automated evidence passed in isolated layers: Go bridge tests and vet,
+  workerd-backed Worker tests (8 files / 51 tests), frontend production build,
+  typecheck, lint, full suite (254 files / 1865 tests), fresh/repeated D1
+  migration and fixture import, embedded Go build, and production-config
+  Wrangler dry-run (157.50 KiB Worker / 34.70 KiB gzip plus Container image).
+
+This is not yet a composed browser -> Go Container -> private Worker -> D1
+runtime acceptance for the new user-write flow. That local probe, remote
+Cloudflare verification, and production acceptance remain separate gates.
+
 ## Explicitly not complete
 
-This branch is not yet a full Sub2API Cloudflare migration. Management UI/API
-write paths, complete user/group/account repositories, subscriptions, pricing,
-reservation and authoritative monetary ledger, multi-account scheduling policy,
-OAuth refresh/rotation, rate limits/cooldowns beyond the first lease path,
-batch/images/files, imports/exports, backup/restore, reconciliation operations,
-performance/resource measurements, and production runbooks remain open matrix
-items. No undeclared fallback supplies them.
+This branch is not yet a full Sub2API Cloudflare migration. Remaining admin API
+key and account writes, user role/step-up operations, dedicated balance changes,
+default subscriptions/default balance, complete repositories, subscriptions,
+pricing, reservation and authoritative monetary ledger, multi-account
+scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
+first lease path, batch/images/files, imports/exports, backup/restore,
+reconciliation operations, performance/resource measurements, and production
+runbooks remain open matrix items. No undeclared fallback supplies them.
+
+Before applying migration `0004_user_live_email_identity.sql` to any existing
+D1 database, operators must identify and resolve duplicate live emails after
+ASCII case-folding and trimming. The unique index deliberately makes migration
+fail instead of choosing an account silently. Internationalized email addresses
+are not admitted by the current Cloudflare-mode write contract.
 
 The approved service set also lacks durable image/file object storage. Preserving
 those audited features requires an explicit decision to add an object-storage
@@ -73,13 +113,17 @@ product such as R2; they have not been silently removed or stored in D1/KV.
 
 ## Next executable acceptance sequence
 
-1. Begin stage C with one coherent D1-backed management surface: users, groups,
-   API keys, and API-key accounts, while retaining the existing HTTP contracts
-   and keeping traditional Ent/PostgreSQL providers unchanged.
-2. Add contract tests shared by the traditional and Cloudflare providers, then
-   reconnect the existing management UI to those routes in Cloudflare mode.
-3. Expand account selection and policy state only after those durable CRUD
-   contracts are stable. Reservation/ledger, OAuth, payment, and background-job
-   work remain stage D gates, not implied by CRUD success.
-4. Keep remote Cloudflare and real-upstream verification behind their separate
+1. Run the new admin-user flow through a live local `wrangler dev` composition
+   and real embedded console, including ambiguous create retry, password update,
+   group-reference race, normalized-email conflict, and API-key tombstoning.
+2. Complete the remaining bounded stage C management surfaces: admin API-key
+   routes and API-key-account writes, with shared contract tests and no
+   PostgreSQL/Redis fallback.
+3. Design role promotion/demotion and balance changes only with their required
+   step-up, audit, reservation, and ledger semantics. Default subscription and
+   default-balance behavior must also be made explicit.
+4. Expand account selection and policy state only after those durable CRUD
+   contracts are stable. OAuth, payment, and background-job work remain stage D
+   gates, not implied by CRUD success.
+5. Keep remote Cloudflare and real-upstream verification behind their separate
    authorization and disposable-resource requirements.

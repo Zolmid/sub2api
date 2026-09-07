@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -114,10 +115,15 @@ func (r *ManagedGroupReader) ListActive(ctx context.Context) ([]service.Group, e
 }
 
 type managedUserWire struct {
-	ID                   string   `json:"id"`
-	Email                string   `json:"email"`
-	Username             string   `json:"username"`
-	Notes                string   `json:"notes"`
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Username string `json:"username"`
+	Notes    string `json:"notes"`
+	// Credential fields are invalid on management responses. Keeping explicit
+	// decoders for them lets every read and mutation fail closed on leakage.
+	PasswordHash         string   `json:"password_hash,omitempty"`
+	Password             string   `json:"password,omitempty"`
+	SemanticDigest       string   `json:"semantic_digest,omitempty"`
 	Status               string   `json:"status"`
 	Role                 string   `json:"role"`
 	Concurrency          int      `json:"concurrency"`
@@ -201,7 +207,8 @@ func decodeManagedUser(wire managedUserWire) (*service.User, bool, error) {
 	if err != nil {
 		return nil, false, errors.New("invalid user deletion timestamp")
 	}
-	if strings.TrimSpace(wire.Email) == "" || len(wire.Email) > 255 || len(wire.Username) > 100 || len(wire.Notes) > 4096 ||
+	if strings.TrimSpace(wire.Email) == "" || len(wire.Email) > 255 || len(utf16.Encode([]rune(wire.Username))) > 100 || len(utf16.Encode([]rune(wire.Notes))) > 4096 ||
+		wire.PasswordHash != "" || wire.Password != "" || wire.SemanticDigest != "" ||
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.Role != service.RoleUser && wire.Role != service.RoleAdmin) ||
 		wire.Concurrency < 1 || wire.Concurrency > 100000 || wire.RPMLimit < 0 || wire.RPMLimit > 1000000 ||

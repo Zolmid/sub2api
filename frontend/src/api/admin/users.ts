@@ -6,6 +6,40 @@
 import { apiClient } from '../client'
 import type { AdminUser, UpdateUserRequest, PaginatedResponse, ApiKey } from '@/types'
 
+export interface AdminUserCreateRequest {
+  email: string
+  password: string
+  username?: string
+  notes?: string
+  role?: 'admin' | 'user'
+  balance?: number
+  concurrency?: number
+  rpm_limit?: number
+  allowed_groups?: number[] | null
+  restrict_public_groups?: boolean
+}
+
+interface PendingUserCreateOperation {
+  fullFingerprint: string
+  nonsecretFingerprint: string
+  idempotencyKey: string
+}
+
+interface StoredUserCreateOperation {
+  nonsecretFingerprint: string
+  idempotencyKey: string
+}
+
+interface UserCreateOperationScope {
+  adminID: string
+  storageKey: string
+  fullFingerprint: string
+  nonsecretFingerprint: string
+}
+
+const pendingUserCreateOperations = new Map<string, PendingUserCreateOperation>()
+let fallbackUserRequestSequence = 0
+
 export interface AdminBindAuthIdentityChannelRequest {
   channel: string
   channel_app_id: string
@@ -127,19 +161,170 @@ export async function getById(id: number, includeDeleted = false): Promise<Admin
  * @param userData - User data (email, password, etc.)
  * @returns Created user
  */
-export async function create(userData: {
-  email: string
-  password: string
-  username?: string
-  notes?: string
-  role?: 'admin' | 'user'
-  balance?: number
-  concurrency?: number
-  rpm_limit?: number
-  allowed_groups?: number[] | null
-}): Promise<AdminUser> {
-  const { data } = await apiClient.post<AdminUser>('/admin/users', userData)
-  return data
+export async function create(userData: AdminUserCreateRequest): Promise<AdminUser> {
+  const scope = await userCreateOperationScope(userData)
+  const inMemory = scope ? pendingUserCreateOperations.get(scope.storageKey) : null
+  const stored = scope ? getStoredUserCreateOperation(scope.storageKey) : null
+  let idempotencyKey: string | null = null
+  if (scope && inMemory && inMemory.fullFingerprint === scope.fullFingerprint) {
+    idempotencyKey = inMemory.idempotencyKey
+  } else if (scope && !inMemory && stored && stored.nonsecretFingerprint === scope.nonsecretFingerprint) {
+    idempotencyKey = stored.idempotencyKey
+  }
+  if (!idempotencyKey) {
+    idempotencyKey = `user-create-${scope?.adminID ?? 'unknown-admin'}-${newUserRequestID()}`
+  }
+  if (scope) {
+    pendingUserCreateOperations.set(scope.storageKey, {
+      fullFingerprint: scope.fullFingerprint,
+      nonsecretFingerprint: scope.nonsecretFingerprint,
+      idempotencyKey
+    })
+    storeUserCreateOperation(scope.storageKey, {
+      nonsecretFingerprint: scope.nonsecretFingerprint,
+      idempotencyKey
+    })
+  }
+
+  try {
+    const { data } = await apiClient.post<AdminUser>('/admin/users', userData, {
+      headers: { 'Idempotency-Key': idempotencyKey }
+    })
+    if (scope) clearUserCreateOperation(scope.storageKey, idempotencyKey)
+    return data
+  } catch (error) {
+    if (scope && isDefinitiveUserCreateFailure(error)) {
+      clearUserCreateOperation(scope.storageKey, idempotencyKey)
+    }
+    throw error
+  }
+}
+
+function currentAdminID(): string | null {
+  try {
+    const rawUser = globalThis.localStorage?.getItem('auth_user')
+    if (!rawUser) return null
+    const user: unknown = JSON.parse(rawUser)
+    if (typeof user !== 'object' || user === null) return null
+    const id = (user as { id?: unknown }).id
+    if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) return String(id)
+    if (
+      typeof id === 'string' &&
+      /^[1-9][0-9]*$/.test(id) &&
+      (id.length < 19 || (id.length === 19 && id <= '9223372036854775807'))
+    ) return id
+    return null
+  } catch {
+    return null
+  }
+}
+
+async function userCreateOperationScope(
+  userData: AdminUserCreateRequest
+): Promise<UserCreateOperationScope | null> {
+  const adminID = currentAdminID()
+  if (!adminID) return null
+  const nonsecret = Object.fromEntries(
+    Object.entries(userData).filter(([key]) => key !== 'password')
+  )
+  const [fullFingerprint, nonsecretFingerprint] = await Promise.all([
+    userPayloadFingerprint(userData),
+    userPayloadFingerprint(nonsecret)
+  ])
+  return {
+    adminID,
+    storageKey: `sub2api:admin:user-create:${adminID}`,
+    fullFingerprint,
+    nonsecretFingerprint
+  }
+}
+
+function canonicalUserPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalUserPayload)
+  if (typeof value !== 'object' || value === null) return value
+  const source = value as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+  for (const key of Object.keys(source).sort()) {
+    if (source[key] !== undefined) result[key] = canonicalUserPayload(source[key])
+  }
+  return result
+}
+
+async function userPayloadFingerprint(value: unknown): Promise<string> {
+  const encoded = new TextEncoder().encode(JSON.stringify(canonicalUserPayload(value)))
+  if (globalThis.crypto?.subtle) {
+    const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', encoded))
+    return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+
+  // Supported browsers provide Web Crypto. This non-cryptographic fallback is
+  // only an in-memory/session scoping aid for tests or legacy runtimes.
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (const byte of encoded) {
+    first = Math.imul(first ^ byte, 0x01000193)
+    second = Math.imul(second ^ byte, 0x85ebca6b)
+  }
+  return `${encoded.length.toString(16)}-${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`
+}
+
+function newUserRequestID(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  if (globalThis.crypto?.getRandomValues) {
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+  }
+  fallbackUserRequestSequence += 1
+  return `${Date.now().toString(36)}-${fallbackUserRequestSequence.toString(36)}`
+}
+
+function getStoredUserCreateOperation(storageKey: string): StoredUserCreateOperation | null {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(storageKey)
+    if (!raw) return null
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null) return null
+    const operation = value as Partial<StoredUserCreateOperation>
+    if (
+      typeof operation.nonsecretFingerprint !== 'string' ||
+      operation.nonsecretFingerprint.length < 1 || operation.nonsecretFingerprint.length > 128 ||
+      typeof operation.idempotencyKey !== 'string' || operation.idempotencyKey.length < 1 ||
+      operation.idempotencyKey.length > 128 || !/^[\x21-\x7E]+$/.test(operation.idempotencyKey)
+    ) return null
+    return {
+      nonsecretFingerprint: operation.nonsecretFingerprint,
+      idempotencyKey: operation.idempotencyKey
+    }
+  } catch {
+    return null
+  }
+}
+
+function storeUserCreateOperation(
+  storageKey: string,
+  operation: StoredUserCreateOperation | null
+): void {
+  try {
+    if (operation) globalThis.sessionStorage?.setItem(storageKey, JSON.stringify(operation))
+    else globalThis.sessionStorage?.removeItem(storageKey)
+  } catch {
+    // The in-memory retry guard remains active when browser storage is unavailable.
+  }
+}
+
+function clearUserCreateOperation(storageKey: string, idempotencyKey: string): void {
+  if (pendingUserCreateOperations.get(storageKey)?.idempotencyKey === idempotencyKey) {
+    pendingUserCreateOperations.delete(storageKey)
+  }
+  if (getStoredUserCreateOperation(storageKey)?.idempotencyKey === idempotencyKey) {
+    storeUserCreateOperation(storageKey, null)
+  }
+}
+
+function isDefinitiveUserCreateFailure(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const status = (error as { status?: unknown }).status
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408
 }
 
 /**

@@ -26,13 +26,36 @@ const call = (path: string, body: object, options?: Parameters<typeof request>[2
 async function createScope(tag: string) {
   const userID = id(); const groupID = id(); const keyID = id(); const accountID = id();
   const operation = tag + "-user-" + userID;
-  const userResponse = await call("/v1/manage/users/create", { operation_id: operation, id: userID, email: tag + "-" + userID + "@example.test", password_hash: "password-hash-for-" + tag, username: tag, notes: "", status: "active", role: "user", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false });
+  const userResponse = await call("/v1/manage/users/create", { operation_id: operation, semantic_digest: "a".repeat(64), id: userID, email: tag + "-" + userID + "@example.test", password_hash: "password-hash-for-" + tag, username: tag, notes: "", status: "active", role: "user", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false });
   if (userResponse.status !== 200) throw new Error(await userResponse.text());
   const groupResponse = await call("/v1/manage/groups/create", { operation_id: tag + "-group-" + groupID, id: groupID, name: tag, platform: "openai", status: "active", is_exclusive: false, subscription_type: "standard" });
   if (groupResponse.status !== 200) throw new Error(await groupResponse.text());
   expect((await call("/v1/manage/users/update", { operation_id: tag + "-groups-" + userID, id: userID, allowed_group_ids: [groupID] })).status).toBe(200);
   return { userID, groupID, keyID, accountID };
 }
+
+const userCreateBody = (
+  operationID: string,
+  userID: string,
+  email: string,
+  overrides: Record<string, unknown> = {},
+) => ({
+  operation_id: operationID,
+  semantic_digest: "c".repeat(64),
+  id: userID,
+  email,
+  password_hash: "bcrypt-compatible-test-hash-0001",
+  username: "managed-user",
+  notes: "",
+  status: "active",
+  role: "user",
+  concurrency: 1,
+  rpm_limit: 0,
+  balance_microusd: "0",
+  allowed_group_ids: [],
+  restrict_public_groups: false,
+  ...overrides,
+});
 
 describe("Stage C private management control plane", () => {
   it("backfills Stage B timestamps on the fresh migration chain", async () => {
@@ -167,6 +190,220 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/groups/create", { ...createRequest, operation_id: operationID + "-recreate", id: retryID })).status).toBe(200);
   });
 
+  it("replays user creates across disposable IDs and never persists credential material in operation rows", async () => {
+    const operationID = "browser-user-" + id();
+    const firstID = id();
+    const retryID = id();
+    const email = "browser-user-" + id() + "@example.test";
+    const firstHash = "bcrypt-compatible-test-hash-first";
+    const retryHash = "bcrypt-compatible-test-hash-retry";
+    const createRequest = userCreateBody(operationID, firstID, email, {
+      password_hash: firstHash,
+      semantic_digest: "d".repeat(64),
+      balance_microusd: "1000001",
+    });
+
+    const createdResponse = await call("/v1/manage/users/create", createRequest);
+    expect(createdResponse.status).toBe(200);
+    const createdText = await createdResponse.text();
+    expect(createdText).not.toContain(firstHash);
+    expect(createdText).not.toContain("semantic_digest");
+    expect(JSON.parse(createdText)).toMatchObject({ user: { id: firstID }, replayed: false });
+
+    const replayResponse = await call("/v1/manage/users/create", {
+      ...createRequest,
+      id: retryID,
+      password_hash: retryHash,
+    });
+    expect(replayResponse.status).toBe(200);
+    const replayText = await replayResponse.text();
+    expect(replayText).not.toContain(firstHash);
+    expect(replayText).not.toContain(retryHash);
+    expect(JSON.parse(replayText)).toMatchObject({ user: { id: firstID }, replayed: true });
+    expect(await env.DB.prepare("SELECT count(*) count FROM users WHERE id=?").bind(retryID).first("count")).toBe(0);
+
+    const operation = await env.DB.prepare(
+      "SELECT request_hash,response_json FROM management_operations WHERE operation_id=?",
+    ).bind(operationID).first<{ request_hash: string; response_json: string }>();
+    expect(operation?.request_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(operation?.response_json).not.toContain(firstHash);
+    expect(operation?.response_json).not.toContain(retryHash);
+    expect(operation?.response_json).not.toContain("semantic_digest");
+
+    const authRead = await call("/v1/private/auth-users/get", { id: firstID });
+    expect(authRead.status).toBe(200);
+    expect(await authRead.json()).toMatchObject({ user: { id: firstID, password_hash: firstHash } });
+
+    expect((await call("/v1/manage/users/create", {
+      ...createRequest,
+      id: retryID,
+      email: "changed-" + email,
+      password_hash: retryHash,
+    })).status).toBe(409);
+    const changedSecret = await call("/v1/manage/users/create", {
+      ...createRequest,
+      id: retryID,
+      password_hash: retryHash,
+      semantic_digest: "e".repeat(64),
+    });
+    expect(changedSecret.status).toBe(409);
+    expect(await changedSecret.json()).toMatchObject({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+  });
+
+  it("uses normalized live email identity and permits reuse only after the prior user is deleted", async () => {
+    const suffix = id();
+    const firstID = id();
+    const secondID = id();
+    const mixedCaseEmail = "Case-" + suffix + "@Example.Test";
+    expect((await call("/v1/manage/users/create", userCreateBody("email-first-" + suffix, firstID, mixedCaseEmail))).status).toBe(200);
+
+    const duplicate = await call(
+      "/v1/manage/users/create",
+      userCreateBody("email-duplicate-" + suffix, secondID, mixedCaseEmail.toLowerCase()),
+    );
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toMatchObject({ error: { code: "EMAIL_EXISTS" } });
+    expect(await env.DB.prepare("SELECT count(*) count FROM users WHERE id=?").bind(secondID).first("count")).toBe(0);
+
+    expect((await call("/v1/manage/users/delete", { operation_id: "email-delete-" + suffix, id: firstID })).status).toBe(200);
+    expect((await call(
+      "/v1/manage/users/create",
+      userCreateBody("email-reuse-" + suffix, secondID, mixedCaseEmail.toLowerCase()),
+    )).status).toBe(200);
+  });
+
+  it("patches only submitted user fields and validates group references only when supplied", async () => {
+    const scope = await createScope("user-patch-" + id());
+    const historicalGroup = id();
+    expect((await call("/v1/manage/groups/create", {
+      operation_id: "historical-group-" + historicalGroup,
+      id: historicalGroup,
+      name: "historical-" + historicalGroup,
+      platform: "openai",
+      status: "disabled",
+      is_exclusive: true,
+      subscription_type: "standard",
+    })).status).toBe(200);
+    expect((await call("/v1/manage/users/update", {
+      operation_id: "historical-assign-" + scope.userID,
+      id: scope.userID,
+      allowed_group_ids: [historicalGroup],
+    })).status).toBe(200);
+    await env.DB.prepare("UPDATE groups SET deleted_at=? WHERE id=?").bind(new Date().toISOString(), historicalGroup).run();
+    await env.DB.prepare("UPDATE users SET balance_microusd='7654321' WHERE id=?").bind(scope.userID).run();
+
+    const notesUpdate = await call("/v1/manage/users/update", {
+      operation_id: "notes-only-" + scope.userID,
+      id: scope.userID,
+      notes: "preserve unrelated state",
+    });
+    expect(notesUpdate.status).toBe(200);
+    const stored = await env.DB.prepare(
+      "SELECT notes,role,balance_microusd,allowed_group_ids_json FROM users WHERE id=?",
+    ).bind(scope.userID).first<{ notes: string; role: string; balance_microusd: string; allowed_group_ids_json: string }>();
+    expect(stored).toEqual({
+      notes: "preserve unrelated state",
+      role: "user",
+      balance_microusd: "7654321",
+      allowed_group_ids_json: JSON.stringify([historicalGroup]),
+    });
+
+    const referenced = await call("/v1/manage/users/update", {
+      operation_id: "historical-resubmit-" + scope.userID,
+      id: scope.userID,
+      allowed_group_ids: [historicalGroup],
+    });
+    expect(referenced.status).toBe(409);
+    expect(await referenced.json()).toMatchObject({ error: { code: "REFERENCE_REJECTED" } });
+    expect((await call("/v1/manage/users/update", {
+      operation_id: "role-write-" + scope.userID,
+      id: scope.userID,
+      role: "admin",
+    })).status).toBe(400);
+    expect((await call("/v1/manage/users/update", {
+      operation_id: "balance-write-" + scope.userID,
+      id: scope.userID,
+      balance_microusd: "1",
+    })).status).toBe(400);
+  });
+
+  it("atomically protects admins and tombstones every live key only after the user delete succeeds", async () => {
+    const scope = await createScope("user-delete-" + id());
+    const rawKey = "DeleteUserKey_" + id();
+    expect((await call("/v1/manage/api-keys/create", {
+      operation_id: "delete-user-key-" + scope.keyID,
+      id: scope.keyID,
+      user_id: scope.userID,
+      group_id: scope.groupID,
+      name: "delete with owner",
+      status: "active",
+      raw_key: rawKey,
+      ip_whitelist: [],
+      ip_blacklist: [],
+      expires_at: null,
+    })).status).toBe(200);
+    const beforeKey = await env.DB.prepare(
+      "SELECT key_hash,status,deleted_at FROM api_keys WHERE id=?",
+    ).bind(scope.keyID).first<{ key_hash: string; status: string; deleted_at: string | null }>();
+
+    await env.DB.prepare(
+      `CREATE TRIGGER user_delete_ignored_${scope.userID} BEFORE UPDATE ON users WHEN OLD.id='${scope.userID}' AND NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(IGNORE); END`,
+    ).run();
+    const ignoredOperation = "ignored-user-delete-" + scope.userID;
+    expect((await call("/v1/manage/users/delete", { operation_id: ignoredOperation, id: scope.userID })).status).toBe(409);
+    expect(await env.DB.prepare("SELECT deleted_at FROM users WHERE id=?").bind(scope.userID).first("deleted_at")).toBeNull();
+    expect(await env.DB.prepare("SELECT key_hash,status,deleted_at FROM api_keys WHERE id=?").bind(scope.keyID).first()).toEqual(beforeKey);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(ignoredOperation).first("count")).toBe(0);
+    await env.DB.prepare(`DROP TRIGGER user_delete_ignored_${scope.userID}`).run();
+
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(scope.userID).run();
+    const protectedResponse = await call("/v1/manage/users/delete", {
+      operation_id: "protected-user-delete-" + scope.userID,
+      id: scope.userID,
+    });
+    expect(protectedResponse.status).toBe(409);
+    expect(await protectedResponse.json()).toMatchObject({ error: { code: "ROLE_PROTECTED" } });
+    expect(await env.DB.prepare("SELECT key_hash FROM api_keys WHERE id=?").bind(scope.keyID).first("key_hash")).toBe(beforeKey?.key_hash);
+
+    const disabledAdmin = await call("/v1/manage/users/update", {
+      operation_id: "disable-admin-" + scope.userID,
+      id: scope.userID,
+      status: "disabled",
+    });
+    expect(disabledAdmin.status).toBe(409);
+    expect(await disabledAdmin.json()).toMatchObject({ error: { code: "ROLE_PROTECTED" } });
+    await env.DB.prepare("UPDATE users SET role='user' WHERE id=?").bind(scope.userID).run();
+
+    expect((await call("/v1/manage/users/delete", {
+      operation_id: "delete-user-success-" + scope.userID,
+      id: scope.userID,
+    })).status).toBe(200);
+    const afterKey = await env.DB.prepare(
+      "SELECT key_hash,status,deleted_at FROM api_keys WHERE id=?",
+    ).bind(scope.keyID).first<{ key_hash: string; status: string; deleted_at: string | null }>();
+    expect(afterKey?.key_hash).not.toBe(beforeKey?.key_hash);
+    expect(afterKey?.status).toBe("disabled");
+    expect(afterKey?.deleted_at).not.toBeNull();
+    expect((await call("/v1/private/auth-users/get", { id: scope.userID })).status).toBe(404);
+    expect((await call("/v1/auth/resolve", { key: rawKey })).status).toBe(404);
+  });
+
+  it("uses JavaScript UTF-16 length limits for managed user text", async () => {
+    const suffix = id();
+    expect((await call("/v1/manage/users/create", userCreateBody(
+      "unicode-user-valid-" + suffix,
+      id(),
+      "unicode-valid-" + suffix + "@example.test",
+      { username: "😀".repeat(50) },
+    ))).status).toBe(200);
+    expect((await call("/v1/manage/users/create", userCreateBody(
+      "unicode-user-invalid-" + suffix,
+      id(),
+      "unicode-invalid-" + suffix + "@example.test",
+      { username: "😀".repeat(51) },
+    ))).status).toBe(400);
+  });
+
   it("does not change account_groups or record success when the primary account update affects zero rows", async () => {
     const scope = await createScope("zero-primary");
     expect((await call("/v1/manage/accounts/create", { operation_id: "zero-primary-account", id: scope.accountID, name: "account", platform: "openai", status: "active", schedulable: true, priority: 2, max_concurrency: 1, credentials: { api_key: "zero-primary-upstream", base_url: "https://mock.upstream" }, extra: {}, group_ids: [scope.groupID] })).status).toBe(200);
@@ -181,7 +418,7 @@ describe("Stage C private management control plane", () => {
 
   it("rejects malformed and unsupported role, platform, and subscription values", async () => {
     expect((await call("/v1/manage/users/list", { limit: 101 })).status).toBe(400);
-    expect((await call("/v1/manage/users/create", { operation_id: "bad-role-" + id(), id: id(), email: "bad-role-" + id() + "@example.test", password_hash: "password-hash-123456789", username: "x", notes: "", status: "active", role: "operator", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false })).status).toBe(400);
+    expect((await call("/v1/manage/users/create", { operation_id: "bad-role-" + id(), semantic_digest: "b".repeat(64), id: id(), email: "bad-role-" + id() + "@example.test", password_hash: "password-hash-123456789", username: "x", notes: "", status: "active", role: "operator", concurrency: 1, rpm_limit: 0, balance_microusd: "1", allowed_group_ids: [], restrict_public_groups: false })).status).toBe(400);
     for (const [operation, platform, subscription] of [["bad-platform", "anthropic", "standard"], ["bad-subscription", "openai", "subscription"], ["bad-mode", "openai", "payg"]]) expect((await call("/v1/manage/groups/create", { operation_id: operation, id: id(), name: "x", platform, status: "active", is_exclusive: false, subscription_type: subscription })).status).toBe(400);
     expect((await call("/v1/manage/users/get", { id: "1001" }, { host: "public.example" })).status).toBe(404);
   });

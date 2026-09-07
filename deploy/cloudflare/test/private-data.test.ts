@@ -60,15 +60,18 @@ describe("private Container data protocol", () => {
     expect(managedListBody).not.toContain("test-only-cloudflare-jwt-secret-32-bytes");
   });
 
-  it("treats tombstones as absent and normalized-email ambiguity as unavailable", async () => {
+  it("treats tombstones as absent and enforces normalized live email identity", async () => {
     await insertUser("9007199254741001", "Gone@example.test", "disabled", stamp);
     expect((await call("/v1/private/auth-users/get", { email: "gone@example.test" })).status).toBe(404);
     expect((await call("/v1/private/auth-users/get", { id: "9007199254741001" })).status).toBe(404);
 
     await insertUser("9007199254741002", "Alias@Example.test");
-    await insertUser("9007199254741003", " alias@example.TEST ");
-    const ambiguous = await call("/v1/private/auth-users/get", { email: "ALIAS@example.test" });
-    expect(ambiguous.status).toBe(503);
+    await expect(insertUser("9007199254741003", " alias@example.TEST ")).rejects.toThrow(
+      /UNIQUE constraint failed/,
+    );
+    const normalized = await call("/v1/private/auth-users/get", { email: " ALIAS@example.test " });
+    expect(normalized.status).toBe(200);
+    expect(await normalized.json()).toMatchObject({ user: { id: "9007199254741002" } });
   });
 
   it("keeps owner lists isolated, excludes tombstones, and never stores raw keys", async () => {

@@ -179,9 +179,8 @@ fail closed.
 
 This branch is not yet a full Sub2API Cloudflare migration. Account writes
 outside the bounded OpenAI API-key CRUD contract, user role/step-up operations,
-dedicated balance changes,
 default subscriptions/default balance, complete repositories, subscriptions,
-pricing, reservation and authoritative monetary ledger, multi-account
+pricing, usage reservation and authoritative request settlement, multi-account
 scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
 first lease path, batch/images/files, imports/exports, backup/restore,
 reconciliation operations, performance/resource measurements, and production
@@ -219,9 +218,10 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    surface; do not invent administrator CRUD routes absent from the upstream
    public contract. Keep OAuth/import/test/refresh/batch/export account
    operations fail-closed until separately designed and tested.
-3. Design role promotion/demotion and balance changes only with their required
-   step-up, audit, reservation, and ledger semantics. Default subscription and
-   default-balance behavior must also be made explicit.
+3. Design role promotion/demotion with required TOTP step-up, immutable audit,
+   and atomic last-administrator protection. Extend the now-verified manual
+   balance ledger into request reservation/settlement separately. Default
+   subscription and default-balance behavior must also be made explicit.
 4. Expand account selection and policy state only after those durable CRUD
    contracts are stable. OAuth, payment, and background-job work remain stage D
    gates, not implied by CRUD success.
@@ -236,5 +236,21 @@ microusd deltas and an append-only D1 balance_ledger; the users balance
 projection, idempotency record, and ledger entry share one guarded D1 batch.
 Focused local workerd tests use an isolated directory containing only tracked
 migrations and cover exact arithmetic, replay/conflict, stale guard, bounds,
-deleted/administrator boundaries, and immutable rows. No browser, remote
-Worker/D1, real upstream, or production validation has occurred.
+deleted/administrator boundaries, exact history enums, and immutable rows. Go
+bridge tests also enforce UTF-16 reason limits and strict public/private history
+contracts.
+
+The local composed-browser gate ran through the embedded console at
+`1e9ca8f70`. Starting from 1.00, an administrator added 1.25 and refunded 0.25;
+the user list refreshed to 2.00 and the reopened history modal displayed the
+two rows newest-first, both notes, current balance 2.00, and total recharged
+1.25. Every balance POST and history GET returned 200. Direct D1 readback
+confirmed transitions 1.00 -> 2.25 -> 2.00, two operation rows, both immutable
+ledger triggers, and no foreign-key violations. The fixture user list also
+rendered successfully with corrected emails and usernames.
+
+At the same revision, the full Worker suite passed 61 tests, Worker typecheck,
+Go bridge tests/vet, the traditional service unit package, and a production
+configuration dry-run all passed. The dry-run built the frontend, Go Container,
+and distroless image and exited before deployment. Remote Worker/D1, real
+upstream, production, usage reservation, and request settlement remain open.

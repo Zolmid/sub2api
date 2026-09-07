@@ -9,16 +9,17 @@ pass its listed acceptance test before it is treated as a replacement.
 ## Stage C management evidence overlay
 
 The branch now has a bounded D1-backed management surface in addition to the
-stage B gateway slice. The API-key rebind and OpenAI API-key account CRUD have
-local composed-browser results; the other rows remain layer-level local
-evidence. None replaces the pending broad-console, remote, real-upstream, or
-production gates.
+stage B gateway slice. The API-key rebind, OpenAI API-key account CRUD, and
+administrator balance adjustment/history have local composed-browser results;
+the other rows remain layer-level local evidence. None replaces the pending
+broad-console, remote, real-upstream, or production gates.
 
 | Feature slice | Implemented target | Local evidence | Status |
 | --- | --- | --- | --- |
 | Admin user create | Existing console API -> Cloudflare Go handler -> private Worker mutation -> D1 user and operation rows | Go HTTP/control-plane tests, workerd D1 tests, frontend retry tests, fresh migration, and full image build cover semantic replay across new IDs/bcrypt hashes, exact microUSD conversion, normalized email conflicts, group references, and private auth readback | Automated layers locally verified for ordinary `user` creation; admin creation, default balance/subscriptions, internationalized email, and a composed browser/runtime probe remain open |
-| Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role and balance changes deliberately fail closed |
+| Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role changes deliberately fail closed and balance uses its dedicated audited endpoint |
 | Admin user delete | One D1 batch tombstones the non-admin user and every live owned API key | Workerd tests cover successful tombstoning, private-auth absence, operation replay, and a zero-row admin guard that leaves keys untouched | Automated layers locally verified for non-admin users; admins remain protected and subscription/ledger cleanup is not implied |
+| Admin balance adjustment/history | Existing console balance modal -> strict Cloudflare Go public API -> private Worker mutation/read -> guarded D1 balance projection, append-only ledger, and operation row | Go and workerd tests cover exact UTF-16/microusd boundaries, replay/conflict, stale and balance bounds, enum validation, immutable rows, and safe history projection; real Chromium covers add/refund, list refresh, modal history, ordering, notes, totals, and persisted D1 readback | Locally composed-browser verified for dedicated administrator add/subtract and immutable history; reservation, settlement, remote, and production equivalence remain open |
 | Admin API-key group rebind | Existing console owner-key list and rebind routes -> strict Cloudflare Go handlers -> private Worker reads/mutation -> D1 | Go and workerd tests cover admin auth, exact request/response protocol, large IDs, key non-disclosure, active owner/key/group guards, same-group replay, exclusive access append, concurrent-state guards, and zero-row rollback; frontend tests cover Cloudflare filtering and traditional behavior; real Chromium plus persisted D1 readback covers the local composed interaction | Locally composed-browser verified for the upstream admin contract's active standard OpenAI group rebind; unsupported unbind, reset, quota/rate, and subscription-group extensions continue to fail closed |
 | Admin account create | Existing console POST -> strict Cloudflare Go handler -> private Worker mutation -> D1 account, group-membership, and operation rows | Go route/bridge tests and workerd D1 tests cover admin auth, semantic replay across regenerated large candidate IDs, one ambiguous private 5xx retry with a stable operation ID, live compatible group references, complete safe readback, conflict mapping, and secret rejection; real Chromium covers the accepted modal and 200 create/list refresh without unsupported initialization probes | Locally composed-browser verified for OpenAI API-key accounts; ambiguous private-5xx retry remains automated, and remote/real-upstream acceptance is not claimed |
 | Admin account update | Existing console PUT -> strict field patch -> one D1 batch for the account and optional memberships | Workerd tests cover omitted-envelope preservation, AES-GCM replacement, invalid-reference rollback, and zero-row primary-update rollback; Go tests cover strict response validation and public non-disclosure; real Chromium covers omitted-key preservation, credential replacement, status/scheduling toggles, and safe responses | Locally composed-browser verified for the bounded fields only; OAuth, refresh, test, and other account options fail closed |
@@ -83,10 +84,17 @@ these bounded parts:
 
 # Administrator balance adjustment (Cloudflare mode)
 
-The existing POST /api/v1/admin/users/:id/balance public shape remains in
-Cloudflare mode. Its established administrator authentication and audit
-semantics remain at the Go public API; the private Worker receives only actor
-and target IDs, operation, exact microusd amount, reason, and idempotency
-operation ID. It does not receive credentials or TOTP material. Traditional
-mode remains on its original Go service/repository path. Browser, remote D1,
-real-upstream, and production equivalence are not claimed by this local lane.
+The existing POST /api/v1/admin/users/:id/balance and
+GET /api/v1/admin/users/:id/balance-history public shapes remain in Cloudflare
+mode. Their established administrator authentication and audit semantics stay
+at the Go public API; the private Worker receives only actor and target IDs,
+operation, exact microusd amount, reason, and idempotency operation ID. It does
+not receive credentials or TOTP material. Traditional mode remains on its
+original Go service/repository path.
+
+The local composed-browser gate added 1.25 and subtracted 0.25 from a 1.00
+fixture balance. The refreshed list showed 2.00, and the history modal showed
+the newest -0.25 row before +1.25, both notes, current balance 2.00, and total
+recharged 1.25. Persisted D1 readback matched both before/after transitions,
+the two idempotency rows, immutable-ledger triggers, and an empty foreign-key
+check. Remote D1, real-upstream, and production equivalence are not claimed.

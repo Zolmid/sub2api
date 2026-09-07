@@ -4,7 +4,7 @@ This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.
 
-Verified date: 2026-09-07. Commands below are run from the locked checkout.
+Verified date: 2026-09-08. Commands below are run from the locked checkout.
 
 ## Current stage C management increments
 
@@ -43,14 +43,15 @@ check passed. The package and both lockfiles therefore remain unchanged.
 | Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, admin protection, field-level updates, and unrelated concurrent balance preservation. |
 | Admin API-key group rebind | `docker run --rm -v <clean-checkout>:/src -w /src/backend golang:1.27-alpine /usr/local/go/bin/go test -tags=unit ./internal/cloudflarebridge`; focused frontend Vitest; frontend typecheck and ESLint | Passed. Coverage includes admin auth, strict JSON, unsafe decimal IDs, the dedicated private route/body, owner-scoped key listing with browser-timezone compatibility, response validation and key non-disclosure, Cloudflare-only selector filtering, traditional selector preservation, and large string-ID forwarding. |
 | Frontend API and Cloudflare account console | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 257 test files / 1884 tests, typecheck, read-only lint, and production build. The five focused account API/create/edit/filter/list files passed 106 tests. Cloudflare mode exposes only the implemented OpenAI API-key fields/actions while traditional requests and UI branches retain their existing behavior. |
-| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` with Wrangler 4.129.0 | Passed: generated types current, `tsc --noEmit`, and 8 test files / 55 tests. Rebind tests cover active/reference constraints, replay conflict, same-group no-op, monotonic exclusive grant, and rollback after a zero-row secondary write; account tests add semantic create replay, credential replacement/preservation, group-reference rollback, terminal tombstones, and UTF-16 name boundaries. Missing source files referenced by published Container package sourcemaps remain warning-only. |
-| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0004` applied, the second run reported no pending migrations, and all 8 corrected fixture statements succeeded with non-empty management timestamps. Worker test setup no longer repairs empty fixture timestamps after import, so the 55-test suite enforces this invariant. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
+| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` with Wrangler 4.129.0 | Passed through `1e9ca8f70`: generated types current, `tsc --noEmit`, and 8 test files / 61 tests. In addition to rebind/account coverage, balance cases enforce exact BigInt microusd arithmetic, replay/conflict, zero-row rollback, bounds, immutable rows, exact history types, and safe decimal-string projections. Missing source files referenced by published Container package sourcemaps remain warning-only. |
+| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0005` applied, the second run reported no pending migrations, and all 8 corrected fixture statements succeeded with non-empty management timestamps and valid fixture identities. Worker tests consume only tracked migrations. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
 | Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
 | Local composed API runtime | Start Wrangler 4.129.0 with the fresh D1 state and local-only secrets, then drive the embedded console and admin/user/key HTTP lifecycle | Passed: console/CSP nonce 200, admin login 200, create/replay 200 with one ID, semantic conflict 409, update and updated-password login 200, normalized-email conflict 409, API-key create and fixture gateway request 200, delete 200, then deleted-user login/key 401 and admin read 404. D1 readback confirmed both tombstones and no foreign-key violations. |
 | Local embedded-browser rebind | Drive the embedded console in real Chromium against local Wrangler/Container/D1 state, then reload and query D1 directly | Passed after reproducing the former 404 and correcting the GET client's automatic `timezone` parameter. The modal showed the truthful current group, exposed only active standard OpenAI groups, hid disabled/unbind choices, completed GET/GET/PUT with 200, showed the exclusive-grant notification, and retained the new group after reload. D1 readback confirmed key `3001` -> group `2002` and one copy each of allowed groups `2001` and `2002`. |
 | Local embedded-browser account CRUD | Drive the bounded account list/detail/create/edit/toggle/delete console in real Chromium at `507a64cf6`, inspect its fetch traffic, and query persisted D1 state | Passed. List and detail accepted the shared `timezone` parameter; create, omitted-key edit, credential replacement, status/scheduling toggles, and delete returned 200. The corrected create made no unsupported Antigravity mapping, TLS, quota, or Web Search request, and account responses disclosed no credential fields. D1 showed both exercised accounts disabled, unschedulable, tombstoned, AES-GCM-enveloped, and group-linked, with 2 create, 3 update, and 2 delete operation rows and no foreign-key violations. |
+| Local embedded-browser balance/history | Drive add and refund actions plus the history modal in real Chromium at `1e9ca8f70`, inspect fetch traffic, and query persisted D1 state | Passed. Fixture users rendered; starting balance 1.00 became 2.25 after +1.25 and 2.00 after -0.25. Both POSTs and both history GETs returned 200. Reopened history was newest-first with both notes, current balance 2.00, and total recharged 1.25. D1 matched both guarded transitions and two operation rows; immutable-ledger triggers existed and foreign-key check was empty. |
 | Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
-| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 at `507a64cf6`: 169.43 KiB Worker upload / 36.32 KiB gzip, frontend rebuild, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 at `1e9ca8f70`: 175.59 KiB Worker upload / 37.72 KiB gzip, frontend build, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
 
 The composed API row is an HTTP harness; the bounded rebind and account CRUD
 rows are real Chromium interactions. None claims broad console, remote
@@ -282,4 +283,18 @@ files only. The balance-ledger cases assert exact BigInt microusd arithmetic,
 idempotent replay and changed-request conflict, a zero-row guarded-update
 stale path that writes neither management_operations nor balance_ledger,
 overflow/underflow rejection, tombstone/admin boundaries, immutable-row
-trigger rejection, repeat migration, and an empty foreign_key_check.
+trigger rejection, exact history-type validation, repeat migration, and an
+empty foreign_key_check. Go tests add strict response parsing and UTF-16 reason
+boundaries; the full bridge test and vet commands pass under Go 1.27.
+
+The composed browser gate used fresh migrations `0001` through `0005`, a
+synthetic first administrator, and the corrected local fixture. Chromium
+observed 200 for the user list, both balance mutations, and both history reads.
+Persisted readback showed fixture user `1001` at 2,000,000 microusd after
+1,000,000 -> 2,250,000 -> 2,000,000 transitions, exactly two balance-operation
+rows, both immutable-ledger triggers, and no foreign-key violations. Secrets
+were local synthetic values and were not recorded in the evidence.
+
+The traditional service unit package passed at the same revision, and the
+production Wrangler configuration completed a full Container build dry-run.
+Neither result is a remote deployment or real-upstream acceptance claim.

@@ -63,15 +63,22 @@ describe("Stage C private management control plane", () => {
     const adminID = id();
     expect((await call("/v1/manage/users/create", userCreateBody("ledger-admin-" + adminID, adminID, "ledger-admin-" + adminID + "@example.test", { role: "user" }))).status).toBe(200);
     await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
-    const request = { operation_id: "ledger-op-" + scope.userID, actor_user_id: adminID, target_user_id: scope.userID, operation: "add", amount_microusd: "999999999999999999", reason: "manual" };
+    const request = { operation_id: "ledger-op-" + scope.userID, actor_user_id: adminID, target_user_id: scope.userID, operation: "add", amount_microusd: "999999", reason: "manual" };
     const first = await call("/v1/manage/users/balance-adjust", request); expect(first.status).toBe(200);
     const result = await first.json<{ balance: { balance_before_microusd: string; balance_after_microusd: string; delta_microusd: string }; replayed: boolean }>();
-    expect(result.balance).toMatchObject({ balance_before_microusd: "1", balance_after_microusd: "1000000000000000000", delta_microusd: "999999999999999999" }); expect(result.replayed).toBe(false);
-    expect((await call("/v1/manage/users/balance-adjust", request)).status).toBe(200);
+    expect(result.balance).toMatchObject({ balance_before_microusd: "1", balance_after_microusd: "1000000", delta_microusd: "999999" }); expect(result.replayed).toBe(false);
+    const replay = await call("/v1/manage/users/balance-adjust", request);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ replayed: true });
     expect((await call("/v1/manage/users/balance-adjust", { ...request, amount_microusd: "2" })).status).toBe(409);
-    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-negative-" + scope.userID, operation: "subtract", amount_microusd: "1000000000000000001" })).status).toBe(409);
-    const maximum = "9999999999999999999999999999999999999999";
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-negative-" + scope.userID, operation: "subtract", amount_microusd: "1000001" })).status).toBe(409);
+    const maximum = "9007199254740991";
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-maximum-" + scope.userID, operation: "set", amount_microusd: maximum })).status).toBe(200);
+    const unreadableOperation = "ledger-unreadable-" + scope.userID;
+    expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: unreadableOperation, operation: "set", amount_microusd: "9007199254740992" })).status).toBe(409);
+    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe(maximum);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(unreadableOperation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(unreadableOperation).first("count")).toBe(0);
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-overflow-" + scope.userID, operation: "add", amount_microusd: "1" })).status).toBe(409);
     const ledger = await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE target_user_id=?").bind(scope.userID).first("count"); expect(ledger).toBe(2);
     await expect(env.DB.prepare("UPDATE balance_ledger SET reason='rewritten' WHERE target_user_id=?").bind(scope.userID).run()).rejects.toThrow();
@@ -88,7 +95,7 @@ describe("Stage C private management control plane", () => {
     const operation = "ledger-stale-" + scope.userID;
     const stamp = new Date().toISOString();
     const results = await env.DB.batch([
-      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=?").bind("2", stamp, scope.userID, "999"),
+      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("2", stamp, scope.userID, "999", adminID),
       env.DB.prepare("INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT ?,?,?,?,? WHERE changes()=1").bind(operation, "/v1/manage/users/balance-adjust", "a".repeat(64), "{\"balance\":{}}", stamp),
       env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, adminID, scope.userID, "add", "stale", "1", "1", "2", stamp, operation),
     ]);
@@ -96,6 +103,65 @@ describe("Stage C private management control plane", () => {
     expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(operation).first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(operation).first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+  });
+  it("rejects noncanonical ledger decimals at the migration boundary", async () => {
+    const insertLedger = (
+      tag: string,
+      delta: string,
+      before: string,
+      after: string,
+      actor = "1",
+      target = "2",
+    ) => env.DB.prepare(
+      "INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+    ).bind(tag, tag, actor, target, "set", "migration constraint", delta, before, after, new Date().toISOString()).run();
+
+    const prefix = "ledger-canonical-" + id();
+    await expect(insertLedger(prefix + "-positive", "1", "0", "1")).resolves.toBeDefined();
+    await expect(insertLedger(prefix + "-negative", "-1", "1", "0")).resolves.toBeDefined();
+    await expect(insertLedger(prefix + "-zero", "0", "1", "1")).resolves.toBeDefined();
+    await expect(insertLedger(prefix + "-leading-delta", "01", "0", "1")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-suffix-delta", "12abc", "0", "1")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-negative-suffix", "-12abc", "12", "0")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-leading-before", "1", "01", "1")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-suffix-after", "1", "0", "1abc")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-leading-actor", "1", "0", "1", "01", "2")).rejects.toThrow();
+    await expect(insertLedger(prefix + "-suffix-target", "1", "0", "1", "1", "2abc")).rejects.toThrow();
+    expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE id LIKE ?").bind(prefix + "%").first("count")).toBe(3);
+  });
+  it("revalidates the actor in the guarded statement and resolves a demotion race as forbidden", async () => {
+    const scope = await createScope("ledger-actor-race-" + id());
+    const adminID = id();
+    expect((await call("/v1/manage/users/create", userCreateBody("ledger-actor-race-admin-" + adminID, adminID, "ledger-actor-race-admin-" + adminID + "@example.test"))).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+
+    await env.DB.prepare("UPDATE users SET role='user' WHERE id=?").bind(adminID).run();
+    const directOperation = "ledger-actor-guard-" + scope.userID;
+    const stamp = new Date().toISOString();
+    const guarded = await env.DB.batch([
+      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("2", stamp, scope.userID, "1", adminID),
+      env.DB.prepare("INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT ?,?,?,?,? WHERE changes()=1").bind(directOperation, "/v1/manage/users/balance-adjust", "b".repeat(64), "{\"balance\":{}}", stamp),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(directOperation, directOperation, adminID, scope.userID, "add", "actor guard", "1", "1", "2", stamp, directOperation),
+    ]);
+    expect(guarded[0].meta.changes).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(directOperation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(directOperation).first("count")).toBe(0);
+    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+    const trigger = "balance_actor_race_" + scope.userID;
+    const racedOperation = "ledger-actor-raced-" + scope.userID;
+    await env.DB.prepare(`CREATE TRIGGER ${trigger} BEFORE UPDATE OF balance_microusd ON users WHEN OLD.id='${scope.userID}' BEGIN UPDATE users SET role='user' WHERE id='${adminID}'; SELECT RAISE(IGNORE); END`).run();
+    try {
+      const raced = await call("/v1/manage/users/balance-adjust", { operation_id: racedOperation, actor_user_id: adminID, target_user_id: scope.userID, operation: "add", amount_microusd: "1", reason: "race" });
+      expect(raced.status).toBe(403);
+      expect(await raced.json()).toMatchObject({ error: { code: "ACTOR_FORBIDDEN" } });
+      expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(racedOperation).first("count")).toBe(0);
+      expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(racedOperation).first("count")).toBe(0);
+      expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+    } finally {
+      await env.DB.prepare(`DROP TRIGGER IF EXISTS ${trigger}`).run();
+    }
   });
   it("backfills Stage B timestamps on the fresh migration chain", async () => {
     await applyD1Migrations(env.DB, testEnv.TEST_MIGRATIONS);

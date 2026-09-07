@@ -80,6 +80,7 @@ these bounded parts:
 - “Business DO” in this document means a Durable Object whose identity follows a domain entity such as an API key, account, scheduling group, billable principal, or job. It owns correctness-critical serialization. “Container-lifecycle DO” means an object used only to create, locate, and route to a Go Container; it must not own those business locks, counters, or scheduler decisions.
 - Plugin process/socket behavior, full database dump/restore, and durable binary/archive retention are particularly unsuitable for the requested Worker/D1/DO/KV/Queues/Container product set. The source proves the dependency; adding a minimal product-set adjustment (for example R2) requires user authorization/architecture decision.
 - The route table establishes supported entrypoints, not end-to-end upstream compatibility. Streaming, WebSockets, request-body limits, provider OAuth redirect/callback behavior, and payment-provider callback IP/signature requirements remain probes.
+
 # Administrator balance adjustment (Cloudflare mode)
 
 The existing POST /api/v1/admin/users/:id/balance public shape remains in

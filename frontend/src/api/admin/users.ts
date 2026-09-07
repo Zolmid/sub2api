@@ -37,7 +37,18 @@ interface UserCreateOperationScope {
   nonsecretFingerprint: string
 }
 
+interface StoredUserBalanceOperation {
+  idempotencyKey: string
+}
+
+interface UserBalanceOperationScope {
+  adminID: string
+  storageKey: string
+  fingerprint: string
+}
+
 const pendingUserCreateOperations = new Map<string, PendingUserCreateOperation>()
+const pendingUserBalanceOperations = new Map<string, string>()
 let fallbackUserRequestSequence = 0
 
 export interface AdminBindAuthIdentityChannelRequest {
@@ -327,6 +338,74 @@ function isDefinitiveUserCreateFailure(error: unknown): boolean {
   return typeof status === 'number' && status >= 400 && status < 500 && status !== 408
 }
 
+async function userBalanceOperationScope(
+  targetUserID: number,
+  payload: { balance: number; operation: 'set' | 'add' | 'subtract'; notes: string }
+): Promise<UserBalanceOperationScope> {
+  const adminID = currentAdminID() ?? 'unknown-admin'
+  const fingerprint = await userPayloadFingerprint({
+    admin_id: adminID,
+    target_user_id: targetUserID,
+    ...payload,
+  })
+  return {
+    adminID,
+    fingerprint,
+    storageKey: `sub2api:admin:user-balance:${adminID}:${fingerprint}`,
+  }
+}
+
+function getStoredUserBalanceOperation(storageKey: string): StoredUserBalanceOperation | null {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(storageKey)
+    if (!raw) return null
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null) return null
+    const idempotencyKey = (value as Partial<StoredUserBalanceOperation>).idempotencyKey
+    if (
+      typeof idempotencyKey !== 'string' || idempotencyKey.length < 1 ||
+      idempotencyKey.length > 128 || !/^[\x21-\x7E]+$/.test(idempotencyKey)
+    ) return null
+    return { idempotencyKey }
+  } catch {
+    return null
+  }
+}
+
+function storeUserBalanceOperation(
+  storageKey: string,
+  operation: StoredUserBalanceOperation | null
+): void {
+  try {
+    if (operation) globalThis.sessionStorage?.setItem(storageKey, JSON.stringify(operation))
+    else globalThis.sessionStorage?.removeItem(storageKey)
+  } catch {
+    // The in-memory retry guard remains active when browser storage is unavailable.
+  }
+}
+
+function clearUserBalanceOperation(storageKey: string, idempotencyKey: string): void {
+  if (pendingUserBalanceOperations.get(storageKey) === idempotencyKey) {
+    pendingUserBalanceOperations.delete(storageKey)
+  }
+  if (getStoredUserBalanceOperation(storageKey)?.idempotencyKey === idempotencyKey) {
+    storeUserBalanceOperation(storageKey, null)
+  }
+}
+
+function balanceFailureStatus(error: unknown): number | null {
+  if (typeof error !== 'object' || error === null) return null
+  const direct = (error as { status?: unknown }).status
+  if (typeof direct === 'number') return direct
+  const response = (error as { response?: { status?: unknown } }).response
+  return typeof response?.status === 'number' ? response.status : null
+}
+
+function isDefinitiveUserBalanceFailure(error: unknown): boolean {
+  const status = balanceFailureStatus(error)
+  return status !== null && status >= 400 && status < 500 && status !== 408
+}
+
 /**
  * Update user
  * @param id - User ID
@@ -362,12 +441,32 @@ export async function updateBalance(
   operation: 'set' | 'add' | 'subtract' = 'set',
   notes?: string
 ): Promise<AdminUser> {
-  const { data } = await apiClient.post<AdminUser>(`/admin/users/${id}/balance`, {
+  const payload = {
     balance,
     operation,
     notes: notes || ''
-  })
-  return data
+  }
+  const scope = await userBalanceOperationScope(id, payload)
+  let idempotencyKey = pendingUserBalanceOperations.get(scope.storageKey) ??
+    getStoredUserBalanceOperation(scope.storageKey)?.idempotencyKey
+  if (!idempotencyKey) {
+    idempotencyKey = `user-balance-${scope.adminID}-${scope.fingerprint.slice(0, 16)}-${newUserRequestID()}`
+  }
+  pendingUserBalanceOperations.set(scope.storageKey, idempotencyKey)
+  storeUserBalanceOperation(scope.storageKey, { idempotencyKey })
+
+  try {
+    const { data } = await apiClient.post<AdminUser>(`/admin/users/${id}/balance`, payload, {
+      headers: { 'Idempotency-Key': idempotencyKey }
+    })
+    clearUserBalanceOperation(scope.storageKey, idempotencyKey)
+    return data
+  } catch (error) {
+    if (isDefinitiveUserBalanceFailure(error)) {
+      clearUserBalanceOperation(scope.storageKey, idempotencyKey)
+    }
+    throw error
+  }
 }
 
 /**

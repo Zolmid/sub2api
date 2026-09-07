@@ -227,6 +227,7 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    gates, not implied by CRUD success.
 5. Keep remote Cloudflare and real-upstream verification behind their separate
    authorization and disposable-resource requirements.
+
 # 2026-09-07 — D1 administrator balance-adjustment ledger (local verification)
 
 Cloudflare mode now routes the existing administrator balance endpoint through

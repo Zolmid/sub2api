@@ -14,6 +14,7 @@ import {
   batchUpdateLimits,
   bindUserAuthIdentity,
   create,
+  updateBalance,
   type AdminBindAuthIdentityRequest,
   type AdminBoundAuthIdentity,
   type BatchUpdateUserLimitsRequest,
@@ -243,5 +244,73 @@ describe('admin users create idempotency', () => {
     expect(firstKey).toMatch(/^user-create-7004-/)
     expect(idempotencyHeader(1)).toMatch(/^user-create-7005-/)
     expect(idempotencyHeader(1)).not.toBe(firstKey)
+  })
+})
+
+describe('admin users balance idempotency', () => {
+  beforeEach(() => {
+    post.mockReset()
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  it('reuses an administrator-and-payload-scoped key after ambiguous failures and clears it after success', async () => {
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8101, role: 'admin' }))
+    post.mockRejectedValueOnce({ status: 503, message: 'upstream unavailable' })
+    post.mockResolvedValueOnce({ data: { id: 71 } })
+    post.mockResolvedValueOnce({ data: { id: 71 } })
+
+    await expect(updateBalance(71, 1.25, 'add', 'manual credit')).rejects.toMatchObject({ status: 503 })
+    const firstKey = idempotencyHeader(0)
+    expect(firstKey).toMatch(/^user-balance-8101-[0-9a-f-]+-/)
+    expect(firstKey.length).toBeLessThanOrEqual(128)
+    expect(sessionStorage.length).toBe(1)
+
+    await updateBalance(71, 1.25, 'add', 'manual credit')
+    expect(idempotencyHeader(1)).toBe(firstKey)
+    expect(post.mock.calls[1]?.[1]).toEqual({
+      balance: 1.25,
+      operation: 'add',
+      notes: 'manual credit',
+    })
+    expect(sessionStorage.length).toBe(0)
+
+    await updateBalance(71, 1.25, 'add', 'manual credit')
+    expect(idempotencyHeader(2)).not.toBe(firstKey)
+  })
+
+  it('retains HTTP 408 but clears a definitive non-408 4xx outcome', async () => {
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8102, role: 'admin' }))
+    post.mockRejectedValueOnce({ response: { status: 408 } })
+    post.mockRejectedValueOnce({ status: 422 })
+    post.mockResolvedValueOnce({ data: { id: 72 } })
+
+    await expect(updateBalance(72, 2, 'subtract')).rejects.toMatchObject({ response: { status: 408 } })
+    const timedOutKey = idempotencyHeader(0)
+    await expect(updateBalance(72, 2, 'subtract')).rejects.toMatchObject({ status: 422 })
+    expect(idempotencyHeader(1)).toBe(timedOutKey)
+    expect(sessionStorage.length).toBe(0)
+
+    await updateBalance(72, 2, 'subtract')
+    expect(idempotencyHeader(2)).not.toBe(timedOutKey)
+  })
+
+  it('changes the key when target, operation, amount, notes, or administrator changes', async () => {
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8103, role: 'admin' }))
+    post.mockRejectedValue({ status: 500 })
+
+    await expect(updateBalance(73, 3, 'add', 'base')).rejects.toMatchObject({ status: 500 })
+    await expect(updateBalance(73, 3, 'add', 'base')).rejects.toMatchObject({ status: 500 })
+    await expect(updateBalance(74, 3, 'add', 'base')).rejects.toMatchObject({ status: 500 })
+    await expect(updateBalance(73, 3, 'subtract', 'base')).rejects.toMatchObject({ status: 500 })
+    await expect(updateBalance(73, 4, 'add', 'base')).rejects.toMatchObject({ status: 500 })
+    await expect(updateBalance(73, 3, 'add', 'changed')).rejects.toMatchObject({ status: 500 })
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8104, role: 'admin' }))
+    await expect(updateBalance(73, 3, 'add', 'base')).rejects.toMatchObject({ status: 500 })
+
+    const keys = post.mock.calls.map((_, index) => idempotencyHeader(index))
+    expect(keys[1]).toBe(keys[0])
+    expect(new Set([keys[0], ...keys.slice(2)]).size).toBe(6)
+    expect(keys[6]).toMatch(/^user-balance-8104-/)
   })
 })

@@ -360,9 +360,7 @@ async function userMutation(env: Env, route: string, body: Record<string, unknow
   return updateUserMutation(env, route, body, operation);
 }
 
-const MAX_BALANCE_MICROUSD = (10n ** 40n) - 1n;
-const signedMicroUSD = (value: unknown): value is string =>
-  typeof value === "string" && /^(0|-?[1-9][0-9]*)$/.test(value) && value.length <= 41;
+const MAX_PUBLIC_BALANCE_MICROUSD = 9007199254740991n;
 
 async function balanceAdjustment(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   if (!only(body, ["operation_id", "actor_user_id", "target_user_id", "operation", "amount_microusd", "reason"]) ||
@@ -380,19 +378,20 @@ async function balanceAdjustment(env: Env, route: string, body: Record<string, u
   try { before = BigInt(target.balance_microusd); amount = BigInt(body.amount_microusd as string); } catch { return error("INVALID_REQUEST"); }
   const after = body.operation === "set" ? amount : body.operation === "add" ? before + amount : before - amount;
   if (after < 0n) return error("BALANCE_NEGATIVE", 409);
-  if (after > MAX_BALANCE_MICROUSD) return error("BALANCE_OVERFLOW", 409);
+  if (after > MAX_PUBLIC_BALANCE_MICROUSD) return error("BALANCE_OVERFLOW", 409);
   const delta = after - before;
   const response = { balance: { ledger_id: operation, actor_user_id: actor.id, target_user_id: target.id, adjustment_type: body.operation, reason: body.reason, delta_microusd: delta.toString(), balance_before_microusd: before.toString(), balance_after_microusd: after.toString() } };
   const stamp = now();
   const saved = await managedOperation(env, route, operation, fingerprint, response, [
-    env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=?").bind(after.toString(), stamp, target.id, before.toString()),
+    env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind(after.toString(), stamp, target.id, before.toString(), actor.id),
     env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, actor.id, target.id, body.operation, body.reason, delta.toString(), before.toString(), after.toString(), stamp, operation),
   ]);
   if (saved) return json({ ...saved.response, replayed: saved.replay });
   const raced = await lookupOperation(env, route, operation, fingerprint);
   if (raced?.kind === "replay") return json({ ...raced.response, replayed: true });
   if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
-  const current = await getUser(env, target.id);
+  const [currentActor, current] = await Promise.all([getUser(env, actor.id), getUser(env, target.id)]);
+  if (!currentActor || currentActor.deleted_at !== null || currentActor.status !== "active" || currentActor.role !== "admin") return error("ACTOR_FORBIDDEN", 403);
   if (!current || current.deleted_at !== null) return error("TARGET_NOT_FOUND", 404);
   return error("STALE_BALANCE", 409);
 }

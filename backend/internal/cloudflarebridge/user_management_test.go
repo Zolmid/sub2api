@@ -28,6 +28,7 @@ type adminUserControlStub struct {
 
 	users      map[int64]*service.User
 	operations map[string]userCreateOperationStub
+	balances   map[string]ManagedBalanceAdjustmentResult
 
 	createCalls           int
 	updateCalls           int
@@ -49,6 +50,7 @@ func newAdminUserControlStub(users ...*service.User) *adminUserControlStub {
 	return &adminUserControlStub{
 		users:      indexed,
 		operations: map[string]userCreateOperationStub{},
+		balances:   map[string]ManagedBalanceAdjustmentResult{},
 	}
 }
 
@@ -193,6 +195,10 @@ func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, ad
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
 	stub.lastBalanceAdjustment = adjustment
+	if prior, ok := stub.balances[adjustment.OperationID]; ok {
+		prior.Replayed = true
+		return &prior, nil
+	}
 	user := stub.users[adjustment.TargetUserID]
 	if user == nil || user.DeletedAt != nil {
 		return nil, service.ErrUserNotFound
@@ -202,7 +208,9 @@ func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, ad
 	if adjustment.Operation == "add" {
 		user.Balance += float64(amount) / float64(microUSDPerUSD)
 	}
-	return &ManagedBalanceAdjustmentResult{LedgerID: adjustment.OperationID, BalanceBeforeMicroUSD: strconv.FormatInt(int64(before*float64(microUSDPerUSD)), 10), BalanceAfterMicroUSD: strconv.FormatInt(int64(user.Balance*float64(microUSDPerUSD)), 10), DeltaMicroUSD: adjustment.AmountMicroUSD}, nil
+	result := ManagedBalanceAdjustmentResult{LedgerID: adjustment.OperationID, BalanceBeforeMicroUSD: strconv.FormatInt(int64(before*float64(microUSDPerUSD)), 10), BalanceAfterMicroUSD: strconv.FormatInt(int64(user.Balance*float64(microUSDPerUSD)), 10), DeltaMicroUSD: adjustment.AmountMicroUSD}
+	stub.balances[adjustment.OperationID] = result
+	return &result, nil
 }
 
 func (stub *adminUserControlStub) DeleteManagedUser(_ context.Context, _ string, userID int64) error {
@@ -240,14 +248,27 @@ func TestCloudflareAdminBalanceUsesExactControlPlaneContract(t *testing.T) {
 	user := &service.User{ID: 2001, Email: "user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1}
 	control := newAdminUserControlStub(user)
 	handler := adminUserMutationRouter(control, 99)
-	result := callAdminUserMutation(t, handler, http.MethodPost, "/users/2001/balance", `{"balance":1.000001,"operation":"add","notes":"ledger note"}`, "balance-write")
+	missing := callAdminUserMutation(t, handler, http.MethodPost, "/users/2001/balance", `{"balance":1.000001,"operation":"add","notes":"ledger note"}`, "")
+	require.Equal(t, http.StatusBadRequest, missing.Code, missing.Body.String())
+	require.Empty(t, control.lastBalanceAdjustment.OperationID)
+
+	idempotencyKey := strings.Repeat("k", 128)
+	result := callAdminUserMutation(t, handler, http.MethodPost, "/users/2001/balance", `{"balance":1.000001,"operation":"add","notes":"ledger note"}`, idempotencyKey)
 	require.Equal(t, http.StatusOK, result.Code, result.Body.String())
 	require.Equal(t, int64(99), control.lastBalanceAdjustment.ActorUserID)
 	require.Equal(t, int64(2001), control.lastBalanceAdjustment.TargetUserID)
 	require.Equal(t, "1000001", control.lastBalanceAdjustment.AmountMicroUSD)
 	require.Equal(t, "add", control.lastBalanceAdjustment.Operation)
 	require.Equal(t, "ledger note", control.lastBalanceAdjustment.Reason)
-	require.Contains(t, control.lastBalanceAdjustment.OperationID, "user-balance:99:")
+	expectedOperationID := "user-balance:99:" + service.HashIdempotencyKey(idempotencyKey)
+	require.Equal(t, expectedOperationID, control.lastBalanceAdjustment.OperationID)
+	require.LessOrEqual(t, len(control.lastBalanceAdjustment.OperationID), 128)
+	require.NotContains(t, control.lastBalanceAdjustment.OperationID, idempotencyKey)
+	require.Empty(t, result.Header().Get("X-Idempotency-Replayed"))
+
+	replay := callAdminUserMutation(t, handler, http.MethodPost, "/users/2001/balance", `{"balance":1.000001,"operation":"add","notes":"ledger note"}`, idempotencyKey)
+	require.Equal(t, http.StatusOK, replay.Code, replay.Body.String())
+	require.Equal(t, "true", replay.Header().Get("X-Idempotency-Replayed"))
 }
 
 func callAdminUserMutation(
@@ -510,6 +531,33 @@ func TestHTTPControlPlaneUserCreateReplayVerifiesThePersistedCredential(t *testi
 	require.EqualValues(t, 7201, created.ID)
 	require.Equal(t, originalCredential.PasswordHash, created.PasswordHash)
 	require.True(t, created.CheckPassword(password))
+}
+
+func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/v1/manage/users/balance-adjust", request.URL.Path)
+		writer.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
+			"balance": map[string]any{
+				"ledger_id":               "user-balance:9:wire",
+				"balance_before_microusd": "1000000",
+				"balance_after_microusd":  "2000000",
+				"delta_microusd":          "1000000",
+			},
+			"replayed": true,
+		}))
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	result, err := control.AdjustManagedUserBalance(context.Background(), ManagedBalanceAdjustment{
+		OperationID: "user-balance:9:wire", ActorUserID: 9, TargetUserID: 10,
+		Operation: "add", AmountMicroUSD: "1000000", Reason: "wire replay",
+	})
+	require.NoError(t, err)
+	require.True(t, result.Replayed)
+	require.Equal(t, "2000000", result.BalanceAfterMicroUSD)
 }
 
 var _ ControlPlane = (*adminUserControlStub)(nil)

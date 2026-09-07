@@ -50,6 +50,7 @@ type ManagedBalanceAdjustmentResult struct {
 	BalanceBeforeMicroUSD string
 	BalanceAfterMicroUSD  string
 	DeltaMicroUSD         string
+	Replayed              bool
 }
 
 // ManagedUserUpdate contains only fields owned by the current Worker schema.
@@ -146,14 +147,23 @@ func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	if key == "" {
+		response.ErrorFrom(c, service.ErrIdempotencyKeyRequired)
+		return
+	}
 	balances, err := h.balances()
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
-	_, err = balances.AdjustManagedUserBalance(c.Request.Context(), ManagedBalanceAdjustment{OperationID: "user-balance:" + strconv.FormatInt(actorID, 10) + ":" + key, ActorUserID: actorID, TargetUserID: userID, Operation: request.Operation, AmountMicroUSD: amount, Reason: request.Notes})
+	operationID := "user-balance:" + strconv.FormatInt(actorID, 10) + ":" + service.HashIdempotencyKey(key)
+	result, err := balances.AdjustManagedUserBalance(c.Request.Context(), ManagedBalanceAdjustment{OperationID: operationID, ActorUserID: actorID, TargetUserID: userID, Operation: request.Operation, AmountMicroUSD: amount, Reason: request.Notes})
 	if err != nil {
 		response.ErrorFrom(c, err)
+		return
+	}
+	if result == nil {
+		response.ErrorFrom(c, errors.New("invalid balance adjustment response"))
 		return
 	}
 	management, err := h.management()
@@ -165,6 +175,9 @@ func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
+	}
+	if result.Replayed {
+		c.Header("X-Idempotency-Replayed", "true")
 	}
 	response.Success(c, newCloudflareAdminUserDTO(user))
 }
@@ -961,6 +974,7 @@ func (c *HTTPControlPlane) AdjustManagedUserBalance(ctx context.Context, adjustm
 			BalanceAfterMicroUSD  string `json:"balance_after_microusd"`
 			DeltaMicroUSD         string `json:"delta_microusd"`
 		} `json:"balance"`
+		Replayed bool `json:"replayed"`
 	}
 	err := c.post(ctx, "/v1/manage/users/balance-adjust", map[string]any{"operation_id": adjustment.OperationID, "actor_user_id": strconv.FormatInt(adjustment.ActorUserID, 10), "target_user_id": strconv.FormatInt(adjustment.TargetUserID, 10), "operation": adjustment.Operation, "amount_microusd": adjustment.AmountMicroUSD, "reason": adjustment.Reason}, &wire)
 	if err != nil {
@@ -969,7 +983,7 @@ func (c *HTTPControlPlane) AdjustManagedUserBalance(ctx context.Context, adjustm
 	if wire.Balance.LedgerID != adjustment.OperationID || !unsignedMicroUSDWire(wire.Balance.BalanceBeforeMicroUSD) || !unsignedMicroUSDWire(wire.Balance.BalanceAfterMicroUSD) || !signedMicroUSDWire(wire.Balance.DeltaMicroUSD) {
 		return nil, errors.New("invalid balance adjustment response")
 	}
-	return &ManagedBalanceAdjustmentResult{LedgerID: wire.Balance.LedgerID, BalanceBeforeMicroUSD: wire.Balance.BalanceBeforeMicroUSD, BalanceAfterMicroUSD: wire.Balance.BalanceAfterMicroUSD, DeltaMicroUSD: wire.Balance.DeltaMicroUSD}, nil
+	return &ManagedBalanceAdjustmentResult{LedgerID: wire.Balance.LedgerID, BalanceBeforeMicroUSD: wire.Balance.BalanceBeforeMicroUSD, BalanceAfterMicroUSD: wire.Balance.BalanceAfterMicroUSD, DeltaMicroUSD: wire.Balance.DeltaMicroUSD, Replayed: wire.Replayed}, nil
 }
 
 func signedMicroUSDWire(value string) bool {

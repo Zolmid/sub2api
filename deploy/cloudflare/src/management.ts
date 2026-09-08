@@ -19,6 +19,7 @@ const ID_MAX = 20;
 const PAGE_MAX = 100;
 const OPERATION_MAX = 128;
 const statuses = new Set(["active", "disabled"]);
+const roles = new Set(["user", "admin"]);
 const readablePrivacyModes = new Set(["training_off", "training_set_failed", "training_set_cf_blocked"]);
 
 type User = {
@@ -51,6 +52,7 @@ const id = (value: unknown): value is string =>
 const operationID = (value: unknown): value is string =>
   isBoundedString(value, OPERATION_MAX) && /^[A-Za-z0-9._:-]+$/.test(value);
 const status = (value: unknown): value is string => typeof value === "string" && statuses.has(value);
+const role = (value: unknown): value is string => typeof value === "string" && roles.has(value);
 const stringArray = (value: unknown, maximum = 100, decimal = false): string[] | null => {
   if (!Array.isArray(value) || value.length > maximum) return null;
   if (!value.every((item) => decimal ? id(item) : isBoundedString(item, 128))) return null;
@@ -389,6 +391,7 @@ async function liveEmailExists(env: Env, value: string, excludingID?: string): P
 async function userMutation(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
   if (route.endsWith("/balance-adjust")) return balanceAdjustment(env, route, body, operation);
   if (route.endsWith("/create")) return createUserMutation(env, route, body, operation);
+  if (route.endsWith("/role-change")) return roleChangeUserMutation(env, route, body, operation);
   if (route.endsWith("/delete")) return deleteUserMutation(env, route, body, operation);
   return updateUserMutation(env, route, body, operation);
 }
@@ -559,6 +562,227 @@ async function updateUserMutation(
   if (raced?.kind === "replay") return json(raced.response);
   if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
   return error("CONFLICT", 409);
+}
+
+const roleChangeKeys = [
+  "operation_id", "actor_user_id", "actor_auth_method", "actor_session_id",
+  "id", "role", "email", "password_hash", "password_semantic_digest",
+  "username", "notes", "status",
+  "concurrency", "rpm_limit", "allowed_group_ids", "restrict_public_groups",
+];
+
+function validRoleChangePatch(body: Record<string, unknown>, groups: string[] | null): boolean {
+  if (body.email !== undefined && !email(body.email)) return false;
+  if (body.password_hash !== undefined && !validPasswordHash(body.password_hash)) return false;
+  const hasPassword = body.password_hash !== undefined;
+  const hasPasswordDigest = body.password_semantic_digest !== undefined;
+  if (hasPassword !== hasPasswordDigest) return false;
+  if (hasPasswordDigest &&
+    (!isBoundedString(body.password_semantic_digest, 64, 64) ||
+      !/^[0-9a-f]{64}$/.test(body.password_semantic_digest as string))) return false;
+  if (body.username !== undefined && !isBoundedString(body.username, 100, 0)) return false;
+  if (body.notes !== undefined && !isBoundedString(body.notes, 4096, 0)) return false;
+  if (body.status !== undefined && !status(body.status)) return false;
+  if (body.concurrency !== undefined &&
+    (!Number.isInteger(body.concurrency) || Number(body.concurrency) < 1 || Number(body.concurrency) > 100000)) return false;
+  if (body.rpm_limit !== undefined &&
+    (!Number.isInteger(body.rpm_limit) || Number(body.rpm_limit) < 0 || Number(body.rpm_limit) > 1000000)) return false;
+  if (body.allowed_group_ids !== undefined && groups === null) return false;
+  return body.restrict_public_groups === undefined || typeof body.restrict_public_groups === "boolean";
+}
+
+async function roleChangeAuthorization(
+  env: Env,
+  body: Record<string, unknown>,
+): Promise<Response | null> {
+  if (body.actor_auth_method !== "jwt") {
+    return error(
+      body.actor_auth_method === "admin_api_key"
+        ? "STEP_UP_ADMIN_API_KEY_FORBIDDEN"
+        : "STEP_UP_JWT_REQUIRED",
+      403,
+    );
+  }
+  if (!isBoundedString(body.actor_session_id, 128, 8)) {
+    return error("STEP_UP_SESSION_REQUIRED", 401);
+  }
+  const actorID = body.actor_user_id as string;
+  const grant = await env.TOTP_SECURITY.get(
+    env.TOTP_SECURITY.idFromName(`user:${actorID}`),
+  ).hasStepUp(actorID, body.actor_session_id);
+  if (!grant.ok) {
+    return grant.code === "TOTP_NOT_SETUP"
+      ? error("STEP_UP_TOTP_NOT_ENABLED", 403)
+      : error("STEP_UP_UNAVAILABLE", 503);
+  }
+  return grant.granted ? null : error("STEP_UP_REQUIRED", 403);
+}
+
+function roleChangeFingerprint(
+  body: Record<string, unknown>,
+  groups: string[] | null,
+): Record<string, unknown> {
+  const fingerprint: Record<string, unknown> = {
+    operation_id: body.operation_id,
+    actor_user_id: body.actor_user_id,
+    id: body.id,
+    role: body.role,
+    password_semantic_digest: body.password_semantic_digest ?? null,
+  };
+  for (const key of [
+    "email", "username", "notes", "status", "concurrency", "rpm_limit",
+    "restrict_public_groups",
+  ]) {
+    if (body[key] !== undefined) fingerprint[key] = body[key];
+  }
+  if (body.allowed_group_ids !== undefined) fingerprint.allowed_group_ids = groups;
+  return fingerprint;
+}
+
+async function hasOtherLiveAdmin(env: Env, targetID: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT id FROM users WHERE id<>? AND role='admin' AND status='active' AND deleted_at IS NULL LIMIT 1",
+  ).bind(targetID).first<{ id: string }>();
+  return row !== null;
+}
+
+async function roleChangeUserMutation(
+  env: Env,
+  route: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<Response> {
+  const groupsProvided = body.allowed_group_ids !== undefined;
+  const groups = groupsProvided ? stringArray(body.allowed_group_ids, 100, true) : null;
+  if (!only(body, roleChangeKeys) || !id(body.actor_user_id) || !id(body.id) ||
+    !role(body.role) || !validRoleChangePatch(body, groups)) {
+    return error("INVALID_REQUEST");
+  }
+  const authorization = await roleChangeAuthorization(env, body);
+  if (authorization) return authorization;
+
+  const fingerprint = roleChangeFingerprint(body, groups);
+  const prior = await lookupOperation(env, route, operation, fingerprint);
+  if (prior) {
+    return prior.kind === "replay"
+      ? json({ ...prior.response, replayed: true })
+      : error("IDEMPOTENCY_CONFLICT", 409);
+  }
+
+  const old = await getUser(env, body.id);
+  if (!old) return error("NOT_FOUND", 404);
+  if (old.deleted_at !== null) return error("CONFLICT", 409);
+  const nextRole = body.role as string;
+  const nextStatus = (body.status ?? old.status) as string;
+  if (groupsProvided && !(await groupsExist(env, groups!))) return error("REFERENCE_REJECTED", 409);
+  if (body.email !== undefined && await liveEmailExists(env, body.email as string, old.id)) {
+    return error("EMAIL_EXISTS", 409);
+  }
+
+  const stamp = now();
+  const user: User = {
+    ...old,
+    email: (body.email ?? old.email) as string,
+    username: (body.username ?? old.username) as string,
+    notes: (body.notes ?? old.notes) as string,
+    status: nextStatus,
+    role: nextRole,
+    concurrency: (body.concurrency ?? old.concurrency) as number,
+    rpm_limit: (body.rpm_limit ?? old.rpm_limit) as number,
+    allowed_group_ids: groupsProvided ? groups! : old.allowed_group_ids,
+    restrict_public_groups: (body.restrict_public_groups ?? old.restrict_public_groups) as boolean,
+    updated_at: stamp,
+  };
+  const saved = await managedOperation(env, route, operation, fingerprint, { user }, [
+    guardedRoleUserStatement(env, body, old, user, stamp, groupsProvided),
+    env.DB.prepare(
+      `INSERT INTO admin_role_change_audit(
+         operation_id,actor_user_id,target_user_id,old_role,new_role,created_at
+       ) SELECT ?,?,?,?,?,?
+       WHERE ?<>? AND EXISTS(
+         SELECT 1 FROM management_operations WHERE operation_id=?
+       )`,
+    ).bind(
+      operation, body.actor_user_id, user.id, old.role, user.role, stamp,
+      old.role, user.role, operation,
+    ),
+  ]);
+  if (saved) return json({ ...saved.response, replayed: saved.replay });
+
+  const raced = await lookupOperation(env, route, operation, fingerprint);
+  if (raced?.kind === "replay") return json({ ...raced.response, replayed: true });
+  if (raced?.kind === "conflict") return error("IDEMPOTENCY_CONFLICT", 409);
+  const [actor, current] = await Promise.all([
+    getUser(env, body.actor_user_id as string),
+    getUser(env, user.id),
+  ]);
+  if (!actor || actor.deleted_at !== null || actor.status !== "active" || actor.role !== "admin") {
+    return error("ACTOR_FORBIDDEN", 403);
+  }
+  if (!current) return error("NOT_FOUND", 404);
+  if (current.deleted_at !== null) return error("CONFLICT", 409);
+  const wouldRemoveCurrentLiveAdmin = current.role === "admin" && current.status === "active" &&
+    (nextRole !== "admin" || nextStatus !== "active");
+  if (wouldRemoveCurrentLiveAdmin && !(await hasOtherLiveAdmin(env, current.id))) {
+    return error("LAST_ADMIN_REQUIRED", 409);
+  }
+  if (groupsProvided && !(await groupsExist(env, groups!))) return error("REFERENCE_REJECTED", 409);
+  if (body.email !== undefined && await liveEmailExists(env, body.email as string, current.id)) {
+    return error("EMAIL_EXISTS", 409);
+  }
+  return error("CONFLICT", 409);
+}
+
+function guardedRoleUserStatement(
+  env: Env,
+  body: Record<string, unknown>,
+  old: User,
+  user: User,
+  stamp: string,
+  groupsProvided: boolean,
+): D1PreparedStatement {
+  const sets: string[] = ["role=?"];
+  const values: unknown[] = [user.role];
+  const set = (column: string, value: unknown) => {
+    sets.push(column + "=?");
+    values.push(value);
+  };
+  if (body.email !== undefined) set("email", user.email);
+  if (body.password_hash !== undefined) set("password_hash", body.password_hash);
+  if (body.username !== undefined) set("username", user.username);
+  if (body.notes !== undefined) set("notes", user.notes);
+  if (body.status !== undefined) set("status", user.status);
+  if (body.concurrency !== undefined) set("concurrency", user.concurrency);
+  if (body.rpm_limit !== undefined) set("rpm_limit", user.rpm_limit);
+  if (groupsProvided) set("allowed_group_ids_json", sqlJSON(user.allowed_group_ids));
+  if (body.restrict_public_groups !== undefined) {
+    set("restrict_public_groups", user.restrict_public_groups ? 1 : 0);
+  }
+  set("updated_at", stamp);
+
+  let where = `id=? AND deleted_at IS NULL AND role=? AND status=? AND updated_at=?
+    AND EXISTS(
+      SELECT 1 FROM users AS actor
+      WHERE actor.id=? AND actor.deleted_at IS NULL
+        AND actor.status='active' AND actor.role='admin'
+    )
+    AND (
+      role<>'admin' OR status<>'active' OR (?='admin' AND ?='active')
+      OR EXISTS(
+        SELECT 1 FROM users AS other
+        WHERE other.id<>users.id AND other.deleted_at IS NULL
+          AND other.status='active' AND other.role='admin'
+      )
+    )`;
+  values.push(
+    user.id, old.role, old.status, old.updated_at, body.actor_user_id,
+    user.role, user.status,
+  );
+  if (groupsProvided) {
+    where += " AND " + liveGroupPredicate;
+    values.push(sqlJSON(user.allowed_group_ids));
+  }
+  return env.DB.prepare("UPDATE users SET " + sets.join(",") + " WHERE " + where).bind(...values);
 }
 
 async function deleteUserMutation(

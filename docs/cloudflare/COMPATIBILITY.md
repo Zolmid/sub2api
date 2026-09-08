@@ -11,16 +11,17 @@ pass its listed acceptance test before it is treated as a replacement.
 The branch now has a bounded D1-backed management surface in addition to the
 stage B gateway slice. The API-key rebind, OpenAI API-key account CRUD, and
 administrator balance adjustment/history have local composed-browser results;
-TOTP/login/step-up has a local composed-HTTP result. The other rows remain
-layer-level local evidence. None replaces the pending broad-console, remote,
-real-upstream, or production gates.
+TOTP/login/step-up and administrator role changes have local composed-HTTP
+results. The other rows remain layer-level local evidence. None replaces the
+pending broad-console, remote, real-upstream, or production gates.
 
 | Feature slice | Implemented target | Local evidence | Status |
 | --- | --- | --- | --- |
 | Admin user create | Existing console API -> Cloudflare Go handler -> private Worker mutation -> D1 user and operation rows | Go HTTP/control-plane tests, workerd D1 tests, frontend retry tests, fresh migration, and full image build cover semantic replay across new IDs/bcrypt hashes, exact microUSD conversion, normalized email conflicts, group references, and private auth readback | Automated layers locally verified for ordinary `user` creation; admin creation, default balance/subscriptions, internationalized email, and a composed browser/runtime probe remain open |
-| Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role changes deliberately fail closed and balance uses its dedicated audited endpoint |
+| Admin user update | Field-level D1 patch with private credential readback; role-changing patches use the separate step-up-gated role operation | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, management-response credential rejection, role-operation replay/conflict, and final-admin protection | Locally composed-HTTP verified for role promotion/demotion and automated locally verified for email/password/profile/status/limits/groups; balance uses its dedicated audited endpoint |
 | Admin user delete | One D1 batch tombstones the non-admin user and every live owned API key | Workerd tests cover successful tombstoning, private-auth absence, operation replay, and a zero-row admin guard that leaves keys untouched | Automated layers locally verified for non-admin users; admins remain protected and subscription/ledger cleanup is not implied |
-| User TOTP and session step-up | Existing auth/TOTP APIs -> Cloudflare Go handler -> private Worker -> per-user `TOTPSecurityDO` plus D1 encrypted envelope/revision | Go route/control-plane tests and workerd tests cover password-gated setup/disable, one-time setup response, encrypted-at-rest state, login challenge consumption, five-attempt lockout, expiry/alarm cleanup, revision invalidation, and JWT-session-bound step-up; a fresh Wrangler/Container/D1 composition covers enable, 2FA login, replay rejection, step-up, disable, and direct-login restoration | Locally composed-HTTP verified. The existing console components were not driven in a browser for this lane; email verification, role mutation consumers, remote Cloudflare, and production remain open |
+| User TOTP and session step-up | Existing auth/TOTP APIs -> Cloudflare Go handler -> private Worker -> per-user `TOTPSecurityDO` plus D1 encrypted envelope/revision | Go route/control-plane tests and workerd tests cover password-gated setup/disable, one-time setup response, encrypted-at-rest state, login challenge consumption, five-attempt lockout, expiry/alarm cleanup, revision invalidation, and JWT-session-bound step-up; a fresh Wrangler/Container/D1 composition covers enable, 2FA login, replay rejection, step-up, disable, and direct-login restoration | Locally composed-HTTP verified. The existing console components were not driven in a browser for this lane; email verification, remote Cloudflare, and production remain open |
+| Admin role promotion/demotion | Existing admin user PUT -> Cloudflare Go JWT/TOTP step-up boundary -> private Worker role mutation -> D1 user, idempotency, and immutable audit rows | Go, workerd, and frontend tests cover API-key rejection, exact session binding, strict payloads, same-request replay, changed-payload/password conflict, combined field/password patches, and concurrent final-admin protection; a fresh Wrangler/Container/D1 composition covers the complete public flow and persisted readback | Locally composed-HTTP verified. Direct admin creation/delete remain prohibited; console interaction, remote Cloudflare, real upstream, and production remain open |
 | Admin balance adjustment/history | Existing console balance modal -> strict Cloudflare Go public API -> private Worker mutation/read -> guarded D1 balance projection, append-only ledger, and operation row | Go and workerd tests cover exact UTF-16/microusd boundaries, replay/conflict, stale and balance bounds, enum validation, immutable rows, and safe history projection; real Chromium covers add/refund, list refresh, modal history, ordering, notes, totals, and persisted D1 readback | Locally composed-browser verified for dedicated administrator add/subtract and immutable history; reservation, settlement, remote, and production equivalence remain open |
 | Admin API-key group rebind | Existing console owner-key list and rebind routes -> strict Cloudflare Go handlers -> private Worker reads/mutation -> D1 | Go and workerd tests cover admin auth, exact request/response protocol, large IDs, key non-disclosure, active owner/key/group guards, same-group replay, exclusive access append, concurrent-state guards, and zero-row rollback; frontend tests cover Cloudflare filtering and traditional behavior; real Chromium plus persisted D1 readback covers the local composed interaction | Locally composed-browser verified for the upstream admin contract's active standard OpenAI group rebind; unsupported unbind, reset, quota/rate, and subscription-group extensions continue to fail closed |
 | Admin account create | Existing console POST -> strict Cloudflare Go handler -> private Worker mutation -> D1 account, group-membership, and operation rows | Go route/bridge tests and workerd D1 tests cover admin auth, semantic replay across regenerated large candidate IDs, one ambiguous private 5xx retry with a stable operation ID, live compatible group references, complete safe readback, conflict mapping, and secret rejection; real Chromium covers the accepted modal and 200 create/list refresh without unsupported initialization probes | Locally composed-browser verified for OpenAI API-key accounts; ambiguous private-5xx retry remains automated, and remote/real-upstream acceptance is not claimed |
@@ -120,3 +121,34 @@ the enabled point found a purpose-prefixed AES-GCM envelope and revision 1; DO
 readback found only hashed/opaque transient state. Final readback found revision
 2, no envelope, and no setup/login/grant/attempt rows. This was not a visual
 browser, remote Cloudflare, real-upstream, or production gate.
+
+# Administrator role changes (Cloudflare mode)
+
+Role promotion and demotion retain the existing
+`PUT /api/v1/admin/users/:id` public shape, but only a real administrator JWT
+session can enter the privileged path. The Go boundary requires enabled TOTP,
+a non-expired step-up grant for that exact JWT session, a normalized
+`Idempotency-Key`, and the explicit browser retry marker. Administrator API
+keys cannot change roles. Ordinary same-role profile updates remain on the
+non-step-up field-patch path.
+
+The private Worker independently checks the actor, target, current session
+grant, exact field allowlist, and operation fingerprint. D1 conditionally
+commits the user patch, one management-operation result, and one immutable
+`admin_role_change_audit` row. The operation fingerprint covers actor, target,
+new role, every supplied field, and an operation-salted password semantic
+digest; it excludes plaintext, JWT/session values, and the randomized bcrypt
+hash. A changed payload under the same key returns
+`IDEMPOTENCY_CONFLICT`. A demotion or disable that would remove the final
+live administrator returns `LAST_ADMIN_REQUIRED`, including concurrent
+self-removal attempts.
+
+The local composed-HTTP gate used a fresh canonical `0001` through `0007`
+D1 chain and the real Worker -> Go Container -> private Worker path. It
+verified promotion, exact replay, changed-payload conflict, password-bearing
+demotion and replay, changed-password conflict, and final-administrator
+rejection. Persisted D1 had exactly two immutable audit rows, one successful
+operation per role transition, no password/digest/session marker in stored
+responses, one remaining live administrator, and no foreign-key violation.
+This was not a visual browser, remote Cloudflare, real-upstream, or production
+gate.

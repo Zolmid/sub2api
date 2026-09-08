@@ -68,5 +68,8 @@ success. Inspect or restore from the verified backup before another operator
 action.
 
 The isolated local inspect/apply/readback path has passed against a fresh D1
-with migrations `0001` through `0004`. Only synthetic local credentials and
-`/private/tmp` state were used; no remote D1 or Cloudflare resource was mutated.
+with the canonical migrations `0001` through `0007`. The later migrations do
+not broaden bootstrap authority; the command still requires an empty,
+schema-compatible users table and creates only the first administrator. Only
+synthetic local credentials and `/private/tmp` state were used; no remote D1 or
+Cloudflare resource was mutated.

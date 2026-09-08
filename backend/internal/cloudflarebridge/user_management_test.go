@@ -23,12 +23,21 @@ type userCreateOperationStub struct {
 	user          *service.User
 }
 
+type userRoleOperationStub struct {
+	actorUserID   int64
+	targetUserID  int64
+	newRole       string
+	semanticToken string
+	user          *service.User
+}
+
 type adminUserControlStub struct {
 	disabledTOTPControlPlane
 	mu sync.Mutex
 
 	users           map[int64]*service.User
 	operations      map[string]userCreateOperationStub
+	roleOperations  map[string]userRoleOperationStub
 	balances        map[string]ManagedBalanceAdjustmentResult
 	history         *ManagedBalanceHistoryPage
 	historyErr      error
@@ -39,12 +48,20 @@ type adminUserControlStub struct {
 
 	createCalls           int
 	updateCalls           int
+	roleChangeCalls       int
 	deleteCalls           int
 	lastOperation         string
 	lastBalanceMicroUSD   string
 	lastSemanticToken     string
 	lastUpdate            ManagedUserUpdate
+	lastRoleChange        ManagedUserRoleChange
 	lastBalanceAdjustment ManagedBalanceAdjustment
+	totpEnabled           bool
+	stepUpGranted         bool
+	totpStatusErr         error
+	stepUpErr             error
+	lastStepUpUserID      int64
+	lastStepUpSession     string
 }
 
 func newAdminUserControlStub(users ...*service.User) *adminUserControlStub {
@@ -55,10 +72,27 @@ func newAdminUserControlStub(users ...*service.User) *adminUserControlStub {
 		indexed[user.ID] = &copy
 	}
 	return &adminUserControlStub{
-		users:      indexed,
-		operations: map[string]userCreateOperationStub{},
-		balances:   map[string]ManagedBalanceAdjustmentResult{},
+		users:          indexed,
+		operations:     map[string]userCreateOperationStub{},
+		roleOperations: map[string]userRoleOperationStub{},
+		balances:       map[string]ManagedBalanceAdjustmentResult{},
 	}
+}
+
+func (stub *adminUserControlStub) GetTOTPStatus(context.Context, int64) (*CloudflareTOTPStatus, error) {
+	if stub.totpStatusErr != nil {
+		return nil, stub.totpStatusErr
+	}
+	return &CloudflareTOTPStatus{Enabled: stub.totpEnabled, Revision: 1}, nil
+}
+
+func (stub *adminUserControlStub) HasTOTPStepUp(_ context.Context, userID int64, sessionID string) (bool, error) {
+	stub.lastStepUpUserID = userID
+	stub.lastStepUpSession = sessionID
+	if stub.stepUpErr != nil {
+		return false, stub.stepUpErr
+	}
+	return stub.stepUpGranted, nil
 }
 
 func (stub *adminUserControlStub) ResolveAPIKey(context.Context, string) (*service.APIKey, error) {
@@ -198,6 +232,67 @@ func (stub *adminUserControlStub) UpdateManagedUser(
 	return &copy, nil
 }
 
+func (stub *adminUserControlStub) ChangeManagedUserRole(
+	_ context.Context,
+	change ManagedUserRoleChange,
+) (*ManagedUserRoleChangeResult, error) {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.roleChangeCalls++
+	stub.lastRoleChange = change
+	if prior, ok := stub.roleOperations[change.OperationID]; ok {
+		if prior.actorUserID != change.ActorUserID || prior.targetUserID != change.TargetUserID ||
+			prior.newRole != change.NewRole || prior.semanticToken != change.PasswordSemanticToken {
+			return nil, &controlPlaneResponseError{StatusCode: http.StatusConflict, Code: "IDEMPOTENCY_CONFLICT"}
+		}
+		copy := *prior.user
+		copy.AllowedGroups = append([]int64{}, prior.user.AllowedGroups...)
+		return &ManagedUserRoleChangeResult{User: &copy, Replayed: true}, nil
+	}
+	user := stub.users[change.TargetUserID]
+	if user == nil || user.DeletedAt != nil {
+		return nil, service.ErrUserNotFound
+	}
+	update := change.Update
+	if update.Email != nil {
+		user.Email = *update.Email
+	}
+	if update.Username != nil {
+		user.Username = *update.Username
+	}
+	if update.Notes != nil {
+		user.Notes = *update.Notes
+	}
+	if update.Status != nil {
+		user.Status = *update.Status
+	}
+	if update.Concurrency != nil {
+		user.Concurrency = *update.Concurrency
+	}
+	if update.RPMLimit != nil {
+		user.RPMLimit = *update.RPMLimit
+	}
+	if update.AllowedGroups != nil {
+		user.AllowedGroups = append([]int64{}, (*update.AllowedGroups)...)
+	}
+	if update.RestrictPublicGroups != nil {
+		user.RestrictPublicGroups = *update.RestrictPublicGroups
+	}
+	if update.PasswordHash != nil {
+		user.PasswordHash = *update.PasswordHash
+	}
+	user.Role = change.NewRole
+	user.UpdatedAt = time.Now().UTC()
+	stored := *user
+	stored.AllowedGroups = append([]int64{}, user.AllowedGroups...)
+	stub.roleOperations[change.OperationID] = userRoleOperationStub{
+		actorUserID: change.ActorUserID, targetUserID: change.TargetUserID,
+		newRole: change.NewRole, semanticToken: change.PasswordSemanticToken, user: &stored,
+	}
+	copy := stored
+	return &ManagedUserRoleChangeResult{User: &copy}, nil
+}
+
 func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, adjustment ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error) {
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
@@ -247,11 +342,21 @@ func (stub *adminUserControlStub) DeleteManagedUser(_ context.Context, _ string,
 }
 
 func adminUserMutationRouter(control *adminUserControlStub, actorID int64) http.Handler {
+	return adminUserMutationRouterWithAuth(control, actorID, "", "")
+}
+
+func adminUserMutationRouterWithAuth(control *adminUserControlStub, actorID int64, authMethod, sessionID string) http.Handler {
 	handler := newCloudflareAdminAPIHandler(control)
 	router := gin.New()
 	withActor := func(next gin.HandlerFunc) gin.HandlerFunc {
 		return func(c *gin.Context) {
 			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: actorID})
+			if authMethod != "" {
+				c.Set("auth_method", authMethod)
+			}
+			if sessionID != "" {
+				c.Set(middleware.ContextKeySessionID, sessionID)
+			}
 			next(c)
 		}
 	}
@@ -344,6 +449,9 @@ func callAdminUserMutation(
 	request.Header.Set("Content-Type", "application/json")
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
+		if method == http.MethodPut && strings.Contains(body, `"role"`) {
+			request.Header.Set("X-Sub2API-Role-Operation", "true")
+		}
 	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
@@ -412,7 +520,8 @@ func TestCloudflareAdminUserMutationSecurityBoundaries(t *testing.T) {
 	require.Zero(t, control.updateCalls)
 
 	roleChange := callAdminUserMutation(t, handler, http.MethodPut, "/users/2001", `{"role":"admin"}`, "")
-	require.Equal(t, http.StatusForbidden, roleChange.Code)
+	require.Equal(t, http.StatusBadRequest, roleChange.Code)
+	require.Contains(t, roleChange.Body.String(), "IDEMPOTENCY_KEY_REQUIRED")
 	require.Zero(t, control.updateCalls)
 
 	sameRole := callAdminUserMutation(t, handler, http.MethodPut, "/users/2001", `{"role":"user"}`, "")
@@ -436,11 +545,87 @@ func TestCloudflareAdminUserMutationSecurityBoundaries(t *testing.T) {
 	require.NotContains(t, patch.Body.String(), "password_hash")
 
 	disableAdmin := callAdminUserMutation(t, handler, http.MethodPut, "/users/2002", `{"status":"disabled"}`, "")
-	require.Equal(t, http.StatusForbidden, disableAdmin.Code)
+	require.Equal(t, http.StatusBadRequest, disableAdmin.Code)
+	require.Contains(t, disableAdmin.Body.String(), "IDEMPOTENCY_KEY_REQUIRED")
 	require.Equal(t, 1, control.updateCalls)
 	deleteAdmin := callAdminUserMutation(t, handler, http.MethodDelete, "/users/2002", `{}`, "")
 	require.Equal(t, http.StatusForbidden, deleteAdmin.Code)
 	require.Zero(t, control.deleteCalls)
+}
+
+func TestCloudflareAdminRoleChangeRequiresJWTSessionStepUpAndPreservesUpdateContract(t *testing.T) {
+	user := &service.User{
+		ID: 3001, Email: "role-user@example.test", Username: "before", Notes: "notes",
+		Status: service.StatusActive, Role: service.RoleUser, Balance: 4.5,
+		Concurrency: 2, RPMLimit: 3, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	require.NoError(t, user.SetPassword("existing password"))
+	control := newAdminUserControlStub(user)
+	plain := adminUserMutationRouter(control, 99)
+
+	unsafeID := callAdminUserMutation(t, plain, http.MethodPut, "/users/9007199254740992", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusNotFound, unsafeID.Code, unsafeID.Body.String())
+	unknownField := callAdminUserMutation(t, plain, http.MethodPut, "/users/3001", `{"role":"admin","unexpected":true}`, "role-key")
+	require.Equal(t, http.StatusBadRequest, unknownField.Code, unknownField.Body.String())
+	invalidRole := callAdminUserMutation(t, plain, http.MethodPut, "/users/3001", `{"role":"owner"}`, "role-key")
+	require.Equal(t, http.StatusBadRequest, invalidRole.Code, invalidRole.Body.String())
+	missingJWT := callAdminUserMutation(t, plain, http.MethodPut, "/users/3001", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusForbidden, missingJWT.Code, missingJWT.Body.String())
+	require.Contains(t, missingJWT.Body.String(), "STEP_UP_JWT_REQUIRED")
+
+	apiKey := adminUserMutationRouterWithAuth(control, 99, service.AuditAuthMethodAdminAPIKey, "session-api-key")
+	response := callAdminUserMutation(t, apiKey, http.MethodPut, "/users/3001", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "STEP_UP_ADMIN_API_KEY_FORBIDDEN")
+
+	missingSession := adminUserMutationRouterWithAuth(control, 99, service.AuditAuthMethodJWT, "")
+	response = callAdminUserMutation(t, missingSession, http.MethodPut, "/users/3001", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "STEP_UP_SESSION_REQUIRED")
+
+	jwt := adminUserMutationRouterWithAuth(control, 99, service.AuditAuthMethodJWT, "session-jwt-99")
+	response = callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "STEP_UP_TOTP_NOT_ENABLED")
+
+	control.totpEnabled = true
+	response = callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", `{"role":"admin"}`, "role-key")
+	require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), "STEP_UP_REQUIRED")
+	require.Equal(t, int64(99), control.lastStepUpUserID)
+	require.Equal(t, "session-jwt-99", control.lastStepUpSession)
+
+	control.stepUpGranted = true
+	body := `{"username":"after","password":"replacement password","role":"admin","concurrency":7}`
+	response = callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", body, "role-key")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, 1, control.roleChangeCalls)
+	require.Equal(t, int64(99), control.lastRoleChange.ActorUserID)
+	require.Equal(t, int64(3001), control.lastRoleChange.TargetUserID)
+	require.Equal(t, "session-jwt-99", control.lastRoleChange.ActorSession)
+	require.Equal(t, service.RoleAdmin, control.lastRoleChange.NewRole)
+	require.Regexp(t, "^[0-9a-f]{64}$", control.lastRoleChange.PasswordSemanticToken)
+	require.Equal(t, "user-role:99:"+service.HashIdempotencyKey("role-key"), control.lastRoleChange.OperationID)
+	require.NotNil(t, control.lastRoleChange.Update.Username)
+	require.NotNil(t, control.lastRoleChange.Update.PasswordHash)
+	require.NotEqual(t, "replacement password", *control.lastRoleChange.Update.PasswordHash)
+	require.Contains(t, response.Body.String(), `"role":"admin"`)
+	require.Contains(t, response.Body.String(), `"username":"after"`)
+	require.NotContains(t, response.Body.String(), "replacement password")
+	require.NotContains(t, response.Body.String(), "password_hash")
+
+	replay := callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", body, "role-key")
+	require.Equal(t, http.StatusOK, replay.Code, replay.Body.String())
+	require.Equal(t, "true", replay.Header().Get("X-Idempotency-Replayed"))
+	require.Equal(t, 2, control.roleChangeCalls)
+
+	changedPassword := callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", `{"username":"after","password":"different replacement","role":"admin","concurrency":7}`, "role-key")
+	require.Equal(t, http.StatusConflict, changedPassword.Code, changedPassword.Body.String())
+	require.Contains(t, changedPassword.Body.String(), "IDEMPOTENCY_CONFLICT")
+
+	conflict := callAdminUserMutation(t, jwt, http.MethodPut, "/users/3001", `{"role":"user"}`, "role-key")
+	require.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+	require.Contains(t, conflict.Body.String(), "IDEMPOTENCY_CONFLICT")
 }
 
 func TestCloudflareUserValidationUsesExactFixedPointAndUnicodeBoundaries(t *testing.T) {
@@ -593,6 +778,79 @@ func TestHTTPControlPlaneUserCreateReplayVerifiesThePersistedCredential(t *testi
 	require.True(t, created.CheckPassword(password))
 }
 
+func TestHTTPControlPlaneRoleChangeForwardsJWTSessionAndReadsBackPublicShape(t *testing.T) {
+	credential := &service.User{}
+	require.NoError(t, credential.SetPassword("role wire password"))
+	var roleRequest map[string]any
+	roleWire := func(passwordHash *string) map[string]any {
+		user := managedUserTestWire("7301", "promoted", "2500000", "2026-09-09T00:01:00Z", passwordHash)
+		user["role"] = service.RoleAdmin
+		return user
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/manage/users/role-change":
+			require.Equal(t, http.MethodPost, request.Method)
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&roleRequest))
+			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
+				"user": roleWire(nil), "replayed": true,
+			}))
+		case "/v1/manage/users/get":
+			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{"user": roleWire(nil)}))
+		case "/v1/private/auth-users/get":
+			auth := roleWire(&credential.PasswordHash)
+			delete(auth, "notes")
+			delete(auth, "deleted_at")
+			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{"user": auth}))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	control, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	username := "promoted"
+	result, err := control.ChangeManagedUserRole(context.Background(), ManagedUserRoleChange{
+		OperationID: "user-role:99:wire", ActorUserID: 99, ActorSession: "jwt-session-99",
+		TargetUserID: 7301, NewRole: service.RoleAdmin,
+		PasswordSemanticToken: strings.Repeat("a", 64),
+		Update:                ManagedUserUpdate{Username: &username, PasswordHash: &credential.PasswordHash},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Replayed)
+	require.Equal(t, service.RoleAdmin, result.User.Role)
+	require.Equal(t, "promoted", result.User.Username)
+	require.True(t, result.User.CheckPassword("role wire password"))
+	require.Equal(t, map[string]any{
+		"operation_id":             "user-role:99:wire",
+		"actor_user_id":            "99",
+		"actor_auth_method":        service.AuditAuthMethodJWT,
+		"actor_session_id":         "jwt-session-99",
+		"id":                       "7301",
+		"role":                     service.RoleAdmin,
+		"username":                 "promoted",
+		"password_hash":            credential.PasswordHash,
+		"password_semantic_digest": strings.Repeat("a", 64),
+	}, roleRequest)
+}
+
+func TestCloudflareRolePasswordSemanticTokenIsStableAndOperationScoped(t *testing.T) {
+	first, err := cloudflareRolePasswordSemanticToken("user-role:7:first", "same password")
+	require.NoError(t, err)
+	replay, err := cloudflareRolePasswordSemanticToken("user-role:7:first", "same password")
+	require.NoError(t, err)
+	changed, err := cloudflareRolePasswordSemanticToken("user-role:7:first", "changed password")
+	require.NoError(t, err)
+	otherOperation, err := cloudflareRolePasswordSemanticToken("user-role:7:second", "same password")
+	require.NoError(t, err)
+	require.Regexp(t, "^[0-9a-f]{64}$", first)
+	require.Equal(t, first, replay)
+	require.NotEqual(t, first, changed)
+	require.NotEqual(t, first, otherOperation)
+}
+
 func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		require.Equal(t, "/v1/manage/users/balance-adjust", request.URL.Path)
@@ -623,4 +881,5 @@ func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
 var _ ControlPlane = (*adminUserControlStub)(nil)
 var _ AdminListControlPlane = (*adminUserControlStub)(nil)
 var _ AdminUserMutationControlPlane = (*adminUserControlStub)(nil)
+var _ AdminUserRoleControlPlane = (*adminUserControlStub)(nil)
 var _ AdminBalanceHistoryControlPlane = (*adminUserControlStub)(nil)

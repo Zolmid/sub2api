@@ -58,6 +58,7 @@ The v1 operations are:
 | Release lease | Account business DO removes a matching lease | Repeated release is safe; stale owner or epoch cannot release a newer lease |
 | TOTP setup/login/disable | D1 owns the encrypted TOTP envelope and revision; the user-keyed `TOTPSecurityDO` owns short-lived challenges and attempt state | Setup/login tokens are stored only as hashes; setup completion is replay-safe and every D1 mutation is revision-guarded |
 | TOTP step-up | The user-keyed `TOTPSecurityDO` verifies a code and records a short-lived grant for the current JWT session hash | The grant must match user, session hash, non-expired revision, and current enabled TOTP state |
+| Administrator role change | Go verifies JWT/TOTP policy; the Worker rechecks the exact user/session grant and atomically writes the D1 user, management operation, and immutable audit row | Actor-scoped idempotency fingerprint covers target, role, and every supplied patch field; a guarded predicate preserves at least one live administrator |
 
 The Go lease keeper renews at one third of the lease TTL. Cloudflare-marked
 upstream contexts preserve cancellation through the original forwarding code;
@@ -72,6 +73,7 @@ canceled. Traditional requests retain their previous detached-context behavior.
 | Completion events, outbox, usage records and future ledger entries | D1 | Durable idempotency and reconciliation; monetary values use fixed-point integers or exact decimal text, never `REAL` |
 | Per-account active leases, concurrency, cooldown, refresh version | `AccountLeaseDO`, keyed only by account ID | One serialization authority even when the account belongs to multiple groups |
 | TOTP challenges, attempt lockout, and step-up grants | `TOTPSecurityDO`, keyed only by user ID | One serialization authority per user; only token/session hashes and bounded expiries persist in DO SQLite |
+| Administrator role-change audit | D1 `admin_role_change_audit` | Minimal durable actor/target/old/new-role facts; update/delete triggers make records append-only |
 | Container process routing/lifecycle | Container SDK lifecycle Durable Object | Infrastructure lifecycle only; it never owns account/business coordination |
 | Rebuildable, non-sensitive aliases or display/config snapshots | KV | Staleness is acceptable and every security decision can fall back to D1 |
 | Usage settlement/projection delivery | Queue, sourced from the D1 outbox | Delivery is at least once; the D1 consumer transaction owns dedupe plus effect |
@@ -123,6 +125,30 @@ is a declared architecture decision, not an implicit substitution.
    setup, login, step-up, and attempt state in the DO. Expiry alarms perform the
    same cleanup for abandoned transient rows.
 
+## Administrator role-change flow
+
+1. The existing admin user-edit UI detects an actual role difference, obtains a
+   session-bound TOTP step-up grant, and sends a stable idempotency key plus an
+   explicit role-operation marker. Ordinary profile edits and neutral same-role
+   fields retain their existing non-step-up path.
+2. Go admits only a live administrator authenticated by JWT, rejects
+   administrator API keys, confirms enabled TOTP and the current session grant,
+   and derives an operation ID scoped to the actor. A password patch is reduced
+   to an operation-salted Argon2id semantic token before the private call; the
+   plaintext never crosses into the Worker.
+3. The private Worker validates the exact field allowlist and rechecks the
+   actor/session grant against `TOTPSecurityDO`. It fingerprints actor, target,
+   requested role, every supplied patch field, and the password semantic token,
+   but never the randomized bcrypt hash, JWT, plaintext password, or raw
+   session ID.
+4. One D1 batch conditionally updates the user and inserts the idempotency
+   result plus immutable role audit. If the transition would demote or disable
+   the final live administrator, the guarded update affects zero rows and
+   returns `LAST_ADMIN_REQUIRED` without an operation or audit record.
+5. An identical retry returns the committed response with the replay marker.
+   Reusing the key with any changed actor, target, role, field, or password
+   returns an idempotency conflict.
+
 ## Atomicity and crash boundaries
 
 D1, a Durable Object, and a Queue do not share a distributed transaction.
@@ -164,6 +190,10 @@ Correctness is therefore expressed as recoverable state transitions:
   persists only purpose-bound ciphertext and revision state; the DO persists
   only hashes for disposable tokens and sessions. TOTP codes, plaintext
   secrets, temporary tokens, and token prefixes are excluded from logs.
+- Role mutation is the only management path that consumes a TOTP step-up grant.
+  It requires both the public JWT check and a private Worker recheck. Audit and
+  operation responses exclude session identifiers, passwords, bcrypt hashes,
+  and semantic tokens.
 - Container SIGTERM is handled with a bounded HTTP shutdown. Durable correctness
   does not depend on that grace period: pending admissions, leases, and outbox
   rows remain recoverable.

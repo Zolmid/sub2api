@@ -30,6 +30,13 @@ type AdminUserMutationControlPlane interface {
 	DeleteManagedUser(context.Context, string, int64) error
 }
 
+// AdminUserRoleControlPlane owns the privileged, session-bound role mutation
+// contract. Keeping it separate prevents an ordinary update adapter from
+// accidentally gaining a role-write path.
+type AdminUserRoleControlPlane interface {
+	ChangeManagedUserRole(context.Context, ManagedUserRoleChange) (*ManagedUserRoleChangeResult, error)
+}
+
 // AdminBalanceControlPlane is deliberately narrower than the legacy service:
 // the Worker owns the atomic D1 projection and immutable audit ledger.
 type AdminBalanceControlPlane interface {
@@ -51,6 +58,21 @@ type ManagedBalanceAdjustmentResult struct {
 	BalanceAfterMicroUSD  string
 	DeltaMicroUSD         string
 	Replayed              bool
+}
+
+type ManagedUserRoleChange struct {
+	OperationID           string
+	ActorUserID           int64
+	ActorSession          string
+	TargetUserID          int64
+	NewRole               string
+	PasswordSemanticToken string
+	Update                ManagedUserUpdate
+}
+
+type ManagedUserRoleChangeResult struct {
+	User     *service.User
+	Replayed bool
 }
 
 // ManagedUserUpdate contains only fields owned by the current Worker schema.
@@ -111,6 +133,71 @@ func (h *cloudflareAdminAPIHandler) balances() (AdminBalanceControlPlane, error)
 		return nil, ErrNotMigrated
 	}
 	return control, nil
+}
+
+func (h *cloudflareAdminAPIHandler) roles() (AdminUserRoleControlPlane, error) {
+	control, ok := h.control.(AdminUserRoleControlPlane)
+	if !ok {
+		return nil, ErrNotMigrated
+	}
+	return control, nil
+}
+
+var (
+	errCloudflareRoleJWTRequired = infraerrors.Forbidden(
+		"STEP_UP_JWT_REQUIRED", "a JWT-authenticated administrator session is required",
+	)
+	errCloudflareRoleAPIKeyForbidden = infraerrors.Forbidden(
+		"STEP_UP_ADMIN_API_KEY_FORBIDDEN", "admin API keys cannot change administrator roles",
+	)
+	errCloudflareRoleSessionRequired = infraerrors.Unauthorized(
+		"STEP_UP_SESSION_REQUIRED", "session-bound authentication is required",
+	)
+	errCloudflareRoleTOTPRequired = infraerrors.Forbidden(
+		"STEP_UP_TOTP_NOT_ENABLED", "two-factor authentication must be enabled before changing administrator roles",
+	)
+	errCloudflareRoleStepUpRequired = infraerrors.Forbidden(
+		"STEP_UP_REQUIRED", "recent two-factor verification is required",
+	)
+	errCloudflareRoleStepUpUnavailable = infraerrors.ServiceUnavailable(
+		"STEP_UP_UNAVAILABLE", "step-up verification service unavailable",
+	)
+)
+
+func (h *cloudflareAdminAPIHandler) authorizeRoleChange(c *gin.Context) (int64, string, error) {
+	if c.GetString("auth_method") == service.AuditAuthMethodAdminAPIKey {
+		return 0, "", errCloudflareRoleAPIKeyForbidden
+	}
+	if c.GetString("auth_method") != service.AuditAuthMethodJWT {
+		return 0, "", errCloudflareRoleJWTRequired
+	}
+	subject, ok := middleware.GetAuthSubjectFromContext(c)
+	if !ok || subject.UserID < 1 {
+		return 0, "", errCloudflareRoleJWTRequired
+	}
+	sessionID := c.GetString(middleware.ContextKeySessionID)
+	if len(sessionID) < 8 || len(sessionID) > 128 {
+		return 0, "", errCloudflareRoleSessionRequired
+	}
+	totp, ok := h.control.(TOTPControlPlane)
+	if !ok {
+		return 0, "", errCloudflareRoleStepUpUnavailable
+	}
+	status, err := totp.GetTOTPStatus(c.Request.Context(), subject.UserID)
+	if err != nil || status == nil {
+		return 0, "", errCloudflareRoleStepUpUnavailable
+	}
+	if !status.Enabled {
+		return 0, "", errCloudflareRoleTOTPRequired
+	}
+	granted, err := totp.HasTOTPStepUp(c.Request.Context(), subject.UserID, sessionID)
+	if err != nil {
+		return 0, "", errCloudflareRoleStepUpUnavailable
+	}
+	if !granted {
+		return 0, "", errCloudflareRoleStepUpRequired
+	}
+	return subject.UserID, sessionID, nil
 }
 
 // UpdateBalance keeps the established public endpoint in Cloudflare mode. It
@@ -291,32 +378,82 @@ func (h *cloudflareAdminAPIHandler) UpdateUser(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
-	if request.Role != nil && *request.Role != before.Role {
-		response.Forbidden(c, "role changes require step-up authentication")
-		return
-	}
-	if before.Role == service.RoleAdmin && request.Status != nil && *request.Status == service.StatusDisabled {
-		response.Forbidden(c, "admin users cannot be disabled in Cloudflare mode")
+	roleChanged := request.Role != nil && *request.Role != before.Role
+	removesLiveAdmin := before.Role == service.RoleAdmin && before.Status == service.StatusActive &&
+		((request.Role != nil && *request.Role != service.RoleAdmin) ||
+			(request.Status != nil && *request.Status != service.StatusActive))
+	// A role-bearing retry can arrive after the committed role already matches.
+	// Keep no-key legacy no-ops on the ordinary path, but route keyed retries to
+	// the durable operation record so they return the original committed result.
+	keyedRoleOperation := request.Role != nil &&
+		strings.EqualFold(strings.TrimSpace(c.GetHeader("X-Sub2API-Role-Operation")), "true")
+	if roleChanged || removesLiveAdmin || keyedRoleOperation {
+		key, err := service.NormalizeIdempotencyKey(c.GetHeader("Idempotency-Key"))
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		if key == "" {
+			response.ErrorFrom(c, service.ErrIdempotencyKeyRequired)
+			return
+		}
+		actorID, sessionID, err := h.authorizeRoleChange(c)
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		update, ok := managedUserUpdateFromRequest(c, request)
+		if !ok {
+			return
+		}
+		roles, err := h.roles()
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		newRole := before.Role
+		if request.Role != nil {
+			newRole = *request.Role
+		}
+		operationID := "user-role:" + strconv.FormatInt(actorID, 10) + ":" + service.HashIdempotencyKey(key)
+		passwordSemanticToken := ""
+		if request.Password != nil {
+			passwordSemanticToken, err = cloudflareRolePasswordSemanticToken(operationID, *request.Password)
+			if err != nil {
+				response.ErrorFrom(c, err)
+				return
+			}
+		}
+		result, err := roles.ChangeManagedUserRole(c.Request.Context(), ManagedUserRoleChange{
+			OperationID:           operationID,
+			ActorUserID:           actorID,
+			ActorSession:          sessionID,
+			TargetUserID:          userID,
+			NewRole:               newRole,
+			PasswordSemanticToken: passwordSemanticToken,
+			Update:                update,
+		})
+		if err != nil {
+			response.ErrorFrom(c, mapManagedUserMutationError(err))
+			return
+		}
+		if result == nil || result.User == nil || result.User.ID != userID ||
+			result.User.Role != newRole || !matchesManagedUserPatch(result.User, update) ||
+			(request.Password != nil && !result.User.CheckPassword(*request.Password)) {
+			response.ErrorFrom(c, errors.New("invalid user role change response"))
+			return
+		}
+		result.User.PasswordHash = ""
+		if result.Replayed {
+			c.Header("X-Idempotency-Replayed", "true")
+		}
+		response.Success(c, newCloudflareAdminUserDTO(result.User))
 		return
 	}
 
-	update := ManagedUserUpdate{
-		Email:                request.Email,
-		Username:             request.Username,
-		Notes:                request.Notes,
-		Status:               request.Status,
-		Concurrency:          request.Concurrency,
-		RPMLimit:             request.RPMLimit,
-		AllowedGroups:        request.AllowedGroups,
-		RestrictPublicGroups: request.RestrictPublicGroups,
-	}
-	if request.Password != nil {
-		credential := &service.User{}
-		if err := credential.SetPassword(*request.Password); err != nil {
-			response.BadRequest(c, "Invalid password")
-			return
-		}
-		update.PasswordHash = &credential.PasswordHash
+	update, ok := managedUserUpdateFromRequest(c, request)
+	if !ok {
+		return
 	}
 	// A same-role field from the legacy full-form UI is neutral. Returning the
 	// fresh pre-read avoids a private no-op while never writing a stale role.
@@ -344,6 +481,28 @@ func (h *cloudflareAdminAPIHandler) UpdateUser(c *gin.Context) {
 	}
 	updated.PasswordHash = ""
 	response.Success(c, newCloudflareAdminUserDTO(updated))
+}
+
+func managedUserUpdateFromRequest(c *gin.Context, request cloudflareUserMutationRequest) (ManagedUserUpdate, bool) {
+	update := ManagedUserUpdate{
+		Email:                request.Email,
+		Username:             request.Username,
+		Notes:                request.Notes,
+		Status:               request.Status,
+		Concurrency:          request.Concurrency,
+		RPMLimit:             request.RPMLimit,
+		AllowedGroups:        request.AllowedGroups,
+		RestrictPublicGroups: request.RestrictPublicGroups,
+	}
+	if request.Password != nil {
+		credential := &service.User{}
+		if err := credential.SetPassword(*request.Password); err != nil {
+			response.BadRequest(c, "Invalid password")
+			return ManagedUserUpdate{}, false
+		}
+		update.PasswordHash = &credential.PasswordHash
+	}
+	return update, true
 }
 
 func (h *cloudflareAdminAPIHandler) DeleteUser(c *gin.Context) {
@@ -658,6 +817,37 @@ func cloudflareUserSemanticToken(operation string, user *service.User, balanceMi
 	return token, nil
 }
 
+// cloudflareRolePasswordSemanticToken lets the Worker distinguish a true
+// password change from a retry whose freshly generated bcrypt hash has a new
+// salt. The operation-scoped Argon2id token is never returned or written to an
+// audit row; D1 persists only the outer management-operation request hash.
+func cloudflareRolePasswordSemanticToken(operation, password string) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Password string `json:"password"`
+	}{Password: password})
+	if err != nil {
+		return "", err
+	}
+	salt := sha256.Sum256([]byte("sub2api:user-role:password-semantic:v1:" + operation))
+	derived := argon2.IDKey(encoded, salt[:], semanticTokenTime, semanticTokenMemoryKiB, semanticTokenThreads, 32)
+	token := hex.EncodeToString(derived)
+	clear(encoded)
+	clear(derived)
+	return token, nil
+}
+
+func isLowerHexDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func (update ManagedUserUpdate) empty() bool {
 	return update.Email == nil && update.Username == nil && update.Notes == nil &&
 		update.Status == nil && update.Concurrency == nil && update.RPMLimit == nil &&
@@ -746,6 +936,20 @@ func mapManagedUserMutationError(err error) error {
 		return infraerrors.Conflict("GROUP_REFERENCED", "allowed group is unavailable")
 	case "ROLE_PROTECTED":
 		return infraerrors.Forbidden("ADMIN_ROLE_PROTECTED", "admin users cannot be disabled or deleted in Cloudflare mode")
+	case "LAST_ADMIN_REQUIRED":
+		return infraerrors.Conflict("LAST_ADMIN_REQUIRED", "at least one live administrator must remain")
+	case "STEP_UP_ADMIN_API_KEY_FORBIDDEN":
+		return errCloudflareRoleAPIKeyForbidden
+	case "STEP_UP_JWT_REQUIRED":
+		return errCloudflareRoleJWTRequired
+	case "STEP_UP_SESSION_REQUIRED":
+		return errCloudflareRoleSessionRequired
+	case "STEP_UP_TOTP_NOT_ENABLED", "TOTP_NOT_SETUP":
+		return errCloudflareRoleTOTPRequired
+	case "STEP_UP_REQUIRED":
+		return errCloudflareRoleStepUpRequired
+	case "STEP_UP_UNAVAILABLE", "TOTP_UNAVAILABLE":
+		return errCloudflareRoleStepUpUnavailable
 	case "IDEMPOTENCY_CONFLICT":
 		return infraerrors.Conflict("IDEMPOTENCY_CONFLICT", "idempotency key was reused with a different user payload")
 	case "BALANCE_NEGATIVE":
@@ -842,6 +1046,53 @@ func (c *HTTPControlPlane) UpdateManagedUser(
 		return nil, errors.New("invalid user update credential readback")
 	}
 	return readback.user, nil
+}
+
+func (c *HTTPControlPlane) ChangeManagedUserRole(
+	ctx context.Context,
+	change ManagedUserRoleChange,
+) (*ManagedUserRoleChangeResult, error) {
+	if change.ActorUserID < 1 || change.TargetUserID < 1 ||
+		(change.NewRole != service.RoleUser && change.NewRole != service.RoleAdmin) ||
+		len(change.ActorSession) < 8 || len(change.ActorSession) > 128 ||
+		(change.Update.PasswordHash != nil) != (change.PasswordSemanticToken != "") ||
+		(change.PasswordSemanticToken != "" && !isLowerHexDigest(change.PasswordSemanticToken)) {
+		return nil, ErrNotMigrated
+	}
+	request := managedUserPatchRequest(change.OperationID, change.TargetUserID, change.Update)
+	request["actor_user_id"] = strconv.FormatInt(change.ActorUserID, 10)
+	request["actor_auth_method"] = service.AuditAuthMethodJWT
+	request["actor_session_id"] = change.ActorSession
+	request["role"] = change.NewRole
+	if change.PasswordSemanticToken != "" {
+		request["password_semantic_digest"] = change.PasswordSemanticToken
+	}
+	var result managedUserMutationResponse
+	if err := c.postManagedMutation(ctx, "/v1/manage/users/role-change", request, &result); err != nil {
+		return nil, err
+	}
+	if result.leaksCredential() {
+		return nil, errors.New("invalid user role change response: credential material")
+	}
+	updated, deleted, err := decodeManagedUser(result.User)
+	if err != nil || deleted || updated.ID != change.TargetUserID ||
+		updated.Role != change.NewRole || !matchesManagedUserPatch(updated, change.Update) {
+		return nil, errors.New("invalid user role change response")
+	}
+	readback, err := c.readManagedUserIncludingTombstone(ctx, change.TargetUserID)
+	if err != nil || readback.deleted || readback.user.Role != change.NewRole ||
+		!matchesManagedUserPatch(readback.user, change.Update) {
+		return nil, errors.New("invalid user role change readback")
+	}
+	auth, err := c.GetAuthUserByID(ctx, change.TargetUserID)
+	if err != nil || attachManagedUserCredential(readback.user, auth) != nil {
+		return nil, errors.New("invalid user role change auth readback")
+	}
+	if change.Update.PasswordHash != nil && !result.Replayed &&
+		readback.user.PasswordHash != *change.Update.PasswordHash {
+		return nil, errors.New("invalid user role change credential readback")
+	}
+	return &ManagedUserRoleChangeResult{User: readback.user, Replayed: result.Replayed}, nil
 }
 
 func (c *HTTPControlPlane) DeleteManagedUser(ctx context.Context, operation string, userID int64) error {
@@ -961,6 +1212,7 @@ func managedUserGroupIDs(values []int64) []string {
 }
 
 var _ AdminUserMutationControlPlane = (*HTTPControlPlane)(nil)
+var _ AdminUserRoleControlPlane = (*HTTPControlPlane)(nil)
 var _ AdminBalanceControlPlane = (*HTTPControlPlane)(nil)
 
 func (c *HTTPControlPlane) AdjustManagedUserBalance(ctx context.Context, adjustment ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error) {

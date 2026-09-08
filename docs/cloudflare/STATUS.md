@@ -46,6 +46,15 @@ Updated: 2026-09-09. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   step-up, disable, and direct-login restoration. This is composed HTTP and
   persisted-state evidence, not visual browser, remote, or production evidence.
 
+- Added Cloudflare-native administrator role promotion/demotion through the
+  existing user-edit contract. A real JWT session with enabled TOTP and a
+  current session-bound step-up grant is mandatory; administrator API keys
+  cannot use this path. D1 commits the guarded user patch, idempotency record,
+  and immutable role audit together, while an atomic predicate prevents
+  demoting or disabling the final live administrator. Local composed HTTP and
+  persisted-state gates passed; browser, remote, and production acceptance
+  remain separate.
+
 - Locked the upstream source, dependency/tool versions, license, and initial
   test results in `BASELINE.md`.
 - Audited the major PostgreSQL, Redis, process-local, filesystem, gateway,
@@ -109,10 +118,11 @@ Updated: 2026-09-09. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   checked again inside the mutation statement, user updates write only fields
   actually supplied, and deleting a non-admin user tombstones all live API keys
   in the same D1 batch.
-- Cloudflare mode intentionally rejects admin creation, role changes, balance
-  updates, disabling/deleting admins, disabled-user creation, and concurrency
-  zero. Those operations need the missing step-up/ledger policy rather than an
-  undeclared downgrade.
+- Cloudflare mode intentionally rejects direct admin creation, deleting admins,
+  disabled-user creation, concurrency zero, and balance writes outside the
+  dedicated audited endpoint. Role promotion/demotion and disabling an admin
+  now require an idempotency key plus a current TOTP step-up grant, and the
+  final live administrator cannot be removed.
 - Automated evidence passed in isolated layers: Go bridge tests and vet,
   workerd-backed Worker tests (8 files / 51 tests), frontend production build,
   typecheck, lint, full suite (254 files / 1865 tests), fresh/repeated D1
@@ -188,8 +198,7 @@ fail closed.
 ## Explicitly not complete
 
 This branch is not yet a full Sub2API Cloudflare migration. Account writes
-outside the bounded OpenAI API-key CRUD contract, user role mutations that
-consume the now-available step-up primitive, default subscriptions/default
+outside the bounded OpenAI API-key CRUD contract, default subscriptions/default
 balance, complete repositories, subscriptions,
 pricing, usage reservation and authoritative request settlement, multi-account
 scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
@@ -229,11 +238,10 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    surface; do not invent administrator CRUD routes absent from the upstream
    public contract. Keep OAuth/import/test/refresh/batch/export account
    operations fail-closed until separately designed and tested.
-3. Implement role promotion/demotion using the verified TOTP step-up primitive,
-   immutable audit, and atomic last-administrator protection. Extend the
-   now-verified manual
-   balance ledger into request reservation/settlement separately. Default
-   subscription and default-balance behavior must also be made explicit.
+3. Extend the now-verified manual balance ledger into exact request
+   reservation/settlement. Versioned pricing, reservation caps, default
+   subscription, and default-balance behavior must be explicit before gateway
+   billing is enabled.
 4. Expand account selection and policy state only after those durable CRUD
    contracts are stable. OAuth, payment, and background-job work remain stage D
    gates, not implied by CRUD success.
@@ -305,5 +313,48 @@ no D1 foreign-key violations. All credentials were synthetic local values and
 were not printed or retained in the repository.
 
 This lane has not been visually driven in Chromium. It also does not prove a
-remote Worker/D1/DO deployment, production secret provisioning, role mutation,
-durable email verification, or real-upstream behavior.
+remote Worker/D1/DO deployment, production secret provisioning, durable email
+verification, or real-upstream behavior.
+
+# 2026-09-09 — TOTP-gated administrator role changes (local verification)
+
+Cloudflare mode now preserves the existing administrator user-edit route for
+role promotion and demotion. The public Go boundary requires a real
+JWT-authenticated administrator, rejects administrator API keys, verifies that
+TOTP is enabled, and checks a current grant for the exact JWT session. The
+browser helper adds a stable actor/target/payload-scoped idempotency key only
+when the role actually changes; session storage retains no email, password, or
+credential digest.
+
+The private Worker route rechecks the user/session grant and commits the exact
+field patch, management operation, and `admin_role_change_audit` row in one D1
+batch. The audit table records only operation, actor, target, old/new role, and
+time, and update/delete triggers make it append-only. A guarded write requires
+another live administrator whenever a change would demote or disable the
+current final live administrator. Password-bearing retries fingerprint a
+slow, operation-salted semantic token rather than a randomized bcrypt hash;
+plaintext, session IDs, hashes, and semantic tokens are absent from audit and
+operation responses.
+
+Automated evidence passed 10 Worker files / 71 tests, Worker TypeScript and
+generated-type checks, the Go 1.27 Cloudflare bridge package and vet, the
+traditional TOTP service regression, three focused frontend files / 24 tests,
+frontend typecheck and targeted lint, and the complete frontend suite (257
+files / 1890 tests). A fresh canonical D1 chain applied migrations `0001`
+through `0007`, repeated with no pending migration, imported all eight fixture
+statements, and passed schema/readback and foreign-key checks. The offline
+first-admin inspect/apply/readback gate also passed against that chain.
+
+The real local Worker -> Go Container -> private Worker -> D1/DO flow then
+passed TOTP setup, 2FA login, session step-up, user creation, promotion,
+identical replay, changed-payload conflict, password-bearing demotion and
+replay, changed-password conflict, and final-administrator rejection. D1
+contained exactly one promotion and one demotion audit row, one operation per
+successful role change, no password/digest/session marker in persisted
+responses, exactly one live administrator, and no foreign-key violation. A
+production-config Wrangler 4.129.0 dry-run rebuilt the 210.53 KiB Worker
+(43.57 KiB gzip) and distroless Container image, then exited before deployment.
+
+All credentials and keys used by these gates were synthetic local values. This
+is not Chromium acceptance, remote Cloudflare/D1/DO deployment, production
+secret provisioning, or real-upstream evidence.

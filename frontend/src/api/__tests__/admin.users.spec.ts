@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { post } = vi.hoisted(() => ({
+const { post, put } = vi.hoisted(() => ({
   post: vi.fn(),
+  put: vi.fn(),
 }))
 
 vi.mock('@/api/client', () => ({
   apiClient: {
     post,
+    put,
   },
 }))
 
@@ -14,6 +16,7 @@ import {
   batchUpdateLimits,
   bindUserAuthIdentity,
   create,
+  update,
   updateBalance,
   type AdminBindAuthIdentityRequest,
   type AdminBoundAuthIdentity,
@@ -23,6 +26,11 @@ import {
 
 function idempotencyHeader(callIndex: number): string {
   const config = post.mock.calls[callIndex]?.[2] as { headers?: Record<string, string> } | undefined
+  return config?.headers?.['Idempotency-Key'] ?? ''
+}
+
+function roleIdempotencyHeader(callIndex: number): string {
+  const config = put.mock.calls[callIndex]?.[2] as { headers?: Record<string, string> } | undefined
   return config?.headers?.['Idempotency-Key'] ?? ''
 }
 
@@ -244,6 +252,69 @@ describe('admin users create idempotency', () => {
     expect(firstKey).toMatch(/^user-create-7004-/)
     expect(idempotencyHeader(1)).toMatch(/^user-create-7005-/)
     expect(idempotencyHeader(1)).not.toBe(firstKey)
+  })
+})
+
+describe('admin user role-change idempotency', () => {
+  beforeEach(() => {
+    put.mockReset()
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  it('keeps one role operation across step-up and clears it after success without storing user secrets', async () => {
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8201, role: 'admin' }))
+    const payload = {
+      email: 'role-target@example.test',
+      password: 'replacement password',
+      role: 'admin' as const,
+      concurrency: 2,
+    }
+    put.mockRejectedValueOnce({ status: 403, code: 'STEP_UP_REQUIRED' })
+    put.mockResolvedValueOnce({ data: { id: 81, role: 'admin' } })
+
+    await expect(update(81, payload, { roleOperation: true }))
+      .rejects.toMatchObject({ code: 'STEP_UP_REQUIRED' })
+    const firstKey = roleIdempotencyHeader(0)
+    const stored = sessionStorage.getItem('sub2api:admin:user-role:8201:81')
+    expect(firstKey).toMatch(/^user-role-8201-81-/)
+    expect(firstKey.length).toBeLessThanOrEqual(128)
+    expect(stored).not.toBeNull()
+    expect(stored).not.toContain(payload.password)
+    expect(stored).not.toContain(payload.email)
+    expect(put.mock.calls[0]?.[2]).toMatchObject({
+      headers: {
+        'Idempotency-Key': firstKey,
+        'X-Sub2API-Role-Operation': 'true',
+      },
+    })
+
+    await update(81, payload, { roleOperation: true })
+    expect(roleIdempotencyHeader(1)).toBe(firstKey)
+    expect(sessionStorage.getItem('sub2api:admin:user-role:8201:81')).toBeNull()
+  })
+
+  it('rotates the operation when a password changes after an ambiguous attempt in the same page', async () => {
+    localStorage.setItem('auth_user', JSON.stringify({ id: 8202, role: 'admin' }))
+    const payload = { role: 'admin' as const, password: 'first replacement' }
+    put.mockRejectedValueOnce({ status: 503 })
+    put.mockResolvedValueOnce({ data: { id: 82, role: 'admin' } })
+
+    await expect(update(82, payload, { roleOperation: true })).rejects.toMatchObject({ status: 503 })
+    const firstKey = roleIdempotencyHeader(0)
+    await update(82, { ...payload, password: 'second replacement' }, { roleOperation: true })
+
+    expect(roleIdempotencyHeader(1)).not.toBe(firstKey)
+    expect(sessionStorage.length).toBe(0)
+  })
+
+  it('leaves ordinary profile updates on the established unkeyed path', async () => {
+    put.mockResolvedValueOnce({ data: { id: 83, role: 'user' } })
+
+    await update(83, { username: 'ordinary' })
+
+    expect(put).toHaveBeenCalledWith('/admin/users/83', { username: 'ordinary' })
+    expect(sessionStorage.length).toBe(0)
   })
 })
 

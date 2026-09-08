@@ -19,6 +19,10 @@ export interface AdminUserCreateRequest {
   restrict_public_groups?: boolean
 }
 
+export interface AdminUserUpdateOptions {
+  roleOperation?: boolean
+}
+
 interface PendingUserCreateOperation {
   fullFingerprint: string
   nonsecretFingerprint: string
@@ -47,7 +51,15 @@ interface UserBalanceOperationScope {
   fingerprint: string
 }
 
+interface UserRoleOperationScope {
+  adminID: string
+  storageKey: string
+  fullFingerprint: string
+  nonsecretFingerprint: string
+}
+
 const pendingUserCreateOperations = new Map<string, PendingUserCreateOperation>()
+const pendingUserRoleOperations = new Map<string, PendingUserCreateOperation>()
 const pendingUserBalanceOperations = new Map<string, string>()
 let fallbackUserRequestSequence = 0
 
@@ -338,6 +350,45 @@ function isDefinitiveUserCreateFailure(error: unknown): boolean {
   return typeof status === 'number' && status >= 400 && status < 500 && status !== 408
 }
 
+async function userRoleOperationScope(
+  targetUserID: number,
+  updates: UpdateUserRequest
+): Promise<UserRoleOperationScope | null> {
+  const adminID = currentAdminID()
+  if (!adminID) return null
+  const nonsecret = Object.fromEntries(
+    Object.entries(updates).filter(([key]) => key !== 'password')
+  )
+  const [fullFingerprint, nonsecretFingerprint] = await Promise.all([
+    userPayloadFingerprint({ admin_id: adminID, target_user_id: targetUserID, updates }),
+    userPayloadFingerprint({ admin_id: adminID, target_user_id: targetUserID, updates: nonsecret })
+  ])
+  return {
+    adminID,
+    storageKey: `sub2api:admin:user-role:${adminID}:${targetUserID}`,
+    fullFingerprint,
+    nonsecretFingerprint
+  }
+}
+
+function clearUserRoleOperation(storageKey: string, idempotencyKey: string): void {
+  if (pendingUserRoleOperations.get(storageKey)?.idempotencyKey === idempotencyKey) {
+    pendingUserRoleOperations.delete(storageKey)
+  }
+  if (getStoredUserCreateOperation(storageKey)?.idempotencyKey === idempotencyKey) {
+    storeUserCreateOperation(storageKey, null)
+  }
+}
+
+function isDefinitiveUserRoleFailure(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const marker = [(error as { code?: unknown }).code, (error as { reason?: unknown }).reason]
+    .find(value => typeof value === 'string' && value.startsWith('STEP_UP'))
+  if (marker) return false
+  const status = balanceFailureStatus(error)
+  return status !== null && status >= 400 && status < 500 && status !== 408
+}
+
 async function userBalanceOperationScope(
   targetUserID: number,
   payload: { balance: number; operation: 'set' | 'add' | 'subtract'; notes: string }
@@ -412,9 +463,56 @@ function isDefinitiveUserBalanceFailure(error: unknown): boolean {
  * @param updates - Fields to update
  * @returns Updated user
  */
-export async function update(id: number, updates: UpdateUserRequest): Promise<AdminUser> {
-  const { data } = await apiClient.put<AdminUser>(`/admin/users/${id}`, updates)
-  return data
+export async function update(
+  id: number,
+  updates: UpdateUserRequest,
+  options?: AdminUserUpdateOptions
+): Promise<AdminUser> {
+  if (!options?.roleOperation) {
+    const { data } = await apiClient.put<AdminUser>(`/admin/users/${id}`, updates)
+    return data
+  }
+
+  const scope = await userRoleOperationScope(id, updates)
+  const inMemory = scope ? pendingUserRoleOperations.get(scope.storageKey) : null
+  const stored = scope ? getStoredUserCreateOperation(scope.storageKey) : null
+  let idempotencyKey: string | null = null
+  if (scope && inMemory?.fullFingerprint === scope.fullFingerprint) {
+    idempotencyKey = inMemory.idempotencyKey
+  } else if (scope && !inMemory && stored?.nonsecretFingerprint === scope.nonsecretFingerprint) {
+    idempotencyKey = stored.idempotencyKey
+  }
+  if (!idempotencyKey) {
+    idempotencyKey = `user-role-${scope?.adminID ?? 'unknown-admin'}-${id}-${newUserRequestID()}`
+  }
+  if (scope) {
+    const operation = {
+      fullFingerprint: scope.fullFingerprint,
+      nonsecretFingerprint: scope.nonsecretFingerprint,
+      idempotencyKey
+    }
+    pendingUserRoleOperations.set(scope.storageKey, operation)
+    storeUserCreateOperation(scope.storageKey, {
+      nonsecretFingerprint: operation.nonsecretFingerprint,
+      idempotencyKey: operation.idempotencyKey
+    })
+  }
+
+  try {
+    const { data } = await apiClient.put<AdminUser>(`/admin/users/${id}`, updates, {
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+        'X-Sub2API-Role-Operation': 'true'
+      }
+    })
+    if (scope) clearUserRoleOperation(scope.storageKey, idempotencyKey)
+    return data
+  } catch (error) {
+    if (scope && isDefinitiveUserRoleFailure(error)) {
+      clearUserRoleOperation(scope.storageKey, idempotencyKey)
+    }
+    throw error
+  }
 }
 
 /**

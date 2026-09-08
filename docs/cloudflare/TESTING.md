@@ -40,25 +40,27 @@ check passed. The package and both lockfiles therefore remain unchanged.
 
 | Scope | Command | Result |
 | --- | --- | --- |
-| Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, admin protection, field-level updates, and unrelated concurrent balance preservation. |
+| Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, field-level updates, role-operation JWT/TOTP authorization, password-semantic replay, final-admin protection, and unrelated concurrent balance preservation. |
 | TOTP/login/step-up bridge | `docker run ... golang:1.27 go test -tags unit ./internal/cloudflarebridge`; `go vet ./internal/cloudflarebridge`; `go test -tags unit ./internal/service -run Totp` | Passed. Tests cover password-gated setup/disable, strict setup token and code handling, 2FA challenge instead of premature JWT issuance, malformed/unknown/invalid challenge rejection, successful JWT/current-user flow, and JWT-session ID forwarding for step-up. The traditional focused tests cover the only legacy-path change, which redacts token prefixes from logs. |
 | TOTP frontend compatibility | Run the existing login modal, login form, profile TOTP/timer, step-up composable, auth store, and profile view Vitest files | Passed: 6 files / 41 tests. The intentionally corrupt-localStorage case emits its expected parse warning; no TOTP assertion failed. |
+| Admin role frontend compatibility | Run the admin users API retry tests, `useStepUp`, and `UserEditModal` tests; then frontend typecheck, targeted ESLint, and the complete Vitest suite | Passed: 3 focused files / 24 tests, typecheck, targeted lint, and 257 files / 1890 tests. Stable role-operation keys survive step-up/ambiguous failures without retaining email/password, while ordinary same-role profile edits stay unkeyed and do not prompt for step-up. |
 | Admin API-key group rebind | `docker run --rm -v <clean-checkout>:/src -w /src/backend golang:1.27-alpine /usr/local/go/bin/go test -tags=unit ./internal/cloudflarebridge`; focused frontend Vitest; frontend typecheck and ESLint | Passed. Coverage includes admin auth, strict JSON, unsafe decimal IDs, the dedicated private route/body, owner-scoped key listing with browser-timezone compatibility, response validation and key non-disclosure, Cloudflare-only selector filtering, traditional selector preservation, and large string-ID forwarding. |
-| Frontend API and Cloudflare account console | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 257 test files / 1884 tests, typecheck, read-only lint, and production build. The five focused account API/create/edit/filter/list files passed 106 tests. Cloudflare mode exposes only the implemented OpenAI API-key fields/actions while traditional requests and UI branches retain their existing behavior. |
-| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` | Passed: generated types current, `tsc --noEmit`, and 9 test files / 66 tests. In addition to rebind/account/balance coverage, TOTP cases enforce purpose-bound encryption, revision guards, setup replay including D1-before-DO crash recovery, one-time challenges, attempt lockout, expiry/alarm cleanup, session-bound step-up, disable cleanup, malformed keys, and strict private routing. Published Container package sourcemap warnings remain non-fatal. |
-| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0006` applied and all 8 corrected fixture statements succeeded with non-empty management timestamps and valid fixture identities. Worker tests load only strict canonical migration filenames and reject duplicate migration numbers. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
-| Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
+| Frontend API and Cloudflare account console | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 257 test files / 1890 tests, typecheck, read-only lint, and production build. The five focused account API/create/edit/filter/list files passed 106 tests. Cloudflare mode exposes only the implemented OpenAI API-key fields/actions while traditional requests and UI branches retain their existing behavior. |
+| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` | Passed: generated types current, `tsc --noEmit`, and 10 test files / 71 tests. In addition to rebind/account/balance coverage, TOTP cases enforce purpose-bound encryption, revision guards, setup replay including D1-before-DO crash recovery, one-time challenges, attempt lockout, expiry/alarm cleanup, and session-bound step-up. Role cases enforce exact authorization, semantic replay/conflict, combined patches, immutable audit rows, and concurrent final-admin protection. Published Container package sourcemap warnings remain non-fatal. |
+| D1 migration | Apply all canonical migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0007` applied, repeated with no pending migration, and all 8 corrected fixture statements succeeded. Readback found the role-audit table, index, both immutability triggers, exact migration history, valid fixture identities, and no foreign-key violation. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
+| Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed against the canonical `0001`-`0007` chain: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
 | Local composed API runtime | Start Wrangler 4.129.0 with the fresh D1 state and local-only secrets, then drive the embedded console and admin/user/key HTTP lifecycle | Passed: console/CSP nonce 200, admin login 200, create/replay 200 with one ID, semantic conflict 409, update and updated-password login 200, normalized-email conflict 409, API-key create and fixture gateway request 200, delete 200, then deleted-user login/key 401 and admin read 404. D1 readback confirmed both tombstones and no foreign-key violations. |
 | Local composed TOTP runtime | Start Wrangler with fresh `0001`-`0006` D1 state and synthetic local secrets, then drive the public auth/TOTP APIs through the real Go Container and inspect D1/DO state | Passed: wrong setup password rejected; setup and enable 200; enabled password login returned a challenge without a JWT; invalid code rejected; valid 2FA login 200; challenge replay 400; session-bound step-up 200; wrong disable password rejected; disable 200; direct login restored. Enabled D1 held only the TOTP envelope/revision, final D1 had no envelope at revision 2, transient DO tables were empty, and foreign-key check returned no rows. |
+| Local composed role runtime | Start Wrangler with a fresh canonical `0001`-`0007` D1 state and synthetic local secrets, bootstrap one admin, then drive public auth/TOTP/admin APIs and inspect D1 | Passed: TOTP enable, 2FA login, session step-up, ordinary user create, promotion, exact replay, changed-payload conflict, password-bearing demotion/replay, changed-password conflict, and final-admin rejection all matched the contract. D1 had exactly two role audit rows, one operation per successful role transition, no credential/digest/session marker in stored responses, one live admin, and no foreign-key violation. |
 | Local embedded-browser rebind | Drive the embedded console in real Chromium against local Wrangler/Container/D1 state, then reload and query D1 directly | Passed after reproducing the former 404 and correcting the GET client's automatic `timezone` parameter. The modal showed the truthful current group, exposed only active standard OpenAI groups, hid disabled/unbind choices, completed GET/GET/PUT with 200, showed the exclusive-grant notification, and retained the new group after reload. D1 readback confirmed key `3001` -> group `2002` and one copy each of allowed groups `2001` and `2002`. |
 | Local embedded-browser account CRUD | Drive the bounded account list/detail/create/edit/toggle/delete console in real Chromium at `507a64cf6`, inspect its fetch traffic, and query persisted D1 state | Passed. List and detail accepted the shared `timezone` parameter; create, omitted-key edit, credential replacement, status/scheduling toggles, and delete returned 200. The corrected create made no unsupported Antigravity mapping, TLS, quota, or Web Search request, and account responses disclosed no credential fields. D1 showed both exercised accounts disabled, unschedulable, tombstoned, AES-GCM-enveloped, and group-linked, with 2 create, 3 update, and 2 delete operation rows and no foreign-key violations. |
 | Local embedded-browser balance/history | Drive add and refund actions plus the history modal in real Chromium at `1e9ca8f70`, inspect fetch traffic, and query persisted D1 state | Passed. Fixture users rendered; starting balance 1.00 became 2.25 after +1.25 and 2.00 after -0.25. Both POSTs and both history GETs returned 200. Reopened history was newest-first with both notes, current balance 2.00, and total recharged 1.25. D1 matched both guarded transitions and two operation rows; immutable-ledger triggers existed and foreign-key check was empty. |
 | Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
-| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the final TOTP crash-window correction: 201.56 KiB Worker upload / 42.27 KiB gzip, generated production D1/KV/Queue/Container plus `TOTP_SECURITY` bindings, rebuilt the embedded Go service, and exported the distroless Container image. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the role-management increment: 210.53 KiB Worker upload / 43.57 KiB gzip, generated production D1/KV/Queue/Container plus `TOTP_SECURITY` bindings, rebuilt the embedded Go service, and exported the distroless Container image. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
 
-The composed API and TOTP rows are HTTP harnesses; the bounded rebind, account
-CRUD, and balance rows are real Chromium interactions. None claims broad
-console, remote Cloudflare, real-upstream, or production acceptance.
+The composed API, TOTP, and role rows are HTTP harnesses; the bounded rebind,
+account CRUD, and balance rows are real Chromium interactions. None claims
+broad console, remote Cloudflare, real-upstream, or production acceptance.
 
 ## Baseline regression
 
@@ -122,8 +124,8 @@ pnpm exec wrangler d1 execute sub2api-cloudflare-local --local \
 ```
 
 Current result: frozen install passed the lockfile supply-chain policy;
-generated types were current; `tsc --noEmit` passed; and Vitest passed 9 files /
-66 tests. The package's published sourcemaps reference missing source files and
+generated types were current; `tsc --noEmit` passed; and Vitest passed 10 files /
+71 tests. The package's published sourcemaps reference missing source files and
 produce warnings, but no test failure. The latest production-config dry-run is
 recorded in the acceptance table above.
 
@@ -154,6 +156,9 @@ Required unit/integration assertions include:
   login challenges, bounded attempts and lockout across DO eviction, alarm
   expiry, revision invalidation, JWT-session-bound step-up, disable cleanup,
   and missing/malformed encryption-key failure.
+- administrator role-change authorization, exact user/session grant recheck,
+  semantic replay/conflict for password-bearing patches, immutable minimal
+  audit rows, and concurrent final-live-admin protection.
 
 Pure Vitest/miniflare evidence and a real local `wrangler dev` process are
 reported separately because mocked bindings cannot prove Container routing or
@@ -331,3 +336,38 @@ step-up, wrong-password disable, successful disable, and post-disable login.
 The final state had no transient TOTP rows and no foreign-key violations. No
 browser automation, remote resources, real upstream, or production secret was
 used for this lane.
+
+# Administrator role-management lane (2026-09-09)
+
+The Worker role suite runs on migration
+`0007_admin_role_management.sql` after the canonical prior migrations. It
+checks promotion/demotion, same-operation replay, changed actor/target/role/
+field/password conflict, exact private request allowlists, user and session
+step-up matching, append-only audit triggers, no-op behavior, and two concurrent
+attempts that would otherwise remove every live administrator. The raw session
+ID is deliberately outside the operation fingerprint; every retry must still
+hold a current grant for whichever session submits it.
+
+The Go bridge tests cover the public `PUT /api/v1/admin/users/:id` split:
+ordinary field or same-role edits stay on the existing path, while role changes
+and live-admin removal require a normalized idempotency key, JWT auth, enabled
+TOTP, and a current grant for the JWT session. Administrator API keys fail
+closed. Password-bearing operations use an operation-salted Argon2id semantic
+token for stable equality across fresh bcrypt hashes, and the public bridge
+still verifies the returned hash against the submitted plaintext before
+discarding it.
+
+The frontend tests prove the modal requests step-up only for an actual role
+change and that retries reuse a stable actor/target/payload-scoped operation
+across step-up, timeout, network, and server failures. Only hashes and the
+idempotency key may enter session storage; password and email remain
+memory-only. The complete 257-file / 1890-test frontend suite passed after the
+focused role tests.
+
+The composed runtime used fresh canonical migrations, an offline synthetic
+first administrator, and local-only keys. Twelve public-flow assertions passed
+through Worker -> Go Container -> private Worker -> D1/DO. Direct D1 readback
+found exactly the successful promotion and demotion audits, exactly one live
+administrator, no password/digest/session marker in role-operation responses,
+and no foreign-key violation. The temporary harness was removed. No browser,
+remote resource, real upstream, or production credential was used.

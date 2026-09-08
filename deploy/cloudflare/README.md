@@ -12,8 +12,9 @@ Stage C adds a private management protocol for the Go Cloudflare adapter. It is
 not a public API: every call is `POST` to `sub2api.internal`, with
 `X-Sub2API-Bridge-Version: 2026-09-06.v1` and a Container identity header.
 The explicit routes are `/v1/manage/{users,groups,api-keys,accounts}/{create,get,list,update,delete}`;
-API keys also provide `revoke` and `rotate`. This slice accepts only `user` and
-`admin` roles, `openai` groups with `standard` subscription type, and upstream
+API keys also provide `revoke` and `rotate`, and administrator role changes use
+`/v1/manage/users/role-change`. This slice accepts only `user` and `admin`
+roles, `openai` groups with `standard` subscription type, and upstream
 accounts whose type is `apikey` and platform is `openai`. Accounts remain bound to groups by
 the existing `account_groups` table, and admission continues selecting from
 the key's group-bound account candidates. There is no per-API-key account
@@ -59,6 +60,23 @@ revision change invalidates old login challenges and step-up grants. Production
 and local runtime startup therefore also require a valid base64-encoded
 32-byte `CREDENTIAL_ENCRYPTION_KEY`; keep it in Worker secrets or the ignored
 local `.dev.vars`, never in Wrangler `vars`.
+
+Administrator promotion/demotion remains on the existing public
+`PUT /api/v1/admin/users/:id` route. A real administrator JWT, enabled TOTP,
+and a current step-up grant for that JWT session are required; administrator
+API keys are rejected. The frontend marks only actual role changes and keeps a
+stable actor/target/payload-scoped idempotency key across step-up or ambiguous
+retry failures. Password-bearing retries use an operation-salted semantic
+digest so fresh bcrypt hashes do not break replay, while plaintext passwords,
+JWTs, session IDs, bcrypt hashes, and semantic digests are excluded from audit
+and operation responses.
+
+D1 migration `0007_admin_role_management.sql` adds the append-only
+`admin_role_change_audit` table. The private Worker rechecks the exact
+user/session grant and atomically commits the user patch, operation response,
+and minimal actor/target/old/new-role audit row. The guarded update refuses to
+demote or disable the final live administrator. Direct admin creation and
+deletion remain unavailable in Cloudflare mode.
 
 Run source checks from this directory:
 

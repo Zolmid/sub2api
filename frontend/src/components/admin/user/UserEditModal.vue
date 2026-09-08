@@ -78,7 +78,7 @@
     </template>
   </BaseDialog>
 
-  <!-- 角色提升为管理员时后端要求 step-up 2FA，弹出 TOTP 验证后自动重试 -->
+  <!-- 管理员角色变更要求 step-up 2FA，弹出 TOTP 验证后自动重试 -->
   <TotpStepUpDialog :controller="stepUp" />
 </template>
 
@@ -151,8 +151,12 @@ const handleUpdateUser = async () => {
   try {
     const data: any = { email: form.email, username: form.username, notes: form.notes, role: form.role, concurrency: form.concurrency, rpm_limit: form.rpm_limit }
     if (form.password.trim()) data.password = form.password.trim()
-    // 提升为管理员属敏感操作：后端返回 STEP_UP_REQUIRED 时弹 TOTP 验证并重试
-    await stepUp.run(() => adminAPI.users.update(userId, data))
+    // 角色提升或降级属于敏感操作；显式标记让一次模糊成功后的重试
+    // 仍进入服务端持久化幂等记录，而普通资料编辑不额外要求 step-up。
+    const roleOperation = form.role !== props.user.role
+    await stepUp.run(() => roleOperation
+      ? adminAPI.users.update(userId, data, { roleOperation: true })
+      : adminAPI.users.update(userId, data))
     if (Object.keys(form.customAttributes).length > 0) await adminAPI.userAttributes.updateUserAttributeValues(userId, form.customAttributes)
     appStore.showSuccess(t('admin.users.userUpdated'))
     emit('success'); emit('close')

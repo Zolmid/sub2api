@@ -21,6 +21,68 @@ function allowedUpstreamHosts(env: CredentialRuntime): string[] {
     );
 }
 
+const TOTP_ENVELOPE_PREFIX = "aes-gcm:v1:totp:";
+
+function encodeBase64(value: Uint8Array): string {
+  return btoa(String.fromCharCode(...value));
+}
+
+export async function encryptTOTPSecret(
+  secret: string,
+  env: Pick<CredentialRuntime, "CREDENTIAL_ENCRYPTION_KEY">,
+): Promise<string | null> {
+  if (!/^[A-Z2-7]{32}$/.test(secret)) return null;
+  const key = await encryptionKey(env as CredentialRuntime);
+  if (!key) return null;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  try {
+    const ciphertext = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        additionalData: new TextEncoder().encode("sub2api:totp:v1"),
+      },
+      key,
+      new TextEncoder().encode(secret),
+    );
+    return TOTP_ENVELOPE_PREFIX + encodeBase64(iv) + ":" +
+      encodeBase64(new Uint8Array(ciphertext));
+  } catch {
+    return null;
+  }
+}
+
+export async function decryptTOTPSecret(
+  envelope: string,
+  env: Pick<CredentialRuntime, "CREDENTIAL_ENCRYPTION_KEY">,
+): Promise<string | null> {
+  if (!envelope.startsWith(TOTP_ENVELOPE_PREFIX)) return null;
+  const parts = envelope.split(":");
+  if (parts.length !== 5 || parts.slice(0, 3).join(":") !== "aes-gcm:v1:totp") {
+    return null;
+  }
+  const key = await encryptionKey(env as CredentialRuntime);
+  if (!key) return null;
+  try {
+    const iv = decodeBase64(parts[3]);
+    const ciphertext = decodeBase64(parts[4]);
+    if (iv.byteLength !== 12 || ciphertext.byteLength < 32) return null;
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        additionalData: new TextEncoder().encode("sub2api:totp:v1"),
+      },
+      key,
+      ciphertext,
+    );
+    const secret = new TextDecoder().decode(plaintext);
+    return /^[A-Z2-7]{32}$/.test(secret) ? secret : null;
+  } catch {
+    return null;
+  }
+}
+
 function hostMatches(pattern: string, hostname: string): boolean {
   if (pattern.startsWith("*.")) {
     const suffix = pattern.slice(2);

@@ -4,7 +4,7 @@ This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.
 
-Verified date: 2026-09-08. Commands below are run from the locked checkout.
+Verified date: 2026-09-09. Commands below are run from the locked checkout.
 
 ## Current stage C management increments
 
@@ -41,21 +41,24 @@ check passed. The package and both lockfiles therefore remain unchanged.
 | Scope | Command | Result |
 | --- | --- | --- |
 | Go user-management bridge | `cd backend && go test ./internal/cloudflarebridge` and `go vet ./internal/cloudflarebridge` under `golang:1.27.0-alpine` | Passed. Tests include HTTP contract validation, create replay across fresh IDs and bcrypt hashes, credential non-disclosure/readback, exact balance conversion, Unicode password limits, admin protection, field-level updates, and unrelated concurrent balance preservation. |
+| TOTP/login/step-up bridge | `docker run ... golang:1.27 go test -tags unit ./internal/cloudflarebridge`; `go vet ./internal/cloudflarebridge`; `go test -tags unit ./internal/service -run Totp` | Passed. Tests cover password-gated setup/disable, strict setup token and code handling, 2FA challenge instead of premature JWT issuance, malformed/unknown/invalid challenge rejection, successful JWT/current-user flow, and JWT-session ID forwarding for step-up. The traditional focused tests cover the only legacy-path change, which redacts token prefixes from logs. |
+| TOTP frontend compatibility | Run the existing login modal, login form, profile TOTP/timer, step-up composable, auth store, and profile view Vitest files | Passed: 6 files / 41 tests. The intentionally corrupt-localStorage case emits its expected parse warning; no TOTP assertion failed. |
 | Admin API-key group rebind | `docker run --rm -v <clean-checkout>:/src -w /src/backend golang:1.27-alpine /usr/local/go/bin/go test -tags=unit ./internal/cloudflarebridge`; focused frontend Vitest; frontend typecheck and ESLint | Passed. Coverage includes admin auth, strict JSON, unsafe decimal IDs, the dedicated private route/body, owner-scoped key listing with browser-timezone compatibility, response validation and key non-disclosure, Cloudflare-only selector filtering, traditional selector preservation, and large string-ID forwarding. |
 | Frontend API and Cloudflare account console | `cd frontend && pnpm run test:run`, `pnpm run typecheck`, `pnpm run lint:check`, and `pnpm run build` | Passed: 257 test files / 1884 tests, typecheck, read-only lint, and production build. The five focused account API/create/edit/filter/list files passed 106 tests. Cloudflare mode exposes only the implemented OpenAI API-key fields/actions while traditional requests and UI branches retain their existing behavior. |
-| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` with Wrangler 4.129.0 | Passed through `1e9ca8f70`: generated types current, `tsc --noEmit`, and 8 test files / 61 tests. In addition to rebind/account coverage, balance cases enforce exact BigInt microusd arithmetic, replay/conflict, zero-row rollback, bounds, immutable rows, exact history types, and safe decimal-string projections. Missing source files referenced by published Container package sourcemaps remain warning-only. |
-| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0005` applied, the second run reported no pending migrations, and all 8 corrected fixture statements succeeded with non-empty management timestamps and valid fixture identities. Worker tests consume only tracked migrations. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
+| Worker control plane | `cd deploy/cloudflare && pnpm exec wrangler types --check`, `pnpm run check`, and `pnpm test` | Passed: generated types current, `tsc --noEmit`, and 9 test files / 66 tests. In addition to rebind/account/balance coverage, TOTP cases enforce purpose-bound encryption, revision guards, setup replay including D1-before-DO crash recovery, one-time challenges, attempt lockout, expiry/alarm cleanup, session-bound step-up, disable cleanup, malformed keys, and strict private routing. Published Container package sourcemap warnings remain non-fatal. |
+| D1 migration | Apply all migrations to a new local persistence directory, apply again, then import `fixtures/local.sql` | Passed: migrations `0001` through `0006` applied and all 8 corrected fixture statements succeeded with non-empty management timestamps and valid fixture identities. Worker tests load only strict canonical migration filenames and reject duplicate migration numbers. Existing databases still require the duplicate normalized-live-email preflight documented in `STATUS.md`. |
 | Offline first admin | Run `cloudflare-first-admin -inspect-local`, then the TTY-only guarded local apply against the fresh migration state | Passed: the normalized live-email index was accepted, exactly one admin was inserted, and credential-aware readback matched. The local test state used synthetic credentials only. |
 | Local composed API runtime | Start Wrangler 4.129.0 with the fresh D1 state and local-only secrets, then drive the embedded console and admin/user/key HTTP lifecycle | Passed: console/CSP nonce 200, admin login 200, create/replay 200 with one ID, semantic conflict 409, update and updated-password login 200, normalized-email conflict 409, API-key create and fixture gateway request 200, delete 200, then deleted-user login/key 401 and admin read 404. D1 readback confirmed both tombstones and no foreign-key violations. |
+| Local composed TOTP runtime | Start Wrangler with fresh `0001`-`0006` D1 state and synthetic local secrets, then drive the public auth/TOTP APIs through the real Go Container and inspect D1/DO state | Passed: wrong setup password rejected; setup and enable 200; enabled password login returned a challenge without a JWT; invalid code rejected; valid 2FA login 200; challenge replay 400; session-bound step-up 200; wrong disable password rejected; disable 200; direct login restored. Enabled D1 held only the TOTP envelope/revision, final D1 had no envelope at revision 2, transient DO tables were empty, and foreign-key check returned no rows. |
 | Local embedded-browser rebind | Drive the embedded console in real Chromium against local Wrangler/Container/D1 state, then reload and query D1 directly | Passed after reproducing the former 404 and correcting the GET client's automatic `timezone` parameter. The modal showed the truthful current group, exposed only active standard OpenAI groups, hid disabled/unbind choices, completed GET/GET/PUT with 200, showed the exclusive-grant notification, and retained the new group after reload. D1 readback confirmed key `3001` -> group `2002` and one copy each of allowed groups `2001` and `2002`. |
 | Local embedded-browser account CRUD | Drive the bounded account list/detail/create/edit/toggle/delete console in real Chromium at `507a64cf6`, inspect its fetch traffic, and query persisted D1 state | Passed. List and detail accepted the shared `timezone` parameter; create, omitted-key edit, credential replacement, status/scheduling toggles, and delete returned 200. The corrected create made no unsupported Antigravity mapping, TLS, quota, or Web Search request, and account responses disclosed no credential fields. D1 showed both exercised accounts disabled, unschedulable, tombstoned, AES-GCM-enveloped, and group-linked, with 2 create, 3 update, and 2 delete operation rows and no foreign-key violations. |
 | Local embedded-browser balance/history | Drive add and refund actions plus the history modal in real Chromium at `1e9ca8f70`, inspect fetch traffic, and query persisted D1 state | Passed. Fixture users rendered; starting balance 1.00 became 2.25 after +1.25 and 2.00 after -0.25. Both POSTs and both history GETs returned 200. Reopened history was newest-first with both notes, current balance 2.00, and total recharged 1.25. D1 matched both guarded transitions and two operation rows; immutable-ledger triggers existed and foreign-key check was empty. |
 | Embedded service | Frontend production build followed by `go build -tags embed -trimpath -o /tmp/sub2api-server ./cmd/server` under Go 1.27 | Passed; the actual generated console was embedded into the complete server binary. |
-| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 at `1e9ca8f70`: 175.59 KiB Worker upload / 37.72 KiB gzip, frontend build, Go build, and distroless Container image export. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
+| Production-config build | `cd deploy/cloudflare && pnpm run dry-run` | Passed with Wrangler 4.129.0 after the final TOTP crash-window correction: 201.56 KiB Worker upload / 42.27 KiB gzip, generated production D1/KV/Queue/Container plus `TOTP_SECURITY` bindings, rebuilt the embedded Go service, and exported the distroless Container image. Wrangler exited at `--dry-run`; no Cloudflare resource was mutated. |
 
-The composed API row is an HTTP harness; the bounded rebind and account CRUD
-rows are real Chromium interactions. None claims broad console, remote
-Cloudflare, real-upstream, or production acceptance.
+The composed API and TOTP rows are HTTP harnesses; the bounded rebind, account
+CRUD, and balance rows are real Chromium interactions. None claims broad
+console, remote Cloudflare, real-upstream, or production acceptance.
 
 ## Baseline regression
 
@@ -119,10 +122,10 @@ pnpm exec wrangler d1 execute sub2api-cloudflare-local --local \
 ```
 
 Current result: frozen install passed the lockfile supply-chain policy;
-generated types were current; `tsc --noEmit` passed; Vitest passed 8 files / 55
-tests; and the production dry-run built a 160.55 KiB Worker bundle (35.22 KiB
-gzip) plus the distroless Container image. The package's published sourcemaps
-reference missing source files and produce warnings, but no test failure.
+generated types were current; `tsc --noEmit` passed; and Vitest passed 9 files /
+66 tests. The package's published sourcemaps reference missing source files and
+produce warnings, but no test failure. The latest production-config dry-run is
+recorded in the acceptance table above.
 
 Required unit/integration assertions include:
 
@@ -147,6 +150,10 @@ Required unit/integration assertions include:
 - admin API-key standard-group rebind, exact request allowlists, same-operation
   replay/conflict, active owner/key/group checks, and atomic monotonic exclusive
   group grants that roll back when either conditional write cannot commit.
+- TOTP secret encryption and D1 consistency, replay-safe setup, single-use
+  login challenges, bounded attempts and lockout across DO eviction, alarm
+  expiry, revision invalidation, JWT-session-bound step-up, disable cleanup,
+  and missing/malformed encryption-key failure.
 
 Pure Vitest/miniflare evidence and a real local `wrangler dev` process are
 reported separately because mocked bindings cannot prove Container routing or
@@ -298,3 +305,29 @@ were local synthetic values and were not recorded in the evidence.
 The traditional service unit package passed at the same revision, and the
 production Wrangler configuration completed a full Container build dry-run.
 Neither result is a remote deployment or real-upstream acceptance claim.
+
+# TOTP and session step-up lane (2026-09-09)
+
+The Worker suite runs against the canonical `0001` through `0006` migration
+chain. Its TOTP cases inspect D1 and Durable Object SQLite independently to
+prove that setup persistence contains only the purpose-bound encrypted
+envelope and token hash. They cover idempotent completion and recovery when D1
+commits before the DO completion marker, one-time login
+challenge use, superseding challenges, the five-attempt limit, lockout and
+expiry across object eviction, session-specific step-up grants, TOTP revision
+invalidation, disable cleanup, D1 consistency triggers, and revision overflow.
+
+Go bridge tests cover public request allowlists and errors, current-password
+verification, the unavailable email path, strict private response decoding,
+password login returning a challenge without an access token, malformed and
+unknown challenge rejection, successful 2FA JWT issuance, `/auth/me`, and
+session-ID forwarding for step-up. `go vet` passed, and the traditional service
+TOTP tests stayed green after removing secret/token prefixes from debug logs.
+
+The composed runtime used a fresh isolated D1 directory, synthetic credentials,
+and the actual Wrangler -> Go Container -> private Worker path. It paused after
+enable for direct D1/DO readback, then completed invalid/valid/replay login,
+step-up, wrong-password disable, successful disable, and post-disable login.
+The final state had no transient TOTP rows and no foreign-key violations. No
+browser automation, remote resources, real upstream, or production secret was
+used for this lane.

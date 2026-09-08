@@ -21,6 +21,7 @@ import (
 )
 
 type fakeControlPlane struct {
+	disabledTOTPControlPlane
 	mu          sync.Mutex
 	key         *service.APIKey
 	account     *service.Account

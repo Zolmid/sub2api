@@ -681,6 +681,7 @@ func TestCloudflarePublicSettingsAreTruthfulAndFrontendCompatible(t *testing.T) 
 			ChannelEnabled       bool     `json:"channel_monitor_enabled"`
 			AffiliateEnabled     bool     `json:"affiliate_enabled"`
 			RiskControlEnabled   bool     `json:"risk_control_enabled"`
+			TOTPEnabled          bool     `json:"totp_enabled"`
 			Suffixes             []string `json:"registration_email_suffix_whitelist"`
 			TableOptions         []int    `json:"table_page_size_options"`
 			MenuItems            []any    `json:"custom_menu_items"`
@@ -701,6 +702,7 @@ func TestCloudflarePublicSettingsAreTruthfulAndFrontendCompatible(t *testing.T) 
 	require.False(t, envelope.Data.ChannelEnabled)
 	require.False(t, envelope.Data.AffiliateEnabled)
 	require.False(t, envelope.Data.RiskControlEnabled)
+	require.True(t, envelope.Data.TOTPEnabled)
 	require.NotNil(t, envelope.Data.Suffixes)
 	require.Equal(t, []int{10, 20, 50, 100}, envelope.Data.TableOptions)
 	require.NotNil(t, envelope.Data.MenuItems)

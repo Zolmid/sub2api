@@ -1,6 +1,6 @@
 # Cloudflare migration status
 
-Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
+Updated: 2026-09-09. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
 
 ## Completed and locally evidenced
 
@@ -35,6 +35,16 @@ Updated: 2026-09-07. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
   bundle (36.32 KiB gzip) without mutating Cloudflare resources.
   OAuth/import/test/refresh/batch/export and other platform/type paths remain
   unavailable; this is not remote deployment or real-upstream evidence.
+
+- Added Cloudflare-native TOTP setup/enable/disable, password login 2FA, and a
+  JWT-session-bound step-up primitive. D1 stores a purpose-bound AES-GCM
+  envelope and monotonic revision; a user-keyed SQLite Durable Object stores
+  only hashed disposable tokens/sessions, attempt state, and expiries. The
+  private routes require the Worker-injected Container identity. Fresh local
+  Wrangler/Go Container/D1 composition passed password gating, enable, invalid
+  code, successful 2FA JWT issuance, challenge replay rejection, session-bound
+  step-up, disable, and direct-login restoration. This is composed HTTP and
+  persisted-state evidence, not visual browser, remote, or production evidence.
 
 - Locked the upstream source, dependency/tool versions, license, and initial
   test results in `BASELINE.md`.
@@ -178,8 +188,9 @@ fail closed.
 ## Explicitly not complete
 
 This branch is not yet a full Sub2API Cloudflare migration. Account writes
-outside the bounded OpenAI API-key CRUD contract, user role/step-up operations,
-default subscriptions/default balance, complete repositories, subscriptions,
+outside the bounded OpenAI API-key CRUD contract, user role mutations that
+consume the now-available step-up primitive, default subscriptions/default
+balance, complete repositories, subscriptions,
 pricing, usage reservation and authoritative request settlement, multi-account
 scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
 first lease path, batch/images/files, imports/exports, backup/restore,
@@ -218,8 +229,9 @@ product such as R2; they have not been silently removed or stored in D1/KV.
    surface; do not invent administrator CRUD routes absent from the upstream
    public contract. Keep OAuth/import/test/refresh/batch/export account
    operations fail-closed until separately designed and tested.
-3. Design role promotion/demotion with required TOTP step-up, immutable audit,
-   and atomic last-administrator protection. Extend the now-verified manual
+3. Implement role promotion/demotion using the verified TOTP step-up primitive,
+   immutable audit, and atomic last-administrator protection. Extend the
+   now-verified manual
    balance ledger into request reservation/settlement separately. Default
    subscription and default-balance behavior must also be made explicit.
 4. Expand account selection and policy state only after those durable CRUD
@@ -254,3 +266,44 @@ Go bridge tests/vet, the traditional service unit package, and a production
 configuration dry-run all passed. The dry-run built the frontend, Go Container,
 and distroless image and exited before deployment. Remote Worker/D1, real
 upstream, production, usage reservation, and request settlement remain open.
+
+# 2026-09-09 — TOTP, login 2FA, and session-bound step-up (local verification)
+
+Cloudflare mode now preserves the existing TOTP setup/enable/disable and login
+2FA shapes without using Ent, PostgreSQL, or Redis. Setup and disable require
+the current password. Email verification remains explicitly unavailable until
+durable email delivery is migrated. Login challenges are one-time and expire
+after five minutes; five failures lock verification for 15 minutes. Successful
+step-up is bound to the current JWT session for 15 minutes, and every TOTP
+revision change invalidates prior challenges and grants.
+
+Automated evidence passed TypeScript checking, 9 Worker files / 66 tests, 6
+focused frontend files / 41 tests, the Go 1.27 Cloudflare bridge package,
+bridge vet, and the traditional TOTP service tests. Workerd coverage includes
+encrypted-at-rest setup state, replay-safe
+completion including D1-before-DO crash recovery, D1 consistency triggers,
+revision overflow guards, challenge
+supersession/consumption/expiry, persistent lockout across DO eviction,
+session binding, disable cleanup, malformed key handling, and exact private
+request allowlists. The test migration loader now reads only canonical
+four-digit migration names and rejects duplicate migration numbers.
+
+The production configuration also completed a Wrangler 4.129.0 dry-run. It
+generated a 201.56 KiB Worker bundle (42.27 KiB gzip), exposed the expected
+`TOTP_SECURITY`/D1/KV/Queue/Container bindings, exported the distroless image,
+and exited before deployment without changing Cloudflare resources.
+
+A fresh local state applied migrations `0001` through `0006`, imported the
+fixture, and ran through the real Worker -> Go Container -> private Worker ->
+D1/DO composition. At the enabled checkpoint D1 held only a
+`aes-gcm:v1:totp:` envelope with revision 1; the DO held no plaintext secret or
+session token. The flow rejected an invalid code, issued a JWT only after valid
+2FA, rejected challenge replay, accepted step-up only for that JWT session,
+rejected a wrong disable password, and restored direct login after disable.
+Final readback showed revision 2, no secret envelope, no transient DO rows, and
+no D1 foreign-key violations. All credentials were synthetic local values and
+were not printed or retained in the repository.
+
+This lane has not been visually driven in Chromium. It also does not prove a
+remote Worker/D1/DO deployment, production secret provisioning, role mutation,
+durable email verification, or real-upstream behavior.

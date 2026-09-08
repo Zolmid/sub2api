@@ -13,8 +13,9 @@ import {
 } from "./contracts";
 import { AuthLoginAdmissionDO } from "./auth-login-admission";
 import { AccountLeaseDO } from "./lease";
+import { TOTPSecurityDO } from "./totp-security";
 
-export { AccountLeaseDO, AuthLoginAdmissionDO, ContainerProxy };
+export { AccountLeaseDO, AuthLoginAdmissionDO, TOTPSecurityDO, ContainerProxy };
 
 type ContainerRuntimeEnv = Omit<
   Env,

@@ -51,11 +51,19 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 
 	apiKeyRepo := NewAPIKeyRepository(control)
 	authUserRepo := NewAuthUserRepository(control)
+	totpControl, ok := control.(TOTPControlPlane)
+	if !ok {
+		return nil, errors.New("cloudflare totp control plane is required")
+	}
 	groupReader := NewManagedGroupReader(control)
 	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
 	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
-	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService)
+	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService, totpControl)
+	totpAPIHandler, err := newCloudflareTOTPHandler(control, authUserRepo)
+	if err != nil {
+		return nil, fmt.Errorf("initialize cloudflare totp handler: %w", err)
+	}
 	adminAPIHandler := newCloudflareAdminAPIHandler(control)
 	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
 	adminAuthMiddleware := middleware.NewAdminAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil)
@@ -79,6 +87,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	v1 := router.Group("/api/v1")
 	v1.GET("/settings/public", userAPIHandler.PublicSettings)
 	v1.POST("/auth/login", userAPIHandler.Login)
+	v1.POST("/auth/login/2fa", userAPIHandler.Login2FA)
 	authenticated := v1.Group("")
 	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
 	keys := authenticated.Group("/keys")
@@ -89,6 +98,14 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	keys.DELETE("/:id", userAPIHandler.DeleteAPIKey)
 	authenticated.GET("/groups/available", userAPIHandler.GetAvailableGroups)
 	authenticated.GET("/auth/me", userAPIHandler.CurrentUser)
+	totp := authenticated.Group("/user/totp")
+	totp.GET("/status", totpAPIHandler.GetStatus)
+	totp.GET("/verification-method", totpAPIHandler.GetVerificationMethod)
+	totp.POST("/send-code", totpAPIHandler.SendVerifyCode)
+	totp.POST("/setup", totpAPIHandler.InitiateSetup)
+	totp.POST("/enable", totpAPIHandler.Enable)
+	totp.POST("/disable", totpAPIHandler.Disable)
+	totp.POST("/step-up", totpAPIHandler.StepUp)
 	admin := v1.Group("/admin")
 	admin.Use(gin.HandlerFunc(adminAuthMiddleware))
 	admin.GET("/users", adminAPIHandler.ListUsers)

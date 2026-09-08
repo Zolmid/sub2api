@@ -24,6 +24,9 @@ type AuthUser = {
   restrict_public_groups: boolean;
   created_at: string;
   updated_at: string;
+  totp_enabled: boolean;
+  totp_enabled_at: string | null;
+  totp_revision: number;
 };
 
 type APIKey = {
@@ -61,7 +64,19 @@ function parsedArray(value: unknown): string[] | null {
 
 function authUserRow(row: Record<string, unknown>): AuthUser | null {
   const groups = parsedArray(row.allowed_group_ids_json);
-  if (groups === null || !groups.every(id)) return null;
+  const totpEnabled = Number(row.totp_enabled);
+  const totpEnabledAt = row.totp_enabled_at === null
+    ? null
+    : String(row.totp_enabled_at);
+  const totpRevision = Number(row.totp_revision);
+  if (
+    groups === null ||
+    !groups.every(id) ||
+    (totpEnabled !== 0 && totpEnabled !== 1) ||
+    !Number.isSafeInteger(totpRevision) ||
+    totpRevision < 0 ||
+    (totpEnabled === 1) !== (totpEnabledAt !== null)
+  ) return null;
   return {
     id: String(row.id),
     email: String(row.email),
@@ -76,6 +91,9 @@ function authUserRow(row: Record<string, unknown>): AuthUser | null {
     restrict_public_groups: Number(row.restrict_public_groups) === 1,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
+    totp_enabled: totpEnabled === 1,
+    totp_enabled_at: totpEnabledAt,
+    totp_revision: totpRevision,
   };
 }
 
@@ -106,7 +124,7 @@ async function authUser(request: Request, env: Env): Promise<Response> {
   if (hasID === hasEmail) return error("INVALID_REQUEST");
 
   let rows: D1Result<Record<string, unknown>>;
-  const columns = "id,email,username,password_hash,status,role,concurrency,rpm_limit,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at";
+  const columns = "id,email,username,password_hash,status,role,concurrency,rpm_limit,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,totp_enabled,totp_enabled_at,totp_revision";
   if (hasID) {
     if (!id(body.id)) return error("INVALID_REQUEST");
     rows = await env.DB.prepare(

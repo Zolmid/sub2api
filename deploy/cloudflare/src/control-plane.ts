@@ -2,6 +2,7 @@ import type { Completion, UsageEnvelope } from "./contracts";
 import { decryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
 import { managementControlPlane } from "./management";
 import { privateDataPlane } from "./private-data";
+import { isTOTPControlPath, totpControlPlane } from "./totp-control";
 import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
@@ -109,6 +110,9 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
   }
 
   try {
+    if (isTOTPControlPath(url.pathname)) {
+      return await totpControlPlane(request, env, url.pathname);
+    }
     switch (url.pathname) {
       case "/v1/auth/resolve":
         return await resolveAPIKey(request, env);

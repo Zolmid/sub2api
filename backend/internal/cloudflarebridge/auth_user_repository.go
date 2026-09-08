@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -98,6 +99,9 @@ type authUserWire struct {
 	RestrictPublicGroups bool     `json:"restrict_public_groups"`
 	CreatedAt            string   `json:"created_at"`
 	UpdatedAt            string   `json:"updated_at"`
+	TotpEnabled          bool     `json:"totp_enabled"`
+	TotpEnabledAt        *string  `json:"totp_enabled_at"`
+	TotpRevision         int64    `json:"totp_revision"`
 }
 
 func decodeAuthUser(wire authUserWire) (*service.User, error) {
@@ -113,12 +117,21 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 	if err != nil {
 		return nil, err
 	}
+	var totpEnabledAt *time.Time
+	if wire.TotpEnabledAt != nil {
+		parsed, parseErr := requiredWireTime("auth user totp enabled timestamp", *wire.TotpEnabledAt)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		totpEnabledAt = &parsed
+	}
 	normalizedEmail := strings.ToLower(strings.TrimSpace(wire.Email))
 	if normalizedEmail == "" || len(wire.Email) > 255 || len(utf16.Encode([]rune(wire.Username))) > 100 || len(wire.PasswordHash) < 20 || len(wire.PasswordHash) > 255 ||
 		(wire.Status != service.StatusActive && wire.Status != service.StatusDisabled) ||
 		(wire.Role != service.RoleUser && wire.Role != service.RoleAdmin) ||
 		wire.Concurrency < 1 || wire.Concurrency > 100000 || wire.RPMLimit < 0 || wire.RPMLimit > 1000000 ||
-		len(wire.AllowedGroupIDs) > 100 {
+		len(wire.AllowedGroupIDs) > 100 || wire.TotpRevision < 0 ||
+		(wire.TotpEnabled != (totpEnabledAt != nil)) {
 		return nil, errors.New("invalid auth user response")
 	}
 	balance, err := displayBalanceFromMicroUSD(wire.BalanceMicroUSD)
@@ -157,6 +170,8 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 		TokenVersionResolved: true,
 		CreatedAt:            createdAt,
 		UpdatedAt:            updatedAt,
+		TotpEnabled:          wire.TotpEnabled,
+		TotpEnabledAt:        totpEnabledAt,
 	}, nil
 }
 

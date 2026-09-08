@@ -24,6 +24,7 @@ type userCreateOperationStub struct {
 }
 
 type adminUserControlStub struct {
+	disabledTOTPControlPlane
 	mu sync.Mutex
 
 	users           map[int64]*service.User

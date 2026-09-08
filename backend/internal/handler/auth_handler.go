@@ -312,12 +312,8 @@ func (h *AuthHandler) Login2FA(c *gin.Context) {
 	// Get the login session
 	session, err := h.totpService.GetLoginSession(c.Request.Context(), req.TempToken)
 	if err != nil || session == nil {
-		tokenPrefix := ""
-		if len(req.TempToken) >= 8 {
-			tokenPrefix = req.TempToken[:8]
-		}
 		slog.Debug("login_2fa_session_invalid",
-			"temp_token_prefix", tokenPrefix,
+			"temp_token_len", len(req.TempToken),
 			"error", err)
 		response.BadRequest(c, "Invalid or expired 2FA session")
 		return

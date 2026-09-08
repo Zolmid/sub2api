@@ -11,14 +11,16 @@ pass its listed acceptance test before it is treated as a replacement.
 The branch now has a bounded D1-backed management surface in addition to the
 stage B gateway slice. The API-key rebind, OpenAI API-key account CRUD, and
 administrator balance adjustment/history have local composed-browser results;
-the other rows remain layer-level local evidence. None replaces the pending
-broad-console, remote, real-upstream, or production gates.
+TOTP/login/step-up has a local composed-HTTP result. The other rows remain
+layer-level local evidence. None replaces the pending broad-console, remote,
+real-upstream, or production gates.
 
 | Feature slice | Implemented target | Local evidence | Status |
 | --- | --- | --- | --- |
 | Admin user create | Existing console API -> Cloudflare Go handler -> private Worker mutation -> D1 user and operation rows | Go HTTP/control-plane tests, workerd D1 tests, frontend retry tests, fresh migration, and full image build cover semantic replay across new IDs/bcrypt hashes, exact microUSD conversion, normalized email conflicts, group references, and private auth readback | Automated layers locally verified for ordinary `user` creation; admin creation, default balance/subscriptions, internationalized email, and a composed browser/runtime probe remain open |
 | Admin user update | Field-level D1 patch with private credential readback | Tests cover password replacement, omitted-field preservation, unrelated concurrent balance preservation, conditional group validation, normalized email uniqueness, and management-response credential rejection | Automated layers locally verified for email/password/profile/status/limits/groups; role changes deliberately fail closed and balance uses its dedicated audited endpoint |
 | Admin user delete | One D1 batch tombstones the non-admin user and every live owned API key | Workerd tests cover successful tombstoning, private-auth absence, operation replay, and a zero-row admin guard that leaves keys untouched | Automated layers locally verified for non-admin users; admins remain protected and subscription/ledger cleanup is not implied |
+| User TOTP and session step-up | Existing auth/TOTP APIs -> Cloudflare Go handler -> private Worker -> per-user `TOTPSecurityDO` plus D1 encrypted envelope/revision | Go route/control-plane tests and workerd tests cover password-gated setup/disable, one-time setup response, encrypted-at-rest state, login challenge consumption, five-attempt lockout, expiry/alarm cleanup, revision invalidation, and JWT-session-bound step-up; a fresh Wrangler/Container/D1 composition covers enable, 2FA login, replay rejection, step-up, disable, and direct-login restoration | Locally composed-HTTP verified. The existing console components were not driven in a browser for this lane; email verification, role mutation consumers, remote Cloudflare, and production remain open |
 | Admin balance adjustment/history | Existing console balance modal -> strict Cloudflare Go public API -> private Worker mutation/read -> guarded D1 balance projection, append-only ledger, and operation row | Go and workerd tests cover exact UTF-16/microusd boundaries, replay/conflict, stale and balance bounds, enum validation, immutable rows, and safe history projection; real Chromium covers add/refund, list refresh, modal history, ordering, notes, totals, and persisted D1 readback | Locally composed-browser verified for dedicated administrator add/subtract and immutable history; reservation, settlement, remote, and production equivalence remain open |
 | Admin API-key group rebind | Existing console owner-key list and rebind routes -> strict Cloudflare Go handlers -> private Worker reads/mutation -> D1 | Go and workerd tests cover admin auth, exact request/response protocol, large IDs, key non-disclosure, active owner/key/group guards, same-group replay, exclusive access append, concurrent-state guards, and zero-row rollback; frontend tests cover Cloudflare filtering and traditional behavior; real Chromium plus persisted D1 readback covers the local composed interaction | Locally composed-browser verified for the upstream admin contract's active standard OpenAI group rebind; unsupported unbind, reset, quota/rate, and subscription-group extensions continue to fail closed |
 | Admin account create | Existing console POST -> strict Cloudflare Go handler -> private Worker mutation -> D1 account, group-membership, and operation rows | Go route/bridge tests and workerd D1 tests cover admin auth, semantic replay across regenerated large candidate IDs, one ambiguous private 5xx retry with a stable operation ID, live compatible group references, complete safe readback, conflict mapping, and secret rejection; real Chromium covers the accepted modal and 200 create/list refresh without unsupported initialization probes | Locally composed-browser verified for OpenAI API-key accounts; ambiguous private-5xx retry remains automated, and remote/real-upstream acceptance is not claimed |
@@ -98,3 +100,23 @@ the newest -0.25 row before +1.25, both notes, current balance 2.00, and total
 recharged 1.25. Persisted D1 readback matched both before/after transitions,
 the two idempotency rows, immutable-ledger triggers, and an empty foreign-key
 check. Remote D1, real-upstream, and production equivalence are not claimed.
+
+# TOTP and session-bound step-up (Cloudflare mode)
+
+The existing setup, enable, disable, login-2FA, and step-up public contracts now
+route through the Cloudflare composition root without Ent, PostgreSQL, or
+Redis. D1 owns only the encrypted secret envelope, enabled timestamp, and
+monotonic revision. A user-keyed SQLite Durable Object serializes setup/login
+challenges, failed-attempt lockout, and step-up grants; it stores token and JWT
+session hashes rather than reusable plaintext. The private route additionally
+requires the Container identity installed by the Worker outbound handler.
+
+The local composed-HTTP gate used fresh migrations `0001` through `0006`, a
+synthetic password, and local-only secrets. It verified password rejection,
+setup/enable, a password login that returned only a 2FA challenge, invalid-code
+rejection, successful JWT issuance, challenge replay rejection, session-bound
+step-up, password-gated disable, and direct login after disable. D1 readback at
+the enabled point found a purpose-prefixed AES-GCM envelope and revision 1; DO
+readback found only hashed/opaque transient state. Final readback found revision
+2, no envelope, and no setup/login/grant/attempt rows. This was not a visual
+browser, remote Cloudflare, real-upstream, or production gate.

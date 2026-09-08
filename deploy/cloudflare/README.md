@@ -29,7 +29,7 @@ the allowed host and encrypts it with `CREDENTIAL_ENCRYPTION_KEY` before D1 writ
 
 HTTPS egress interception is enabled for the fixture host. At runtime the Container passes `SSL_CERT_FILE=/etc/cloudflare/certs/cloudflare-containers-ca.crt` so Go trusts Cloudflare's ephemeral interception CA; that file is not copied into the image.
 
-Production account credentials require `aes-gcm:v1:<base64(iv)>:<base64(ciphertext)>` plus the `CREDENTIAL_ENCRYPTION_KEY` secret. The deploy configuration is fixture-off and fail-closed. Local tests use `wrangler.test.jsonc`, which sets `ENVIRONMENT=local`, `ALLOW_TEST_FIXTURE=true`, `mock.upstream`, and a compatibility date constrained by the bundled workerd runtime.
+Production account credentials require `aes-gcm:v1:<base64(iv)>:<base64(ciphertext)>` plus the `CREDENTIAL_ENCRYPTION_KEY` secret. TOTP secrets use the same 32-byte secret binding with a distinct `aes-gcm:v1:totp:` envelope and purpose-bound authenticated data. The deploy configuration is fixture-off and fail-closed. Local tests use `wrangler.test.jsonc`, which sets `ENVIRONMENT=local`, `ALLOW_TEST_FIXTURE=true`, `mock.upstream`, and a compatibility date constrained by the bundled workerd runtime.
 
 `POST /api/v1/auth/login` is additionally admitted at the Worker edge by the
 SQLite-backed `AUTH_LOGIN_ADMISSION` Durable Object: 20 requests per 60-second
@@ -41,6 +41,24 @@ login traffic. The test pool supplies a fixed test-only key. A missing or
 invalid edge identity, secret, binding, or DO call intentionally fails closed.
 For `pnpm dev`, put a local-only value with that name in the ignored
 `deploy/cloudflare/.dev.vars`; do not reuse a production value.
+
+Cloudflare-mode TOTP is owned by the per-user SQLite-backed `TOTP_SECURITY`
+Durable Object and D1 migration `0006_totp_security.sql`. The private
+`/v1/private/totp/*` routes require the version header and Container identity.
+D1 stores only the encrypted TOTP envelope, enabled timestamp, and monotonic
+revision; the DO stores setup/login token hashes, session hashes, expiries, and
+attempt counters. Plaintext secret material exists only in the one-time setup
+response needed by the existing console and is not persisted or logged.
+
+Setup and login challenges expire after five minutes. Five failed codes lock
+verification for 15 minutes, and a successful step-up grant is bound to the
+current JWT session for 15 minutes. Enabling or disabling TOTP in Cloudflare
+mode requires the current password; the email-verification variant fails with
+`EMAIL_VERIFY_NOT_ENABLED` until durable email delivery is migrated. A TOTP
+revision change invalidates old login challenges and step-up grants. Production
+and local runtime startup therefore also require a valid base64-encoded
+32-byte `CREDENTIAL_ENCRYPTION_KEY`; keep it in Worker secrets or the ignored
+local `.dev.vars`, never in Wrangler `vars`.
 
 Run source checks from this directory:
 

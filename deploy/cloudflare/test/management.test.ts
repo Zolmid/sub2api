@@ -13,6 +13,12 @@ const secureEnv = new Proxy(env, {
     return Reflect.get(target, property, receiver);
   },
 }) as Env;
+const missingCredentialKeyEnv = new Proxy(env, {
+  get(target, property, receiver) {
+    if (property === "CREDENTIAL_ENCRYPTION_KEY") return undefined;
+    return Reflect.get(target, property, receiver);
+  },
+}) as Env;
 const request = (path: string, body: object, options: { host?: string; version?: string; container?: string } = {}) =>
   new Request("http://" + (options.host ?? "sub2api.internal") + path, {
     method: "POST",
@@ -240,7 +246,7 @@ describe("Stage C private management control plane", () => {
     expect(admission.status).toBe(200); expect(await admission.json()).toMatchObject({ account: { id: scope.accountID, credentials: { api_key: upstreamKey, base_url: baseURL } } });
     const rows = await env.DB.prepare("SELECT response_json FROM management_operations").all<{ response_json: string }>();
     for (const row of rows.results) { expect(row.response_json).not.toContain("password-hash-for-credentials"); expect(row.response_json).not.toContain("test-only-cloudflare-jwt-secret-32-bytes"); expect(row.response_json).not.toContain(rawKey); expect(row.response_json).not.toContain(upstreamKey); expect(row.response_json).not.toContain(baseURL); }
-    expect((await call("/v1/manage/accounts/create", { operation_id: "no-secret", id: id(), name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credentials: { api_key: "x", base_url: baseURL }, extra: {}, group_ids: [scope.groupID] }, undefined, env)).status).toBe(400);
+    expect((await call("/v1/manage/accounts/create", { operation_id: "no-secret", id: id(), name: "bad", platform: "openai", status: "active", schedulable: true, priority: 1, max_concurrency: 1, credentials: { api_key: "x", base_url: baseURL }, extra: {}, group_ids: [scope.groupID] }, undefined, missingCredentialKeyEnv)).status).toBe(400);
     expect((await call("/v1/manage/accounts/delete", { operation_id: "delete-account-read", id: scope.accountID })).status).toBe(200);
     const tombstoneGet = await call("/v1/manage/accounts/get", { id: scope.accountID });
     expect(tombstoneGet.status).toBe(200);

@@ -1,7 +1,8 @@
 # Cloudflare-native architecture
 
-Status: staged migration, with the first gateway vertical slice locally
-verified. This document does not claim full compatibility; see
+Status: staged migration, with the first gateway and bounded management/TOTP
+vertical slices locally verified. This document does not claim full
+compatibility; see
 `COMPATIBILITY.md` and `STATUS.md` for the remaining baseline surface.
 
 Platform behavior and package APIs were checked against Cloudflare's official
@@ -55,6 +56,8 @@ The v1 operations are:
 | Renew lease | Account business DO extends one matching active lease | Full request/account/lease/owner/epoch match required |
 | Complete request | D1 records immutable outcome/usage and an outbox event | Stable server-generated `event_id`; different payload for one ID is a conflict |
 | Release lease | Account business DO removes a matching lease | Repeated release is safe; stale owner or epoch cannot release a newer lease |
+| TOTP setup/login/disable | D1 owns the encrypted TOTP envelope and revision; the user-keyed `TOTPSecurityDO` owns short-lived challenges and attempt state | Setup/login tokens are stored only as hashes; setup completion is replay-safe and every D1 mutation is revision-guarded |
+| TOTP step-up | The user-keyed `TOTPSecurityDO` verifies a code and records a short-lived grant for the current JWT session hash | The grant must match user, session hash, non-expired revision, and current enabled TOTP state |
 
 The Go lease keeper renews at one third of the lease TTL. Cloudflare-marked
 upstream contexts preserve cancellation through the original forwarding code;
@@ -68,10 +71,11 @@ canceled. Traditional requests retain their previous detached-context behavior.
 | Users, API-key hashes, groups, accounts, request admissions | D1 | Durable relational facts and queryable recovery state |
 | Completion events, outbox, usage records and future ledger entries | D1 | Durable idempotency and reconciliation; monetary values use fixed-point integers or exact decimal text, never `REAL` |
 | Per-account active leases, concurrency, cooldown, refresh version | `AccountLeaseDO`, keyed only by account ID | One serialization authority even when the account belongs to multiple groups |
+| TOTP challenges, attempt lockout, and step-up grants | `TOTPSecurityDO`, keyed only by user ID | One serialization authority per user; only token/session hashes and bounded expiries persist in DO SQLite |
 | Container process routing/lifecycle | Container SDK lifecycle Durable Object | Infrastructure lifecycle only; it never owns account/business coordination |
 | Rebuildable, non-sensitive aliases or display/config snapshots | KV | Staleness is acceptable and every security decision can fall back to D1 |
 | Usage settlement/projection delivery | Queue, sourced from the D1 outbox | Delivery is at least once; the D1 consumer transaction owns dedupe plus effect |
-| Credentials | AES-GCM envelope in D1; key material from a Worker secret binding | No plaintext credential, Base64-as-encryption, or key in source/config |
+| Account and TOTP secrets | Purpose-separated AES-GCM envelopes in D1; key material from a Worker secret binding | Random IVs and authenticated purpose data prevent cross-protocol envelope reuse; no plaintext secret, Base64-as-encryption, or key in source/config |
 | Go Container filesystem | No durable authority | Container restarts and sleep may discard all local files |
 
 The approved product set has no durable object store for image/file bytes. If
@@ -99,6 +103,25 @@ is a declared architecture decision, not an implicit substitution.
    in D1; a payload mismatch for the same event ID is an auditable conflict.
 8. Go releases the exact lease in a bounded cleanup context. Expiry plus the DO
    alarm recover capacity after Container death or a lost release.
+
+## TOTP and session step-up flow
+
+1. After current-password verification in Go, the Container asks the private
+   Worker to begin setup. The user-keyed DO creates a random secret, encrypts it
+   before D1/DO persistence, and returns the plaintext only for the one-time QR
+   setup response.
+2. Setup completion verifies the submitted code, conditionally writes the D1
+   envelope/enabled timestamp/revision, and marks the setup complete. Replaying
+   the same completed setup is idempotent; a changed revision fails closed.
+3. Password login for a TOTP-enabled user returns a five-minute unpredictable,
+   user-bound challenge instead of a JWT. Successful one-time verification
+   reloads the active D1 user and only then issues the normal JWT.
+4. Sensitive operations can require a 15-minute step-up grant. Verification
+   stores only a hash of the JWT session ID; checking a different session or a
+   stale TOTP revision fails.
+5. Disable clears the D1 envelope and increments the revision, then deletes
+   setup, login, step-up, and attempt state in the DO. Expiry alarms perform the
+   same cleanup for abandoned transient rows.
 
 ## Atomicity and crash boundaries
 
@@ -137,6 +160,10 @@ Correctness is therefore expressed as recoverable state transitions:
   tenant-controlled routing feature.
 - The Worker limits internal JSON sizes and validates exact object shapes,
   string IDs, protocol version, state, and lease identity.
+- TOTP private routes additionally require a bounded Container identity. D1
+  persists only purpose-bound ciphertext and revision state; the DO persists
+  only hashes for disposable tokens and sessions. TOTP codes, plaintext
+  secrets, temporary tokens, and token prefixes are excluded from logs.
 - Container SIGTERM is handled with a bounded HTTP shutdown. Durable correctness
   does not depend on that grace period: pending admissions, leases, and outbox
   rows remain recoverable.

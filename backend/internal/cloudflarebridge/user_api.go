@@ -201,10 +201,11 @@ type cloudflareUserAPIHandler struct {
 	authService   *service.AuthService
 	authUsers     *AuthUserRepository
 	apiKeyService *service.APIKeyService
+	totp          TOTPControlPlane
 }
 
-func newCloudflareUserAPIHandler(authService *service.AuthService, authUsers *AuthUserRepository, apiKeyService *service.APIKeyService) *cloudflareUserAPIHandler {
-	return &cloudflareUserAPIHandler{authService: authService, authUsers: authUsers, apiKeyService: apiKeyService}
+func newCloudflareUserAPIHandler(authService *service.AuthService, authUsers *AuthUserRepository, apiKeyService *service.APIKeyService, totp TOTPControlPlane) *cloudflareUserAPIHandler {
+	return &cloudflareUserAPIHandler{authService: authService, authUsers: authUsers, apiKeyService: apiKeyService, totp: totp}
 }
 
 // GetPublicSettingsForInjection lets the embedded frontend use exactly the
@@ -230,6 +231,7 @@ func cloudflarePublicSettings() dto.PublicSettings {
 		ServerUTCOffset:                      "+00:00",
 		ChannelMonitorMode:                   "v2",
 		ChannelMonitorDefaultIntervalSeconds: 60,
+		TotpEnabled:                          true,
 	}
 }
 
@@ -272,8 +274,63 @@ func (h *cloudflareUserAPIHandler) Login(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	if user.TotpEnabled {
+		if h.totp == nil {
+			response.ErrorFrom(c, errCloudflareTOTPUnavailable)
+			return
+		}
+		challenge, challengeErr := h.totp.BeginTOTPLogin(c.Request.Context(), user.ID)
+		if challengeErr != nil {
+			response.ErrorFrom(c, challengeErr)
+			return
+		}
+		response.Success(c, gin.H{
+			"requires_2fa":      true,
+			"temp_token":        challenge.TempToken,
+			"user_email_masked": service.MaskEmail(user.Email),
+		})
+		return
+	}
 	h.authService.RecordSuccessfulLogin(c.Request.Context(), user.ID)
 	response.Success(c, cloudflareAuthResponse{AccessToken: token, TokenType: "Bearer", User: newCloudflareUserDTO(user)})
+}
+
+type cloudflareLogin2FARequest struct {
+	TempToken string `json:"temp_token"`
+	TOTPCode  string `json:"totp_code"`
+}
+
+func (h *cloudflareUserAPIHandler) Login2FA(c *gin.Context) {
+	var request cloudflareLogin2FARequest
+	if err := decodeCloudflareJSON(c, &request); err != nil ||
+		!cloudflareTOTPLoginPattern.MatchString(request.TempToken) ||
+		!cloudflareTOTPCodePattern.MatchString(request.TOTPCode) {
+		response.BadRequest(c, "Invalid request")
+		return
+	}
+	if h.totp == nil {
+		response.ErrorFrom(c, errCloudflareTOTPUnavailable)
+		return
+	}
+	userID, err := h.totp.VerifyTOTPLogin(c.Request.Context(), request.TempToken, request.TOTPCode)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	user, err := h.authUsers.GetByID(c.Request.Context(), userID)
+	if err != nil || !user.IsActive() || !user.TotpEnabled {
+		response.ErrorFrom(c, errCloudflareTOTPLoginExpired)
+		return
+	}
+	token, err := h.authService.GenerateToken(c.Request.Context(), user)
+	if err != nil {
+		response.ErrorFrom(c, errCloudflareTOTPUnavailable)
+		return
+	}
+	h.authService.RecordSuccessfulLogin(c.Request.Context(), user.ID)
+	response.Success(c, cloudflareAuthResponse{
+		AccessToken: token, TokenType: "Bearer", User: newCloudflareUserDTO(user),
+	})
 }
 
 func (h *cloudflareUserAPIHandler) CurrentUser(c *gin.Context) {

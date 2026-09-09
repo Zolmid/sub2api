@@ -7,6 +7,7 @@
     "types": "wrangler types",
     "check": "tsc --noEmit",
     "test": "vitest run",
+    "ci:local": "bash scripts/cloudflare-native-ci.sh",
     "dry-run": "wrangler deploy --dry-run",
     "dev": "wrangler dev --config wrangler.local.jsonc",
     "migrate:local": "wrangler d1 migrations apply sub2api-cloudflare-local --local --config wrangler.local.jsonc",

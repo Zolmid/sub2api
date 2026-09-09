@@ -1,5 +1,40 @@
 # Cloudflare migration testing
 
+## CI and local acceptance contract
+
+The checked-in workflow at `.github/workflows/cloudflare-native-ci.yml` is a
+credential-free, no-deployment gate. It runs on a clean GitHub checkout with
+Node 22, the package-pinned `pnpm@11.19.0`, and the `go-version-file` in
+`backend/go.mod`, then explicitly requires `go1.27.0`. It installs only from
+the Cloudflare lockfile, checks generated Worker types and TypeScript, runs the
+Worker Vitest suite, applies the local D1 migrations twice to one fresh local
+state, runs focused Cloudflare bridge tests, and runs the minimal traditional
+upstream-cancellation regression.
+
+The script itself resolves the repository from its own path and can be invoked
+from any current working directory. The package command uses a repository-root
+relative `--dir`, so run this exact command from the repository root:
+
+```sh
+pnpm --dir deploy/cloudflare run ci:local
+```
+
+The script uses only the canonical `wrangler.local.jsonc` configuration and
+cleans its own temporary D1 state on normal or failed exit. It does not read
+credentials, contact an upstream, access a remote resource, deploy, or remove
+checkout files. The migration command is the local fresh-install/re-entry
+check; the Worker test runner separately loads only canonical migration names.
+
+The bridge gate runs `go test -race -tags=unit` plus matching `go vet`; the
+traditional service check remains the four-test directed cancellation
+regression.
+
+CI/local acceptance is not production acceptance. A green run proves the
+listed source and local emulation checks only. It does not prove Cloudflare
+bindings, remote D1/KV/Queue/DO resources, production secrets, deployment,
+real upstream connectivity, traffic behavior, or browser acceptance. Those
+require a separately authorized production runbook and live evidence.
+
 This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.

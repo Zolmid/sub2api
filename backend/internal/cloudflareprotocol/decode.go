@@ -57,17 +57,6 @@ func cloneRaw(raw json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
-func decodeStringOrArray(raw json.RawMessage, field string, dst any) (string, bool, error) {
-	var text string
-	if err := json.Unmarshal(raw, &text); err == nil {
-		return text, true, nil
-	}
-	if err := decodeStrict(raw, dst, field); err != nil {
-		return "", false, err
-	}
-	return "", false, nil
-}
-
 func decodeStopSequences(raw json.RawMessage, field string, limits DecodeLimits) ([]string, error) {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, nil

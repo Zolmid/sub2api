@@ -1451,7 +1451,7 @@ func encodeGeminiEvent(event Event, limits EncodeLimits) ([]byte, error) {
 		if err := json.Unmarshal(event.ToolCall.Arguments, &arguments); err != nil {
 			return nil, err
 		}
-		candidate["content"].(map[string]any)["parts"] = []any{map[string]any{"functionCall": map[string]any{"name": event.ToolCall.Name, "args": arguments}}}
+		content["parts"] = []any{map[string]any{"functionCall": map[string]any{"name": event.ToolCall.Name, "args": arguments}}}
 	case EventCompleted:
 		if err := validateStopReason(Gemini, event.StopReason, event.StopReason == StopToolUse); err != nil {
 			return nil, err

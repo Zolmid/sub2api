@@ -69,7 +69,8 @@ func TestHTTPUpstreamCloudflareGatewayBoundaryRejectsUnsafeRequestParts(t *testi
 		return req
 	}
 
-	upstream := NewHTTPUpstream(nil).(*httpUpstreamService)
+	upstream, ok := NewHTTPUpstream(nil).(*httpUpstreamService)
+	require.True(t, ok)
 
 	t.Run("accepts canonical request", func(t *testing.T) {
 		require.NoError(t, upstream.validateCloudflareGatewayRequest(newRequest(t)))
@@ -160,7 +161,8 @@ func TestHTTPUpstreamCloudflareBoundaryStopsBeforeTransportAndMarksOnce(t *testi
 			t.Run(tc.name, func(t *testing.T) {
 				started := &atomic.Int64{}
 				transportCalls := &atomic.Int64{}
-				svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+				svc, ok := NewHTTPUpstream(nil).(*httpUpstreamService)
+				require.True(t, ok)
 				resolverCalls := &atomic.Int64{}
 				svc.resolvePublicHost = func(string) error {
 					resolverCalls.Add(1)

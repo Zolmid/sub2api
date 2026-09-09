@@ -496,7 +496,7 @@ func queryOneWith(ctx context.Context, t target, sql string, runner commandRunne
 	}
 	output, err := runner.Run(ctx, wrangler, wranglerArgs(t, sql, "")...)
 	if err != nil {
-		return nil, errors.New("Wrangler query failed")
+		return nil, errors.New("wrangler query failed")
 	}
 	statement, err := parseStatement(output)
 	if err != nil {
@@ -560,10 +560,10 @@ func unwrapStatement(value any) (map[string]any, error) {
 	}
 	statement, ok := value.(map[string]any)
 	if !ok {
-		return nil, errors.New("Wrangler statement is not an object")
+		return nil, errors.New("wrangler statement is not an object")
 	}
 	if success, present := statement["success"]; !present || success != true {
-		return nil, errors.New("Wrangler reported an unsuccessful statement")
+		return nil, errors.New("wrangler reported an unsuccessful statement")
 	}
 	if nested, ok := statement["result"]; ok && statement["results"] == nil {
 		return unwrapStatement(nested)

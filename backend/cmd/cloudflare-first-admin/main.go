@@ -485,7 +485,7 @@ func readBack(ctx context.Context, t target, deps dependencies, a firstAdmin) er
 		integer(row, "restrict_public_groups") != 0 || stringField(row, "created_at") != a.createdAt ||
 		stringField(row, "updated_at") != a.createdAt || !isNull(row["deleted_at"]) ||
 		integer(row, "password_hash_matches") != 1 {
-		return errors.New("D1 readback did not exactly match the requested first administrator")
+		return errors.New("d1 readback did not exactly match the requested first administrator")
 	}
 	return nil
 }
@@ -569,7 +569,7 @@ func unwrapStatement(value any) (map[string]any, error) {
 		return unwrapStatement(nested)
 	}
 	if _, ok := statement["results"].([]any); !ok {
-		return nil, errors.New("Wrangler statement has no result array")
+		return nil, errors.New("wrangler statement has no result array")
 	}
 	return statement, nil
 }

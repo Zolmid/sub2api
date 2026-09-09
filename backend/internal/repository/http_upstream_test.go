@@ -195,7 +195,8 @@ func TestHTTPUpstreamCloudflareBoundaryStopsBeforeTransportAndMarksOnce(t *testi
 		started := &atomic.Int64{}
 		transportCalls := &atomic.Int64{}
 		sequence := make([]string, 0, 3)
-		svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+		svc, ok := NewHTTPUpstream(nil).(*httpUpstreamService)
+		require.True(t, ok)
 		svc.resolvePublicHost = func(host string) error {
 			require.Equal(t, "upstream.example", host)
 			return nil
@@ -234,7 +235,8 @@ func TestHTTPUpstreamCloudflareBoundaryStopsBeforeTransportAndMarksOnce(t *testi
 }
 
 func TestHTTPUpstreamCloudflareBoundaryPublicPrivateHostValidationIsDeterministic(t *testing.T) {
-	svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+	svc, ok := NewHTTPUpstream(nil).(*httpUpstreamService)
+	require.True(t, ok)
 	resolverCalls := &atomic.Int64{}
 	svc.resolvePublicHost = func(host string) error {
 		resolverCalls.Add(1)
@@ -272,7 +274,8 @@ func TestHTTPUpstreamCloudflareBoundaryCountsFinalGrokHeaders(t *testing.T) {
 		req.Header.Set(fmt.Sprintf("X-SDK-Meta-%d", i), "ok")
 	}
 
-	svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+	svc, ok := NewHTTPUpstream(nil).(*httpUpstreamService)
+	require.True(t, ok)
 	svc.resolvePublicHost = func(string) error {
 		return errors.New("DNS must not be reached")
 	}

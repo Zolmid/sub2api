@@ -615,7 +615,7 @@ func TestAuthUserRepositoryNormalizesEmailAndResolvesTokenVersion(t *testing.T) 
 		_ = json.NewEncoder(w).Encode(map[string]any{"user": map[string]any{
 			"id": "9007199254740993", "email": user.Email, "username": user.Username,
 			"password_hash": user.PasswordHash, "status": user.Status, "role": user.Role,
-			"concurrency": 1, "rpm_limit": 0, "balance_microusd": "2500000",
+			"concurrency": 1, "rpm_limit": 0, "balance_e8_usd": "250000000",
 			"allowed_group_ids": []string{}, "restrict_public_groups": false,
 			"created_at": user.CreatedAt.Format(time.RFC3339Nano), "updated_at": user.UpdatedAt.Format(time.RFC3339Nano),
 		}})

@@ -251,7 +251,7 @@ func TestCloudflareHandlerUsesBaselineAuthAndOpenAIForwarder(t *testing.T) {
 	defer control.mu.Unlock()
 	require.Equal(t, 1, control.touchCount)
 	require.NotNil(t, control.completion)
-	require.Equal(t, ProtocolVersion, control.completion.SchemaVersion)
+	require.Equal(t, UsageSchemaVersion, control.completion.SchemaVersion)
 	require.Equal(t, UsageEventType, control.completion.EventType)
 	require.Equal(t, OutcomeSucceeded, control.completion.Outcome)
 	require.Equal(t, UsageConfirmed, control.completion.UsageState)

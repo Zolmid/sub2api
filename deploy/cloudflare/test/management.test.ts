@@ -81,8 +81,8 @@ describe("Stage C private management control plane", () => {
     await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
     const stamp = "2026-09-07T01:02:03Z";
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-a-" + scope.userID, "secret-operation-a", adminID, scope.userID, "add", "first add", "1250000", "0", "1250000", stamp),
-      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-b-" + scope.userID, "secret-operation-b", adminID, scope.userID, "subtract", "second subtract", "-250000", "1250000", "1000000", stamp),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-a-" + scope.userID, "secret-operation-a", adminID, scope.userID, "add", "first add", "125000000", "0", "125000000", stamp),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind("history-b-" + scope.userID, "secret-operation-b", adminID, scope.userID, "subtract", "second subtract", "-25000000", "125000000", "100000000", stamp),
     ]);
     const first = await call("/v1/manage/users/balance-history", { id: scope.userID, page: 1, page_size: 1 });
     expect(first.status).toBe(200);
@@ -117,7 +117,7 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-maximum-" + scope.userID, operation: "set", amount_microusd: maximum })).status).toBe(200);
     const unreadableOperation = "ledger-unreadable-" + scope.userID;
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: unreadableOperation, operation: "set", amount_microusd: "9007199254740992" })).status).toBe(409);
-    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe(maximum);
+    expect(await env.DB.prepare("SELECT balance_e8_usd FROM users WHERE id=?").bind(scope.userID).first("balance_e8_usd")).toBe((BigInt(maximum) * 100n).toString());
     expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(unreadableOperation).first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(unreadableOperation).first("count")).toBe(0);
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-overflow-" + scope.userID, operation: "add", amount_microusd: "1" })).status).toBe(409);
@@ -128,6 +128,81 @@ describe("Stage C private management control plane", () => {
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-deleted-" + scope.userID })).status).toBe(404);
     expect((await call("/v1/manage/users/balance-adjust", { ...request, operation_id: "ledger-actor-" + scope.userID, actor_user_id: scope.userID })).status).toBe(403);
   });
+  it("preserves single-e8 adjustments and canonicalizes legacy retries", async () => {
+    const scope = await createScope("ledger-e8-" + id());
+    const adminID = id();
+    expect((await call("/v1/manage/users/create", userCreateBody(
+      "ledger-e8-admin-" + adminID,
+      adminID,
+      "ledger-e8-admin-" + adminID + "@example.test",
+    ))).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
+
+    const compatibleOperation = "ledger-e8-compatible-" + scope.userID;
+    const exact = await call("/v1/manage/users/balance-adjust", {
+      operation_id: compatibleOperation,
+      actor_user_id: adminID,
+      target_user_id: scope.userID,
+      operation: "add",
+      amount_e8_usd: "100",
+      reason: "canonical retry",
+    });
+    expect(exact.status).toBe(200);
+    expect(await exact.json()).toMatchObject({
+      replayed: false,
+      balance: {
+        delta_e8_usd: "100",
+        balance_before_e8_usd: "100",
+        balance_after_e8_usd: "200",
+      },
+    });
+    const legacyReplay = await call("/v1/manage/users/balance-adjust", {
+      operation_id: compatibleOperation,
+      actor_user_id: adminID,
+      target_user_id: scope.userID,
+      operation: "add",
+      amount_microusd: "1",
+      reason: "canonical retry",
+    });
+    expect(legacyReplay.status).toBe(200);
+    expect(await legacyReplay.json()).toMatchObject({ replayed: true });
+
+    const oneE8Operation = "ledger-e8-one-" + scope.userID;
+    const oneE8 = await call("/v1/manage/users/balance-adjust", {
+      operation_id: oneE8Operation,
+      actor_user_id: adminID,
+      target_user_id: scope.userID,
+      operation: "add",
+      amount_e8_usd: "1",
+      reason: "one e8",
+    });
+    expect(oneE8.status).toBe(200);
+    const oneE8Body = await oneE8.json<{ balance: Record<string, unknown> }>();
+    expect(oneE8Body.balance).toMatchObject({
+      delta_e8_usd: "1",
+      balance_before_e8_usd: "200",
+      balance_after_e8_usd: "201",
+    });
+    expect(oneE8Body.balance).not.toHaveProperty("delta_microusd");
+    expect(await env.DB.prepare(
+      "SELECT delta_e8_usd,balance_after_e8_usd FROM balance_ledger WHERE operation_id=?",
+    ).bind(oneE8Operation).first()).toMatchObject({
+      delta_e8_usd: "1",
+      balance_after_e8_usd: "201",
+    });
+    const zeroOperation = "ledger-e8-zero-" + scope.userID;
+    expect((await call("/v1/manage/users/balance-adjust", {
+      operation_id: zeroOperation,
+      actor_user_id: adminID,
+      target_user_id: scope.userID,
+      operation: "add",
+      amount_e8_usd: "0",
+      reason: "zero",
+    })).status).toBe(400);
+    expect(await env.DB.prepare(
+      "SELECT count(*) AS count FROM management_operations WHERE operation_id=?",
+    ).bind(zeroOperation).first<number>("count")).toBe(0);
+  });
   it("leaves no operation or ledger when the guarded projection update is stale", async () => {
     const scope = await createScope("ledger-stale-" + id());
     const adminID = id();
@@ -136,14 +211,14 @@ describe("Stage C private management control plane", () => {
     const operation = "ledger-stale-" + scope.userID;
     const stamp = new Date().toISOString();
     const results = await env.DB.batch([
-      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("2", stamp, scope.userID, "999", adminID),
+      env.DB.prepare("UPDATE users SET balance_e8_usd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_e8_usd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("200", stamp, scope.userID, "99900", adminID),
       env.DB.prepare("INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT ?,?,?,?,? WHERE changes()=1").bind(operation, "/v1/manage/users/balance-adjust", "a".repeat(64), "{\"balance\":{}}", stamp),
-      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, adminID, scope.userID, "add", "stale", "1", "1", "2", stamp, operation),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, adminID, scope.userID, "add", "stale", "100", "100", "200", stamp, operation),
     ]);
     expect(results[0].meta.changes).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(operation).first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(operation).first("count")).toBe(0);
-    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+    expect(await env.DB.prepare("SELECT balance_e8_usd FROM users WHERE id=?").bind(scope.userID).first("balance_e8_usd")).toBe("100");
   });
   it("rejects noncanonical ledger decimals at the migration boundary", async () => {
     const insertLedger = (
@@ -154,7 +229,7 @@ describe("Stage C private management control plane", () => {
       actor = "1",
       target = "2",
     ) => env.DB.prepare(
-      "INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
     ).bind(tag, tag, actor, target, "set", "migration constraint", delta, before, after, new Date().toISOString()).run();
 
     const prefix = "ledger-canonical-" + id();
@@ -180,26 +255,26 @@ describe("Stage C private management control plane", () => {
     const directOperation = "ledger-actor-guard-" + scope.userID;
     const stamp = new Date().toISOString();
     const guarded = await env.DB.batch([
-      env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("2", stamp, scope.userID, "1", adminID),
+      env.DB.prepare("UPDATE users SET balance_e8_usd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_e8_usd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind("200", stamp, scope.userID, "100", adminID),
       env.DB.prepare("INSERT INTO management_operations(operation_id,route,request_hash,response_json,created_at) SELECT ?,?,?,?,? WHERE changes()=1").bind(directOperation, "/v1/manage/users/balance-adjust", "b".repeat(64), "{\"balance\":{}}", stamp),
-      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(directOperation, directOperation, adminID, scope.userID, "add", "actor guard", "1", "1", "2", stamp, directOperation),
+      env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(directOperation, directOperation, adminID, scope.userID, "add", "actor guard", "100", "100", "200", stamp, directOperation),
     ]);
     expect(guarded[0].meta.changes).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(directOperation).first("count")).toBe(0);
     expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(directOperation).first("count")).toBe(0);
-    expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+    expect(await env.DB.prepare("SELECT balance_e8_usd FROM users WHERE id=?").bind(scope.userID).first("balance_e8_usd")).toBe("100");
 
     await env.DB.prepare("UPDATE users SET role='admin' WHERE id=?").bind(adminID).run();
     const trigger = "balance_actor_race_" + scope.userID;
     const racedOperation = "ledger-actor-raced-" + scope.userID;
-    await env.DB.prepare(`CREATE TRIGGER ${trigger} BEFORE UPDATE OF balance_microusd ON users WHEN OLD.id='${scope.userID}' BEGIN UPDATE users SET role='user' WHERE id='${adminID}'; SELECT RAISE(IGNORE); END`).run();
+    await env.DB.prepare(`CREATE TRIGGER ${trigger} BEFORE UPDATE OF balance_e8_usd ON users WHEN OLD.id='${scope.userID}' BEGIN UPDATE users SET role='user' WHERE id='${adminID}'; SELECT RAISE(IGNORE); END`).run();
     try {
       const raced = await call("/v1/manage/users/balance-adjust", { operation_id: racedOperation, actor_user_id: adminID, target_user_id: scope.userID, operation: "add", amount_microusd: "1", reason: "race" });
       expect(raced.status).toBe(403);
       expect(await raced.json()).toMatchObject({ error: { code: "ACTOR_FORBIDDEN" } });
       expect(await env.DB.prepare("SELECT count(*) count FROM management_operations WHERE operation_id=?").bind(racedOperation).first("count")).toBe(0);
       expect(await env.DB.prepare("SELECT count(*) count FROM balance_ledger WHERE operation_id=?").bind(racedOperation).first("count")).toBe(0);
-      expect(await env.DB.prepare("SELECT balance_microusd FROM users WHERE id=?").bind(scope.userID).first("balance_microusd")).toBe("1");
+      expect(await env.DB.prepare("SELECT balance_e8_usd FROM users WHERE id=?").bind(scope.userID).first("balance_e8_usd")).toBe("100");
     } finally {
       await env.DB.prepare(`DROP TRIGGER IF EXISTS ${trigger}`).run();
     }
@@ -638,7 +713,7 @@ describe("Stage C private management control plane", () => {
       allowed_group_ids: [historicalGroup],
     })).status).toBe(200);
     await env.DB.prepare("UPDATE groups SET deleted_at=? WHERE id=?").bind(new Date().toISOString(), historicalGroup).run();
-    await env.DB.prepare("UPDATE users SET balance_microusd='7654321' WHERE id=?").bind(scope.userID).run();
+    await env.DB.prepare("UPDATE users SET balance_e8_usd='765432100' WHERE id=?").bind(scope.userID).run();
 
     const notesUpdate = await call("/v1/manage/users/update", {
       operation_id: "notes-only-" + scope.userID,
@@ -647,12 +722,12 @@ describe("Stage C private management control plane", () => {
     });
     expect(notesUpdate.status).toBe(200);
     const stored = await env.DB.prepare(
-      "SELECT notes,role,balance_microusd,allowed_group_ids_json FROM users WHERE id=?",
-    ).bind(scope.userID).first<{ notes: string; role: string; balance_microusd: string; allowed_group_ids_json: string }>();
+      "SELECT notes,role,balance_e8_usd,allowed_group_ids_json FROM users WHERE id=?",
+    ).bind(scope.userID).first<{ notes: string; role: string; balance_e8_usd: string; allowed_group_ids_json: string }>();
     expect(stored).toEqual({
       notes: "preserve unrelated state",
       role: "user",
-      balance_microusd: "7654321",
+      balance_e8_usd: "765432100",
       allowed_group_ids_json: JSON.stringify([historicalGroup]),
     });
 

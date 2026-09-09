@@ -25,7 +25,7 @@ async function createUser(role: "user" | "admin", status: "active" | "disabled" 
   const stamp = new Date().toISOString();
   await env.DB.prepare(
     `INSERT INTO users(
-       id,status,role,concurrency,balance_microusd,allowed_group_ids_json,
+       id,status,role,concurrency,balance_e8_usd,allowed_group_ids_json,
        restrict_public_groups,created_at,updated_at,email,password_hash,
        username,notes,rpm_limit,deleted_at
      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,

@@ -19,7 +19,8 @@ type AuthUser = {
   role: string;
   concurrency: number;
   rpm_limit: number;
-  balance_microusd: string;
+  balance_e8_usd: string;
+  balance_microusd?: string;
   allowed_group_ids: string[];
   restrict_public_groups: boolean;
   created_at: string;
@@ -62,6 +63,15 @@ function parsedArray(value: unknown): string[] | null {
   }
 }
 
+function legacyMicrousd(value: string): string | undefined {
+  try {
+    const amount = BigInt(value);
+    return amount % 100n === 0n ? (amount / 100n).toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function authUserRow(row: Record<string, unknown>): AuthUser | null {
   const groups = parsedArray(row.allowed_group_ids_json);
   const totpEnabled = Number(row.totp_enabled);
@@ -86,7 +96,8 @@ function authUserRow(row: Record<string, unknown>): AuthUser | null {
     role: String(row.role),
     concurrency: Number(row.concurrency),
     rpm_limit: Number(row.rpm_limit),
-    balance_microusd: String(row.balance_microusd),
+    balance_e8_usd: String(row.balance_e8_usd),
+    ...(legacyMicrousd(String(row.balance_e8_usd)) === undefined ? {} : { balance_microusd: legacyMicrousd(String(row.balance_e8_usd)) }),
     allowed_group_ids: groups,
     restrict_public_groups: Number(row.restrict_public_groups) === 1,
     created_at: String(row.created_at),
@@ -124,7 +135,7 @@ async function authUser(request: Request, env: Env): Promise<Response> {
   if (hasID === hasEmail) return error("INVALID_REQUEST");
 
   let rows: D1Result<Record<string, unknown>>;
-  const columns = "id,email,username,password_hash,status,role,concurrency,rpm_limit,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,totp_enabled,totp_enabled_at,totp_revision";
+  const columns = "id,email,username,password_hash,status,role,concurrency,rpm_limit,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,totp_enabled,totp_enabled_at,totp_revision";
   if (hasID) {
     if (!id(body.id)) return error("INVALID_REQUEST");
     rows = await env.DB.prepare(

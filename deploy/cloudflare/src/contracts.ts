@@ -1,4 +1,6 @@
-export const BRIDGE_VERSION = "2026-09-06.v1";
+export const BRIDGE_VERSION = "2026-09-08.v2";
+export const D1_BASE_SCHEMA_VERSION = "2026-09-06.v1";
+export const USAGE_SCHEMA_VERSION = "2026-09-06.v1";
 export const USAGE_EVENT_TYPE = "gateway.usage.v1";
 export const INTERNAL_HOST = "sub2api.internal";
 export const MAX_CONTROL_BODY_BYTES = 64 * 1024;
@@ -120,7 +122,7 @@ export type LeaseIdentity = {
 
 export type Completion = Omit<LeaseIdentity, "owner" | "epoch"> & {
   lease_epoch: string;
-  schema_version: typeof BRIDGE_VERSION;
+  schema_version: typeof USAGE_SCHEMA_VERSION;
   event_type: typeof USAGE_EVENT_TYPE;
   event_id: string;
   api_key_id: string;

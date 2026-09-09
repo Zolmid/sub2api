@@ -5,15 +5,17 @@ brand-new Cloudflare D1 installation. It is an operator-run, out-of-band
 command ("offline" relative to the application HTTP control plane); it does
 not add or enable an HTTP setup endpoint. Remote mode still connects to D1.
 
-It refuses to mutate unless D1 reports the `2026-09-06.v1` bridge metadata,
+It refuses to mutate unless D1 reports the `2026-09-06.v1` base schema,
+`cloudflare_e8_money_scale=8`, and pricing schema `2026-09-08.v1` metadata,
 the complete Stage C `users` shape (including `email`, `password_hash`,
 `username`, `notes`, `rpm_limit`, `updated_at`, and `deleted_at`), the partial
 unique `users_email_live_identity_idx` over `lower(trim(email))`, and zero rows
 in `users`. The insert repeats the empty-table/schema guards, so a preflight
 race cannot overwrite or reset an existing account. It creates one active
 `admin` with ID `1` unless `-id` is supplied. IDs and balances are decimal
-TEXT; IDs must be positive Go `int64` values and are intentionally never
-converted to JavaScript numbers.
+TEXT; balances use integer E8 USD after migration `0008`, and IDs must be
+positive Go `int64` values. Neither is converted to a JavaScript number for
+authoritative processing.
 
 The password has no default, must contain 20 through 72 bytes (bcrypt's input
 limit), and is read twice from a real TTY with echo disabled. The command
@@ -68,7 +70,7 @@ success. Inspect or restore from the verified backup before another operator
 action.
 
 The isolated local inspect/apply/readback path has passed against a fresh D1
-with the canonical migrations `0001` through `0007`. The later migrations do
+with the canonical migrations `0001` through `0008`. The later migrations do
 not broaden bootstrap authority; the command still requires an empty,
 schema-compatible users table and creates only the first administrator. Only
 synthetic local credentials and `/private/tmp` state were used; no remote D1 or

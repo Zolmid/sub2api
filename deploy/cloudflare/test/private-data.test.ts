@@ -19,8 +19,8 @@ const stamp = "2026-09-06T00:00:00.000Z";
 
 async function insertUser(id: string, email: string, status = "active", deletedAt: string | null = null) {
   await env.DB.prepare(
-    "INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-  ).bind(id, status, "user", 1, "1", "[]", 0, stamp, email, "bcrypt-test-password-hash", "tester", "", 0, stamp, deletedAt).run();
+    "INSERT INTO users(id,status,role,concurrency,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+  ).bind(id, status, "user", 1, "100", "[]", 0, stamp, email, "bcrypt-test-password-hash", "tester", "", 0, stamp, deletedAt).run();
 }
 
 async function insertGroup(id: string) {

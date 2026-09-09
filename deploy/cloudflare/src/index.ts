@@ -14,6 +14,7 @@ import {
 import { AuthLoginAdmissionDO } from "./auth-login-admission";
 import { AccountLeaseDO } from "./lease";
 import { TOTPSecurityDO } from "./totp-security";
+import { validateActivePricing } from "./pricing";
 
 export { AccountLeaseDO, AuthLoginAdmissionDO, TOTPSecurityDO, ContainerProxy };
 
@@ -372,6 +373,15 @@ export async function routeIngress(
     // forging the URL/Host. Only Container outbound dispatch invokes it.
     return error("NOT_FOUND", 404);
   }
+  const url = new URL(request.url);
+  if (request.method === "GET" && url.pathname === "/ready") {
+    try {
+      await validateActivePricing(env);
+      return new Response(null, { status: 200, headers: { "cache-control": "no-store" } });
+    } catch {
+      return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
+    }
+  }
   const runtime = env as unknown as ContainerRuntimeEnv;
   const containerName = selectContainerName(
     request,
@@ -382,7 +392,6 @@ export async function routeIngress(
     return error("FIXTURE_CONTAINER_INVALID", 400);
   }
 
-  const url = new URL(request.url);
   if (request.method === "POST" && url.pathname === AUTH_LOGIN_PATH) {
     // This preflight intentionally examines only the authoritative edge
     // address header; the login body is still unread at Container handoff.

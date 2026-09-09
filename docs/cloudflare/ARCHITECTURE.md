@@ -40,11 +40,13 @@ after defining `Sub2APIContainer`; a native static class field would shadow the
 setter and leave `ContainerProxy` without a handler. A regression test locks
 this runtime-sensitive invariant.
 
-Every call includes `X-Sub2API-Bridge-Version: 2026-09-06.v1`. Incompatible
-changes require a new version/route. Persistent identifiers, epochs, token
-counts, and durations cross JSON as decimal strings so an existing Go `int64`
-cannot be rounded by JavaScript. Raw API keys appear only in the private auth
-request body; the Worker hashes them before lookup and neither side logs them.
+Every call includes `X-Sub2API-Bridge-Version: 2026-09-08.v2`. Incompatible
+control-plane changes require a new negotiated version. Usage envelopes retain
+their independent `2026-09-06.v1` schema version. Persistent identifiers,
+epochs, token counts, durations, and authoritative E8 USD amounts cross JSON as
+decimal strings so JavaScript cannot round them. Raw API keys appear only in
+the private auth request body; the Worker hashes them before lookup and neither
+side logs them.
 
 The v1 operations are:
 
@@ -52,7 +54,7 @@ The v1 operations are:
 | --- | --- | --- |
 | Resolve API key | D1 reads key, user, and group state; KV may provide only a rebuildable hash alias | D1 status and relationship checks remain authoritative |
 | Touch API key | D1 updates last-used metadata | Monotonic/latest timestamp update |
-| Admit request | D1 creates or reads the request admission; an account business DO grants capacity | Server-generated `request_id`; DO returns `lease_id`, owner, epoch, and expiry |
+| Admit request | D1 validates the active immutable pricing snapshot and creates or reads the request admission; an account business DO grants capacity | Server-generated `request_id`; admitted pricing version/digest/rule and DO lease identity are fixed on the request |
 | Renew lease | Account business DO extends one matching active lease | Full request/account/lease/owner/epoch match required |
 | Complete request | D1 records immutable outcome/usage and an outbox event | Stable server-generated `event_id`; different payload for one ID is a conflict |
 | Release lease | Account business DO removes a matching lease | Repeated release is safe; stale owner or epoch cannot release a newer lease |

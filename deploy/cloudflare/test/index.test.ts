@@ -1,3 +1,4 @@
+import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { INTERNAL_HOST } from "../src/contracts";
 import {
@@ -5,6 +6,7 @@ import {
   parseContainerHosts,
   sanitizeIngressRequest,
   selectContainerName,
+  routeIngress,
 } from "../src/index";
 
 describe("container egress registration", () => {
@@ -74,5 +76,24 @@ describe("container egress registration", () => {
     expect(sanitized.headers.has("X-Sub2API-Fixture-Container")).toBe(false);
     expect(sanitized.headers.has("X-Sub2API-Bridge-Version")).toBe(false);
     expect(sanitized.headers.has("X-Sub2API-Container-Id")).toBe(false);
+  });
+});
+
+describe("edge readiness", () => {
+  it("checks the authoritative pricing snapshot without waking a Container", async () => {
+    let forwarded = 0;
+    const forward = async () => {
+      forwarded += 1;
+      return new Response("unexpected");
+    };
+    const ready = await routeIngress(new Request("https://example.test/ready"), env, forward);
+    expect(ready.status).toBe(200);
+    expect(ready.headers.get("cache-control")).toBe("no-store");
+    expect(forwarded).toBe(0);
+
+    await env.DB.prepare("DELETE FROM pricing_active_version").run();
+    const unavailable = await routeIngress(new Request("https://example.test/ready"), env, forward);
+    expect(unavailable.status).toBe(503);
+    expect(forwarded).toBe(0);
   });
 });

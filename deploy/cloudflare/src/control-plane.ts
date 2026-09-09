@@ -2,12 +2,14 @@ import type { Completion, UsageEnvelope } from "./contracts";
 import { decryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
 import { managementControlPlane } from "./management";
 import { privateDataPlane } from "./private-data";
+import { lookupAdmissionPriceCard } from "./pricing";
 import { isTOTPControlPath, totpControlPlane } from "./totp-control";
 import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
   MAX_CONTROL_BODY_BYTES,
   USAGE_EVENT_TYPE,
+  USAGE_SCHEMA_VERSION,
   canonical,
   error,
   isBoundedString,
@@ -50,7 +52,7 @@ type AuthRow = {
   user_status: string;
   role: string;
   concurrency: number;
-  balance_microusd: string;
+  balance_e8_usd: string;
   allowed_group_ids_json: string;
   restrict_public_groups: number;
   group_name: string | null;
@@ -93,6 +95,9 @@ type GatewayIdentity = {
   owner: string;
   model: string;
   upstream_model: string;
+  pricing_version_id: string | null;
+  pricing_digest: string | null;
+  pricing_rule_pattern: string | null;
   state: string;
 };
 
@@ -182,7 +187,7 @@ async function fetchAuthRowByHash(hash: string, env: Env): Promise<AuthRow | nul
        u.status user_status,
        u.role,
        u.concurrency,
-       u.balance_microusd,
+       u.balance_e8_usd,
        u.allowed_group_ids_json,
        u.restrict_public_groups,
        g.name group_name,
@@ -215,7 +220,7 @@ async function fetchAuthRowByID(keyID: string, env: Env): Promise<AuthRow | null
        u.status user_status,
        u.role,
        u.concurrency,
-       u.balance_microusd,
+       u.balance_e8_usd,
        u.allowed_group_ids_json,
        u.restrict_public_groups,
        g.name group_name,
@@ -278,7 +283,7 @@ function permittedAuth(row: AuthRow, requestedGroup?: string): boolean {
     isCanonicalPositiveDecimal(row.user_id) &&
     isCanonicalPositiveDecimal(row.group_id) &&
     (requestedGroup === undefined || row.group_id === requestedGroup) &&
-    hasPositiveBalance(row.balance_microusd) &&
+    hasPositiveBalance(row.balance_e8_usd) &&
     isUnexpired(row.expires_at)
   );
 }
@@ -475,6 +480,12 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
 
   const mapped = await resolveAlias(body.model, env);
   if (!mapped) return error("ADMISSION_REJECTED", 429);
+  let priceCard;
+  try {
+    priceCard = await lookupAdmissionPriceCard(env, body.model);
+  } catch {
+    return error("PRICING_UNAVAILABLE", 503);
+  }
 
   const account = await env.DB.prepare(
     `SELECT
@@ -539,8 +550,8 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
     inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO gateway_requests(
          request_id,api_key_id,account_id,lease_id,lease_epoch,owner,
-         model,upstream_model,state,created_at
-       ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+         model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,state,created_at
+       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
       .bind(
         body.request_id,
@@ -551,6 +562,9 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
         owner,
         body.model,
         mapped.upstream_model,
+        priceCard.version_id,
+        priceCard.digest,
+        priceCard.rule.model_pattern,
         "admitted",
         now(),
       )
@@ -563,7 +577,7 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
   if ((inserted.meta.changes ?? 0) === 0) {
     const existing = await env.DB.prepare(
       `SELECT request_id,api_key_id,account_id,lease_id,lease_epoch,
-              owner,model,upstream_model,state
+              owner,model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,state
        FROM gateway_requests WHERE request_id=?`,
     )
       .bind(body.request_id)
@@ -577,6 +591,9 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
       existing.owner === owner &&
       existing.model === body.model &&
       existing.upstream_model === mapped.upstream_model &&
+      existing.pricing_version_id === priceCard.version_id &&
+      existing.pricing_digest === priceCard.digest &&
+      existing.pricing_rule_pattern === priceCard.rule.model_pattern &&
       existing.state === "admitted";
     if (!same) {
       if (leased.created) await releaseNewLease(stub, leased.lease);
@@ -595,6 +612,7 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
       extra,
     },
     upstream_model: mapped.upstream_model,
+    price_card: priceCard,
     lease: leased.lease,
   });
 }
@@ -657,7 +675,7 @@ export function validCompletion(value: unknown): value is Completion {
   const body = value as Partial<Completion>;
   if (Object.keys(value).some((key) => !completionKeys.has(key))) return false;
   return (
-    body.schema_version === BRIDGE_VERSION &&
+    body.schema_version === USAGE_SCHEMA_VERSION &&
     body.event_type === USAGE_EVENT_TYPE &&
     isBoundedString(body.request_id, 256) &&
     body.event_id === `${body.request_id}:usage:v1` &&

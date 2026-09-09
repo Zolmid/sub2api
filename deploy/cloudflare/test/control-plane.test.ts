@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import { controlPlane } from "../src/control-plane";
 import {
   BRIDGE_VERSION,
+  D1_BASE_SCHEMA_VERSION,
   USAGE_EVENT_TYPE,
+  USAGE_SCHEMA_VERSION,
   type Completion,
 } from "../src/contracts";
 import worker from "../src/index";
@@ -35,6 +37,12 @@ type Admission = {
     extra: Record<string, unknown>;
   };
   upstream_model: string;
+  price_card: {
+    version_id: string;
+    digest: string;
+    max_reservation_e8_usd: string;
+    rule: { version_id: string; model_pattern: string; match_kind: string };
+  };
   lease: {
     account_id: string;
     request_id: string;
@@ -78,7 +86,7 @@ const completionFor = (
   admission: Admission,
   overrides: Partial<Completion> = {},
 ): Completion => ({
-  schema_version: BRIDGE_VERSION,
+  schema_version: USAGE_SCHEMA_VERSION,
   event_type: USAGE_EVENT_TYPE,
   event_id: `${admission.lease.request_id}:usage:v1`,
   request_id: admission.lease.request_id,
@@ -123,11 +131,11 @@ describe("D1-backed private control plane", () => {
       await env.DB.prepare(
         "SELECT value FROM schema_metadata WHERE key='cloudflare_bridge_schema_version'",
       ).first("value"),
-    ).toBe(BRIDGE_VERSION);
+    ).toBe(D1_BASE_SCHEMA_VERSION);
     await expect(
       env.DB.prepare(
         `INSERT INTO users(
-           id,status,role,concurrency,balance_microusd,
+           id,status,role,concurrency,balance_e8_usd,
            allowed_group_ids_json,restrict_public_groups,created_at
          ) VALUES('01','active','user',1,'1','[]',0,'now')`,
       ).run(),
@@ -200,6 +208,16 @@ describe("D1-backed private control plane", () => {
         extra: { openai_responses_supported: false },
       },
       upstream_model: "mock-upstream-model",
+      price_card: {
+        version_id: "fixture-v1",
+        digest: "37c6c3745cdf65cf1c54ddbcb1a205657ea2d4fabb0121807a9f99aefcbd5d1d",
+        max_reservation_e8_usd: "100000000000",
+        rule: {
+          version_id: "fixture-v1",
+          model_pattern: "fixture-model",
+          match_kind: "exact",
+        },
+      },
       lease: {
         account_id: "4001",
         request_id: "request-admission-compatible",
@@ -209,15 +227,49 @@ describe("D1-backed private control plane", () => {
     expect(Date.parse(admission.lease.expires_at)).toBeGreaterThan(Date.now());
 
     const row = await env.DB.prepare(
-      "SELECT owner,upstream_model FROM gateway_requests WHERE request_id=?",
+      "SELECT owner,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern FROM gateway_requests WHERE request_id=?",
     )
       .bind(admission.lease.request_id)
-      .first<{ owner: string; upstream_model: string }>();
+      .first<{ owner: string; upstream_model: string; pricing_version_id: string; pricing_digest: string; pricing_rule_pattern: string }>();
     expect(row).toEqual({
       owner: "container-test-a",
       upstream_model: "mock-upstream-model",
+      pricing_version_id: admission.price_card.version_id,
+      pricing_digest: admission.price_card.digest,
+      pricing_rule_pattern: admission.price_card.rule.model_pattern,
     });
     expect((await release(admission)).status).toBe(200);
+  });
+
+  it("fails closed before leasing when the active price snapshot is unavailable", async () => {
+    await env.DB.prepare("DELETE FROM pricing_active_version").run();
+    const noLeaseEnv = overrideEnv({
+      ACCOUNT_LEASE: {
+        idFromName: () => { throw new Error("lease access must not occur"); },
+      },
+    });
+    const before = await env.DB.prepare(
+      "SELECT count(*) AS count FROM gateway_requests WHERE request_id='request-no-price'",
+    ).first<number>("count");
+    const response = await call(
+      "/v1/requests/admit",
+      {
+        request_id: "request-no-price",
+        api_key_id: "3001",
+        group_id: "2001",
+        model: "fixture-model",
+        lease_ttl_seconds: 30,
+      },
+      noLeaseEnv,
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: { code: "PRICING_UNAVAILABLE", message: "PRICING_UNAVAILABLE" },
+    });
+    expect(before).toBe(0);
+    expect(await env.DB.prepare(
+      "SELECT count(*) AS count FROM gateway_requests WHERE request_id='request-no-price'",
+    ).first<number>("count")).toBe(0);
   });
 
   it("uses D1 authority on KV miss, stale value, and KV failure", async () => {

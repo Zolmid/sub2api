@@ -23,6 +23,8 @@ import (
 
 const (
 	bridgeSchemaVersion   = "2026-09-06.v1"
+	e8MoneyScale          = "8"
+	pricingSchemaVersion  = "2026-09-08.v1"
 	remoteAcknowledgement = "I_HAVE_EXPORTED_A_D1_BACKUP_AND_ACCEPT_REMOTE_FIRST_ADMIN_BOOTSTRAP"
 	localDatabaseName     = "sub2api-cloudflare-local"
 	remoteDatabaseName    = "sub2api-cloudflare"
@@ -336,6 +338,10 @@ func inspect(ctx context.Context, t target, deps dependencies) error {
 	if integer(row, "metadata_rows") != 1 || integer(row, "metadata_matches") != 1 {
 		return errors.New("preflight refused: Cloudflare bridge schema metadata is incompatible or ambiguous")
 	}
+	if integer(row, "e8_metadata_rows") != 1 || integer(row, "e8_metadata_matches") != 1 ||
+		integer(row, "pricing_metadata_rows") != 1 || integer(row, "pricing_metadata_matches") != 1 {
+		return errors.New("preflight refused: Cloudflare migration 0008 e8 money and pricing metadata is required")
+	}
 	if integer(row, "stage_c_columns") != 15 {
 		return errors.New("preflight refused: required Stage C users columns/shape are incompatible")
 	}
@@ -351,36 +357,42 @@ func inspect(ctx context.Context, t target, deps dependencies) error {
 func preflightSQL() string {
 	return fmt.Sprintf(`WITH cols AS (SELECT name, lower(type) AS type, "notnull" AS nn, pk FROM pragma_table_info('users'))
 SELECT
-  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version') AS metadata_rows,
-  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version' AND value=%s) AS metadata_matches,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version') AS metadata_rows,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version' AND value=%s) AS metadata_matches,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_e8_money_scale') AS e8_metadata_rows,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_e8_money_scale' AND value=%s) AS e8_metadata_matches,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_pricing_schema_version') AS pricing_metadata_rows,
+	  (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_pricing_schema_version' AND value=%s) AS pricing_metadata_matches,
   (SELECT count(*) FROM cols WHERE
     (name='id' AND type='text' AND pk=1) OR
     (name IN ('status','role','allowed_group_ids_json','created_at','email','password_hash','username','notes','updated_at') AND type='text' AND nn=1 AND pk=0) OR
-    (name='balance_microusd' AND type='text' AND nn=1 AND pk=0) OR
+    (name='balance_e8_usd' AND type='text' AND nn=1 AND pk=0) OR
     (name IN ('concurrency','restrict_public_groups','rpm_limit') AND type='integer' AND nn=1 AND pk=0) OR
     (name='deleted_at' AND type='text' AND nn=0 AND pk=0)
   ) AS stage_c_columns,
   (SELECT count(*) FROM pragma_index_list('users') WHERE name='users_email_live_identity_idx' AND "unique"=1 AND partial=1) AS email_index_flags,
   (SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_identity_idx') AS email_index_sql,
-  (SELECT count(*) FROM users) AS users_count`, sqlLiteral(bridgeSchemaVersion))
+	  (SELECT count(*) FROM users) AS users_count`, sqlLiteral(bridgeSchemaVersion), sqlLiteral(e8MoneyScale), sqlLiteral(pricingSchemaVersion))
 }
 
 func guardedInsertSQL(a firstAdmin) string {
-	return fmt.Sprintf(`INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at)
+	return fmt.Sprintf(`INSERT INTO users(id,status,role,concurrency,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at)
 SELECT %s,'active','admin',1,'0','[]',0,%s,%s,%s,%s,%s,0,%s,NULL
-WHERE NOT EXISTS (SELECT 1 FROM users)
-  AND (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version' AND value=%s)=1
+	WHERE NOT EXISTS (SELECT 1 FROM users)
+	  AND (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_bridge_schema_version' AND value=%s)=1
+	  AND (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_e8_money_scale' AND value=%s)=1
+	  AND (SELECT count(*) FROM schema_metadata WHERE key='cloudflare_pricing_schema_version' AND value=%s)=1
   AND (SELECT count(*) FROM pragma_table_info('users') WHERE
     (name='id' AND lower(type)='text' AND pk=1) OR
     (name IN ('status','role','allowed_group_ids_json','created_at','email','password_hash','username','notes','updated_at') AND lower(type)='text' AND "notnull"=1 AND pk=0) OR
-    (name='balance_microusd' AND lower(type)='text' AND "notnull"=1 AND pk=0) OR
+    (name='balance_e8_usd' AND lower(type)='text' AND "notnull"=1 AND pk=0) OR
     (name IN ('concurrency','restrict_public_groups','rpm_limit') AND lower(type)='integer' AND "notnull"=1 AND pk=0) OR
     (name='deleted_at' AND lower(type)='text' AND "notnull"=0 AND pk=0)
   )=15
   AND EXISTS (SELECT 1 FROM pragma_index_list('users') WHERE name='users_email_live_identity_idx' AND "unique"=1 AND partial=1)
   AND replace(replace(replace(replace(lower((SELECT sql FROM sqlite_master WHERE type='index' AND name='users_email_live_identity_idx')), ' ', ''), char(9), ''), char(10), ''), char(13), '')=%s
 RETURNING id AS inserted_id`,
-		sqlLiteral(a.id()), sqlLiteral(a.createdAt), sqlLiteral(a.email()), sqlLiteral(a.passwordHash), sqlLiteral(a.username), sqlLiteral(a.notes), sqlLiteral(a.createdAt), sqlLiteral(bridgeSchemaVersion), sqlLiteral(stageCEmailIndexSQL))
+		sqlLiteral(a.id()), sqlLiteral(a.createdAt), sqlLiteral(a.email()), sqlLiteral(a.passwordHash), sqlLiteral(a.username), sqlLiteral(a.notes), sqlLiteral(a.createdAt), sqlLiteral(bridgeSchemaVersion), sqlLiteral(e8MoneyScale), sqlLiteral(pricingSchemaVersion), sqlLiteral(stageCEmailIndexSQL))
 }
 
 func readBackSQL(a firstAdmin) string {
@@ -389,7 +401,7 @@ func readBackSQL(a firstAdmin) string {
 		"(SELECT count(*) FROM users) AS users_count",
 		fmt.Sprintf("(SELECT count(*) FROM users WHERE %s) AS matching_count", match),
 	}
-	for _, column := range []string{"id", "email", "username", "notes", "status", "role", "concurrency", "rpm_limit", "balance_microusd", "allowed_group_ids_json", "restrict_public_groups", "created_at", "updated_at", "deleted_at"} {
+	for _, column := range []string{"id", "email", "username", "notes", "status", "role", "concurrency", "rpm_limit", "balance_e8_usd", "allowed_group_ids_json", "restrict_public_groups", "created_at", "updated_at", "deleted_at"} {
 		parts = append(parts, fmt.Sprintf("(SELECT %s FROM users WHERE %s LIMIT 1) AS %s", column, match, column))
 	}
 	parts = append(parts, fmt.Sprintf("(SELECT password_hash=%s FROM users WHERE %s LIMIT 1) AS password_hash_matches", sqlLiteral(a.passwordHash), match))
@@ -469,7 +481,7 @@ func readBack(ctx context.Context, t target, deps dependencies, a firstAdmin) er
 		stringField(row, "username") != a.username || stringField(row, "notes") != a.notes ||
 		stringField(row, "status") != "active" || stringField(row, "role") != "admin" ||
 		integer(row, "concurrency") != 1 || integer(row, "rpm_limit") != 0 ||
-		stringField(row, "balance_microusd") != "0" || stringField(row, "allowed_group_ids_json") != "[]" ||
+		stringField(row, "balance_e8_usd") != "0" || stringField(row, "allowed_group_ids_json") != "[]" ||
 		integer(row, "restrict_public_groups") != 0 || stringField(row, "created_at") != a.createdAt ||
 		stringField(row, "updated_at") != a.createdAt || !isNull(row["deleted_at"]) ||
 		integer(row, "password_hash_matches") != 1 {

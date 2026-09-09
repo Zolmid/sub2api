@@ -95,6 +95,8 @@ func mutationStatement(id string) []byte {
 func preflightRow(overrides map[string]any) map[string]any {
 	row := map[string]any{
 		"metadata_rows": 1, "metadata_matches": 1, "stage_c_columns": 15,
+		"e8_metadata_rows": 1, "e8_metadata_matches": 1,
+		"pricing_metadata_rows": 1, "pricing_metadata_matches": 1,
 		"email_index_flags": 1,
 		"email_index_sql":   "CREATE UNIQUE INDEX users_email_live_identity_idx ON users(lower(trim(email))) WHERE email <> '' AND deleted_at IS NULL",
 		"users_count":       0,
@@ -109,7 +111,7 @@ func readbackRow(a firstAdmin, overrides map[string]any) map[string]any {
 	row := map[string]any{
 		"users_count": 1, "matching_count": 1, "id": a.id(), "email": a.email(),
 		"username": a.username, "notes": a.notes, "status": "active", "role": "admin",
-		"concurrency": 1, "rpm_limit": 0, "balance_microusd": "0", "allowed_group_ids_json": "[]",
+		"concurrency": 1, "rpm_limit": 0, "balance_e8_usd": "0", "allowed_group_ids_json": "[]",
 		"restrict_public_groups": 0, "created_at": a.createdAt, "updated_at": a.createdAt,
 		"deleted_at": nil, "password_hash_matches": 1,
 	}
@@ -239,10 +241,12 @@ func TestInputValidationAndTextIDBoundary(t *testing.T) {
 
 func TestPreflightFailsClosed(t *testing.T) {
 	for name, row := range map[string]map[string]any{
-		"schema mismatch": {"metadata_matches": 0},
-		"non empty users": {"users_count": 1},
-		"missing stage c": {"stage_c_columns": 14},
-		"bad index":       {"email_index_flags": 0},
+		"schema mismatch":           {"metadata_matches": 0},
+		"missing e8 migration":      {"e8_metadata_rows": 0, "e8_metadata_matches": 0},
+		"pricing metadata mismatch": {"pricing_metadata_matches": 0},
+		"non empty users":           {"users_count": 1},
+		"missing stage c":           {"stage_c_columns": 14},
+		"bad index":                 {"email_index_flags": 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			runner := &fakeRunner{preflight: statement(preflightRow(row))}
@@ -455,13 +459,16 @@ func openBootstrapTestDB(t *testing.T, indexDDL string) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	schema := `CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO schema_metadata(key,value) VALUES ('cloudflare_bridge_schema_version','2026-09-06.v1');
+	INSERT INTO schema_metadata(key,value) VALUES
+	  ('cloudflare_bridge_schema_version','2026-09-06.v1'),
+	  ('cloudflare_e8_money_scale','8'),
+	  ('cloudflare_pricing_schema_version','2026-09-08.v1');
 CREATE TABLE users (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
   role TEXT NOT NULL,
   concurrency INTEGER NOT NULL,
-  balance_microusd TEXT NOT NULL,
+  balance_e8_usd TEXT NOT NULL,
   allowed_group_ids_json TEXT NOT NULL,
   restrict_public_groups INTEGER NOT NULL,
   created_at TEXT NOT NULL,

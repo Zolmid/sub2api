@@ -7,8 +7,8 @@ import {
 import { describe, expect, it } from "vitest";
 import { drainOutbox } from "../src/control-plane";
 import {
-  BRIDGE_VERSION,
   USAGE_EVENT_TYPE,
+  USAGE_SCHEMA_VERSION,
   canonical,
   sha256,
   type Completion,
@@ -17,7 +17,7 @@ import {
 import worker from "../src/index";
 
 const completion = (requestID: string, outputTokens = "4"): Completion => ({
-  schema_version: BRIDGE_VERSION,
+  schema_version: USAGE_SCHEMA_VERSION,
   event_type: USAGE_EVENT_TYPE,
   event_id: `${requestID}:usage:v1`,
   request_id: requestID,
@@ -50,11 +50,20 @@ const insertRequest = async (
   state: "admitted" | "succeeded" = "succeeded",
   withOutbox = state === "succeeded",
 ): Promise<void> => {
+  const pricing = await env.DB.prepare(
+    `SELECT a.version_id,v.digest,r.model_pattern
+     FROM pricing_active_version a
+     JOIN pricing_versions v ON v.version_id=a.version_id
+     JOIN pricing_rules r ON r.version_id=a.version_id
+     WHERE r.model_pattern='fixture-model'`,
+  ).first<{ version_id: string; digest: string; model_pattern: string }>();
+  if (!pricing) throw new Error("fixture pricing is unavailable");
   await env.DB.prepare(
     `INSERT INTO gateway_requests(
        request_id,api_key_id,account_id,lease_id,lease_epoch,owner,
-       model,upstream_model,state,event_id,completed_at,created_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+       model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,
+       state,event_id,completed_at,created_at
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   )
     .bind(
       value.request_id,
@@ -65,6 +74,9 @@ const insertRequest = async (
       "container-queue-test",
       value.model,
       value.upstream_model,
+      pricing.version_id,
+      pricing.digest,
+      pricing.model_pattern,
       state,
       state === "succeeded" ? value.event_id : null,
       state === "succeeded" ? "2026-09-06T00:00:01Z" : null,
@@ -129,7 +141,7 @@ describe("usage Queue consumer", () => {
       .bind(value.event_id)
       .first<Record<string, string>>();
     expect(usage).toEqual({
-      schema_version: BRIDGE_VERSION,
+      schema_version: USAGE_SCHEMA_VERSION,
       event_type: USAGE_EVENT_TYPE,
       input_tokens: "11",
       output_tokens: "4",

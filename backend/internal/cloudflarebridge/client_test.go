@@ -4,6 +4,7 @@ package cloudflarebridge
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -66,11 +67,20 @@ func TestHTTPControlPlaneMapsNotFoundWithoutLeakingResponseBody(t *testing.T) {
 func TestHTTPControlPlaneRejectsMismatchedLeaseIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{
-			"upstream_model":"fixture-upstream",
-			"account":{"id":"3001","name":"fixture","platform":"openai","type":"apikey","concurrency":1,"credentials":{"api_key":"fixture-secret"},"extra":{}},
-			"lease":{"lease_id":"lease","request_id":"different-request","account_id":"3001","owner":"container","epoch":"1","expires_at":"2030-01-01T00:00:00Z"}
-		}`)
+		card := testAdmittedCard()
+		card.Rule.ModelPattern = "test-model"
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"upstream_model": "fixture-upstream",
+			"price_card":     card,
+			"account": map[string]any{
+				"id": "3001", "name": "fixture", "platform": "openai", "type": "apikey",
+				"concurrency": 1, "credentials": map[string]any{"api_key": "fixture-secret"}, "extra": map[string]any{},
+			},
+			"lease": map[string]any{
+				"lease_id": "lease", "request_id": "different-request", "account_id": "3001",
+				"owner": "container", "epoch": "1", "expires_at": "2030-01-01T00:00:00Z",
+			},
+		}))
 	}))
 	defer server.Close()
 
@@ -89,11 +99,22 @@ func TestHTTPControlPlaneRejectsMismatchedLeaseIdentity(t *testing.T) {
 func TestHTTPControlPlaneAdmissionPreservesMappedModelAndDecimalLeaseIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{
-			"upstream_model":"mapped-model",
-			"account":{"id":"9007199254740993","name":"fixture","platform":"openai","type":"apikey","concurrency":1,"credentials":{"api_key":"fixture-secret","base_url":"https://mock.upstream"},"extra":{"openai_responses_supported":false}},
-			"lease":{"lease_id":"lease","request_id":"expected-request","account_id":"9007199254740993","owner":"container","epoch":"9007199254740994","expires_at":"2030-01-01T00:00:00Z"}
-		}`)
+		card := testAdmittedCard()
+		card.Rule.ModelPattern = "client-model"
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"upstream_model": "mapped-model",
+			"price_card":     card,
+			"account": map[string]any{
+				"id": "9007199254740993", "name": "fixture", "platform": "openai", "type": "apikey",
+				"concurrency": 1,
+				"credentials": map[string]any{"api_key": "fixture-secret", "base_url": "https://mock.upstream"},
+				"extra":       map[string]any{"openai_responses_supported": false},
+			},
+			"lease": map[string]any{
+				"lease_id": "lease", "request_id": "expected-request", "account_id": "9007199254740993",
+				"owner": "container", "epoch": "9007199254740994", "expires_at": "2030-01-01T00:00:00Z",
+			},
+		}))
 	}))
 	defer server.Close()
 
@@ -110,6 +131,33 @@ func TestHTTPControlPlaneAdmissionPreservesMappedModelAndDecimalLeaseIdentity(t 
 	require.Equal(t, "mapped-model", admission.UpstreamModel)
 	require.Equal(t, "9007199254740994", admission.Lease.Epoch)
 	require.Equal(t, int64(9007199254740993), admission.Account.ID)
+	require.Equal(t, "2026-09-09.test", admission.PriceCard.VersionID)
+}
+
+func TestHTTPControlPlaneRejectsPriceCardForAnotherModel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		card := testAdmittedCard()
+		card.Rule.ModelPattern = "other-model"
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"upstream_model": "mapped-model", "price_card": card,
+			"account": map[string]any{
+				"id": "3001", "name": "fixture", "platform": "openai", "type": "apikey",
+				"concurrency": 1, "credentials": map[string]any{"api_key": "fixture-secret"}, "extra": map[string]any{},
+			},
+			"lease": map[string]any{
+				"lease_id": "lease", "request_id": "expected-request", "account_id": "3001",
+				"owner": "container", "epoch": "1", "expires_at": "2030-01-01T00:00:00Z",
+			},
+		}))
+	}))
+	defer server.Close()
+	client, err := NewHTTPControlPlane(server.URL, server.Client())
+	require.NoError(t, err)
+	_, err = client.Admit(context.Background(), AdmissionRequest{
+		RequestID: "expected-request", APIKeyID: "4001", GroupID: "2001",
+		Model: "client-model", LeaseTTLSeconds: 90,
+	})
+	require.ErrorContains(t, err, "price card")
 }
 
 func TestHTTPControlPlaneRejectsOversizedResponse(t *testing.T) {

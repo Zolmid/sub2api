@@ -288,7 +288,8 @@ func (c *HTTPControlPlane) TouchAPIKey(ctx context.Context, keyID int64, usedAt 
 }
 
 type admissionResponse struct {
-	UpstreamModel string `json:"upstream_model"`
+	UpstreamModel string            `json:"upstream_model"`
+	PriceCard     AdmittedPriceCard `json:"price_card"`
 	Account       struct {
 		ID          string         `json:"id"`
 		Name        string         `json:"name"`
@@ -319,6 +320,9 @@ func (c *HTTPControlPlane) Admit(ctx context.Context, request AdmissionRequest) 
 	if strings.TrimSpace(response.UpstreamModel) == "" {
 		return nil, errors.New("invalid admission response: upstream model is required")
 	}
+	if err := ValidateAdmittedPriceCardForModel(response.PriceCard, request.Model); err != nil {
+		return nil, errors.New("invalid admission response: price card")
+	}
 	apiKey, ok := response.Account.Credentials["api_key"].(string)
 	if !ok || strings.TrimSpace(apiKey) == "" {
 		return nil, errors.New("invalid admission response: account credential is required")
@@ -344,7 +348,7 @@ func (c *HTTPControlPlane) Admit(ctx context.Context, request AdmissionRequest) 
 		Status:      service.StatusActive,
 		Schedulable: true,
 	}
-	return &Admission{Account: account, Lease: response.Lease, UpstreamModel: response.UpstreamModel}, nil
+	return &Admission{Account: account, Lease: response.Lease, UpstreamModel: response.UpstreamModel, PriceCard: response.PriceCard}, nil
 }
 
 func isCanonicalPositiveDecimal(value string) bool {

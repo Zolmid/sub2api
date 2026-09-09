@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -16,44 +15,40 @@ import (
 // the administrator balance-history view. Ledger and operation identifiers are
 // intentionally absent from this public-facing projection.
 type ManagedBalanceHistoryEntry struct {
-	ID                    int64
-	AdjustmentType        string
-	Reason                string
-	DeltaMicroUSD         string
-	BalanceBeforeMicroUSD string
-	BalanceAfterMicroUSD  string
-	CreatedAt             time.Time
+	ID                 int64
+	AdjustmentType     string
+	Reason             string
+	DeltaE8USD         string
+	BalanceBeforeE8USD string
+	BalanceAfterE8USD  string
+	CreatedAt          time.Time
 }
 
 type ManagedBalanceHistoryPage struct {
-	Entries        []ManagedBalanceHistoryEntry
-	Total          int64
-	TotalRecharged float64
+	Entries             []ManagedBalanceHistoryEntry
+	Total               int64
+	TotalRechargedE8USD string
 }
 
 type AdminBalanceHistoryControlPlane interface {
 	GetManagedBalanceHistory(context.Context, int64, int, int, string) (*ManagedBalanceHistoryPage, error)
 }
 
-func signedDisplayBalanceFromMicroUSD(value string) (float64, error) {
+func signedDisplayBalanceFromE8USD(value string) (float64, error) {
 	negative := false
 	digits := value
 	if strings.HasPrefix(value, "-") {
 		negative = true
 		digits = value[1:]
 	}
-	if !canonicalUnsignedDecimal(digits) || len(digits) > 40 {
+	if !canonicalUnsignedDecimal(digits) || len(digits) > 40 || negative && digits == "0" {
 		return 0, errors.New("invalid balance history amount")
 	}
-	microUSD, err := strconv.ParseUint(digits, 10, 64)
-	if err != nil || microUSD > maxExactFloatInteger {
-		return 0, errors.New("balance history amount is not exactly representable")
+	amount, err := displayBalanceFromE8USD(digits)
+	if err != nil {
+		return 0, errors.New("invalid balance history amount")
 	}
-	amount := float64(microUSD) / float64(microUSDPerUSD)
-	if math.IsNaN(amount) || math.IsInf(amount, 0) || uint64(math.Round(amount*float64(microUSDPerUSD))) != microUSD {
-		return 0, errors.New("balance history amount is not exactly representable")
-	}
-	if negative && microUSD != 0 {
+	if negative {
 		return -amount, nil
 	}
 	return amount, nil
@@ -65,16 +60,16 @@ func (c *HTTPControlPlane) GetManagedBalanceHistory(ctx context.Context, userID 
 	}
 	var response struct {
 		Items []struct {
-			ID                    string `json:"id"`
-			AdjustmentType        string `json:"adjustment_type"`
-			Reason                string `json:"reason"`
-			DeltaMicroUSD         string `json:"delta_microusd"`
-			BalanceBeforeMicroUSD string `json:"balance_before_microusd"`
-			BalanceAfterMicroUSD  string `json:"balance_after_microusd"`
-			CreatedAt             string `json:"created_at"`
+			ID                 string `json:"id"`
+			AdjustmentType     string `json:"adjustment_type"`
+			Reason             string `json:"reason"`
+			DeltaE8USD         string `json:"delta_e8_usd"`
+			BalanceBeforeE8USD string `json:"balance_before_e8_usd"`
+			BalanceAfterE8USD  string `json:"balance_after_e8_usd"`
+			CreatedAt          string `json:"created_at"`
 		} `json:"items"`
-		Total          string  `json:"total"`
-		TotalRecharged float64 `json:"total_recharged"`
+		Total               string `json:"total"`
+		TotalRechargedE8USD string `json:"total_recharged_e8_usd"`
 	}
 	request := struct {
 		ID       string `json:"id"`
@@ -88,16 +83,17 @@ func (c *HTTPControlPlane) GetManagedBalanceHistory(ctx context.Context, userID 
 		return nil, mapManagedReadError(err, service.ErrUserNotFound)
 	}
 	total, err := strconv.ParseInt(response.Total, 10, 64)
-	if err != nil || total < 0 || len(response.Items) > pageSize || math.IsNaN(response.TotalRecharged) || math.IsInf(response.TotalRecharged, 0) {
+	if err != nil || total < 0 || len(response.Items) > pageSize ||
+		!canonicalUnsignedDecimal(response.TotalRechargedE8USD) || len(response.TotalRechargedE8USD) > 40 {
 		return nil, errors.New("invalid managed balance history response")
 	}
 	entries := make([]ManagedBalanceHistoryEntry, 0, len(response.Items))
 	for _, item := range response.Items {
 		entryID, err := parsePositiveID("balance history id", item.ID)
 		createdAt, timeErr := requiredWireTime("balance history timestamp", item.CreatedAt)
-		_, deltaErr := signedDisplayBalanceFromMicroUSD(item.DeltaMicroUSD)
-		_, beforeErr := displayBalanceFromMicroUSD(item.BalanceBeforeMicroUSD)
-		_, afterErr := displayBalanceFromMicroUSD(item.BalanceAfterMicroUSD)
+		_, deltaErr := signedDisplayBalanceFromE8USD(item.DeltaE8USD)
+		_, beforeErr := displayBalanceFromE8USD(item.BalanceBeforeE8USD)
+		_, afterErr := displayBalanceFromE8USD(item.BalanceAfterE8USD)
 		if err != nil || timeErr != nil || deltaErr != nil || beforeErr != nil || afterErr != nil ||
 			(item.AdjustmentType != "add" && item.AdjustmentType != "subtract" && item.AdjustmentType != "set") ||
 			utf16Length(item.Reason) > 4096 {
@@ -105,9 +101,9 @@ func (c *HTTPControlPlane) GetManagedBalanceHistory(ctx context.Context, userID 
 		}
 		entries = append(entries, ManagedBalanceHistoryEntry{
 			ID: entryID, AdjustmentType: item.AdjustmentType, Reason: item.Reason,
-			DeltaMicroUSD: item.DeltaMicroUSD, BalanceBeforeMicroUSD: item.BalanceBeforeMicroUSD,
-			BalanceAfterMicroUSD: item.BalanceAfterMicroUSD, CreatedAt: createdAt,
+			DeltaE8USD: item.DeltaE8USD, BalanceBeforeE8USD: item.BalanceBeforeE8USD,
+			BalanceAfterE8USD: item.BalanceAfterE8USD, CreatedAt: createdAt,
 		})
 	}
-	return &ManagedBalanceHistoryPage{Entries: entries, Total: total, TotalRecharged: response.TotalRecharged}, nil
+	return &ManagedBalanceHistoryPage{Entries: entries, Total: total, TotalRechargedE8USD: response.TotalRechargedE8USD}, nil
 }

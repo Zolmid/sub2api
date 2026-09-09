@@ -237,7 +237,7 @@ func (h *gatewayHandler) chatCompletions(c *gin.Context) {
 	outcome := OutcomeSucceeded
 	usageState := UsageUnknown
 	completion := CompletionRequest{
-		SchemaVersion:   ProtocolVersion,
+		SchemaVersion:   UsageSchemaVersion,
 		EventType:       UsageEventType,
 		EventID:         requestID + ":usage:v1",
 		RequestID:       requestID,

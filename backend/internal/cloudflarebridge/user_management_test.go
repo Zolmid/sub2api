@@ -51,7 +51,7 @@ type adminUserControlStub struct {
 	roleChangeCalls       int
 	deleteCalls           int
 	lastOperation         string
-	lastBalanceMicroUSD   string
+	lastBalanceE8USD      string
 	lastSemanticToken     string
 	lastUpdate            ManagedUserUpdate
 	lastRoleChange        ManagedUserRoleChange
@@ -155,7 +155,7 @@ func (stub *adminUserControlStub) CreateManagedUser(
 	_ context.Context,
 	operation string,
 	user *service.User,
-	balanceMicroUSD string,
+	balanceE8USD string,
 	passwordHash string,
 	semanticToken string,
 ) (*service.User, bool, error) {
@@ -163,7 +163,7 @@ func (stub *adminUserControlStub) CreateManagedUser(
 	defer stub.mu.Unlock()
 	stub.createCalls++
 	stub.lastOperation = operation
-	stub.lastBalanceMicroUSD = balanceMicroUSD
+	stub.lastBalanceE8USD = balanceE8USD
 	stub.lastSemanticToken = semanticToken
 	if prior, ok := stub.operations[operation]; ok {
 		if prior.semanticToken != semanticToken || !sameManagedUserFields(prior.user, user) {
@@ -306,11 +306,11 @@ func (stub *adminUserControlStub) AdjustManagedUserBalance(_ context.Context, ad
 		return nil, service.ErrUserNotFound
 	}
 	before := user.Balance
-	amount, _ := strconv.ParseInt(adjustment.AmountMicroUSD, 10, 64)
+	amount, _ := strconv.ParseInt(adjustment.AmountE8USD, 10, 64)
 	if adjustment.Operation == "add" {
-		user.Balance += float64(amount) / float64(microUSDPerUSD)
+		user.Balance += float64(amount) / float64(e8USDPerUSD)
 	}
-	result := ManagedBalanceAdjustmentResult{LedgerID: adjustment.OperationID, BalanceBeforeMicroUSD: strconv.FormatInt(int64(before*float64(microUSDPerUSD)), 10), BalanceAfterMicroUSD: strconv.FormatInt(int64(user.Balance*float64(microUSDPerUSD)), 10), DeltaMicroUSD: adjustment.AmountMicroUSD}
+	result := ManagedBalanceAdjustmentResult{LedgerID: adjustment.OperationID, BalanceBeforeE8USD: strconv.FormatInt(int64(before*float64(e8USDPerUSD)), 10), BalanceAfterE8USD: strconv.FormatInt(int64(user.Balance*float64(e8USDPerUSD)), 10), DeltaE8USD: adjustment.AmountE8USD}
 	stub.balances[adjustment.OperationID] = result
 	return &result, nil
 }
@@ -372,8 +372,8 @@ func TestCloudflareAdminBalanceHistoryPreservesModalContractWithoutLedgerIDs(t *
 	userID := int64(2001)
 	control := newAdminUserControlStub(&service.User{ID: userID, Email: "user@example.test", Status: service.StatusActive, Role: service.RoleUser, Balance: 1, Concurrency: 1})
 	control.history = &ManagedBalanceHistoryPage{
-		Entries: []ManagedBalanceHistoryEntry{{ID: 7, AdjustmentType: "subtract", Reason: "manual correction", DeltaMicroUSD: "-250000", BalanceBeforeMicroUSD: "1250000", BalanceAfterMicroUSD: "1000000", CreatedAt: time.Date(2026, 9, 7, 1, 2, 3, 0, time.UTC)}},
-		Total:   2, TotalRecharged: 1.25,
+		Entries: []ManagedBalanceHistoryEntry{{ID: 7, AdjustmentType: "subtract", Reason: "manual correction", DeltaE8USD: "-25000000", BalanceBeforeE8USD: "125000000", BalanceAfterE8USD: "100000000", CreatedAt: time.Date(2026, 9, 7, 1, 2, 3, 0, time.UTC)}},
+		Total:   2, TotalRechargedE8USD: "125000000",
 	}
 	handler := adminUserMutationRouter(control, 99)
 	recorded := httptest.NewRecorder()
@@ -408,7 +408,7 @@ func TestCloudflareAdminBalanceUsesExactControlPlaneContract(t *testing.T) {
 	require.Equal(t, http.StatusOK, result.Code, result.Body.String())
 	require.Equal(t, int64(99), control.lastBalanceAdjustment.ActorUserID)
 	require.Equal(t, int64(2001), control.lastBalanceAdjustment.TargetUserID)
-	require.Equal(t, "1000001", control.lastBalanceAdjustment.AmountMicroUSD)
+	require.Equal(t, "100000100", control.lastBalanceAdjustment.AmountE8USD)
 	require.Equal(t, "add", control.lastBalanceAdjustment.Operation)
 	require.Equal(t, "ledger note", control.lastBalanceAdjustment.Reason)
 	expectedOperationID := "user-balance:99:" + service.HashIdempotencyKey(idempotencyKey)
@@ -467,7 +467,7 @@ func TestCloudflareAdminCreateUserUsesStableSemanticIdempotencyWithoutReturningS
 	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
 	require.NotContains(t, first.Body.String(), "correct horse battery staple")
 	require.NotContains(t, first.Body.String(), "password_hash")
-	require.Equal(t, "1000001", control.lastBalanceMicroUSD)
+	require.Equal(t, "100000100", control.lastBalanceE8USD)
 	require.Len(t, control.lastSemanticToken, 64)
 	require.True(t, strings.HasPrefix(control.lastOperation, "user-create:42:"))
 
@@ -641,14 +641,16 @@ func TestCloudflareUserValidationUsesExactFixedPointAndUnicodeBoundaries(t *test
 		ok   bool
 	}{
 		{raw: "0", want: "0", ok: true},
-		{raw: "1.000001", want: "1000001", ok: true},
-		{raw: "0.000001", want: "1", ok: true},
-		{raw: "0.0000001", ok: false},
+		{raw: "1.000001", want: "100000100", ok: true},
+		{raw: "0.000001", want: "100", ok: true},
+		{raw: "0.0000001", want: "10", ok: true},
+		{raw: "0.00000001", want: "1", ok: true},
+		{raw: "0.000000001", ok: false},
 		{raw: "-1", ok: false},
-		{raw: "9007199254.740991", want: "9007199254740991", ok: true},
+		{raw: "9007199254.740991", want: "900719925474099100", ok: true},
 		{raw: "9007199254.740992", ok: false},
 	} {
-		got, ok := microUSDFromJSON(json.RawMessage(test.raw))
+		got, ok := e8USDFromJSON(json.RawMessage(test.raw))
 		require.Equal(t, test.ok, ok, test.raw)
 		require.Equal(t, test.want, got, test.raw)
 	}
@@ -662,11 +664,11 @@ func TestCloudflareUserSemanticTokenIgnoresCandidateIDAndChangesWithPassword(t *
 	}
 	otherID := *base
 	otherID.ID = 2
-	first, err := cloudflareUserSemanticToken("user-create:7:key", base, "1000000", "same password")
+	first, err := cloudflareUserSemanticToken("user-create:7:key", base, "100000000", "same password")
 	require.NoError(t, err)
-	second, err := cloudflareUserSemanticToken("user-create:7:key", &otherID, "1000000", "same password")
+	second, err := cloudflareUserSemanticToken("user-create:7:key", &otherID, "100000000", "same password")
 	require.NoError(t, err)
-	changed, err := cloudflareUserSemanticToken("user-create:7:key", base, "1000000", "changed password")
+	changed, err := cloudflareUserSemanticToken("user-create:7:key", base, "100000000", "changed password")
 	require.NoError(t, err)
 	require.Equal(t, first, second)
 	require.NotEqual(t, first, changed)
@@ -677,7 +679,7 @@ func managedUserTestWire(userID, username, balance, updatedAt string, passwordHa
 	user := map[string]any{
 		"id": userID, "email": "wire@example.test", "username": username, "notes": "notes",
 		"status": "active", "role": "user", "concurrency": 1, "rpm_limit": 0,
-		"balance_microusd": balance, "allowed_group_ids": []string{},
+		"balance_e8_usd": balance, "allowed_group_ids": []string{},
 		"restrict_public_groups": false, "created_at": "2026-09-07T00:00:00Z",
 		"updated_at": updatedAt, "deleted_at": nil,
 	}
@@ -697,14 +699,14 @@ func TestHTTPControlPlaneUserUpdateReturnsFreshReadbackWithoutLostFieldAssumptio
 		case "/v1/manage/users/update":
 			require.NoError(t, json.NewDecoder(request.Body).Decode(&updateRequest))
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
-				"user": managedUserTestWire("7101", "after", "1000000", "2026-09-07T00:01:00Z", nil),
+				"user": managedUserTestWire("7101", "after", "100000000", "2026-09-07T00:01:00Z", nil),
 			}))
 		case "/v1/manage/users/get":
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
-				"user": managedUserTestWire("7101", "after", "9000000", "2026-09-07T00:02:00Z", nil),
+				"user": managedUserTestWire("7101", "after", "900000000", "2026-09-07T00:02:00Z", nil),
 			}))
 		case "/v1/private/auth-users/get":
-			auth := managedUserTestWire("7101", "after", "9000000", "2026-09-07T00:02:00Z", &credential.PasswordHash)
+			auth := managedUserTestWire("7101", "after", "900000000", "2026-09-07T00:02:00Z", &credential.PasswordHash)
 			delete(auth, "notes")
 			delete(auth, "deleted_at")
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{"user": auth}))
@@ -742,15 +744,15 @@ func TestHTTPControlPlaneUserCreateReplayVerifiesThePersistedCredential(t *testi
 		switch request.URL.Path {
 		case "/v1/manage/users/create":
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
-				"user":     managedUserTestWire("7201", "wire", "1000000", "2026-09-07T00:00:00Z", nil),
+				"user":     managedUserTestWire("7201", "wire", "100000000", "2026-09-07T00:00:00Z", nil),
 				"replayed": true,
 			}))
 		case "/v1/manage/users/get":
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
-				"user": managedUserTestWire("7201", "wire", "1000000", "2026-09-07T00:00:00Z", nil),
+				"user": managedUserTestWire("7201", "wire", "100000000", "2026-09-07T00:00:00Z", nil),
 			}))
 		case "/v1/private/auth-users/get":
-			auth := managedUserTestWire("7201", "wire", "1000000", "2026-09-07T00:00:00Z", &originalCredential.PasswordHash)
+			auth := managedUserTestWire("7201", "wire", "100000000", "2026-09-07T00:00:00Z", &originalCredential.PasswordHash)
 			delete(auth, "notes")
 			delete(auth, "deleted_at")
 			require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{"user": auth}))
@@ -768,7 +770,7 @@ func TestHTTPControlPlaneUserCreateReplayVerifiesThePersistedCredential(t *testi
 		Concurrency: 1, AllowedGroups: []int64{},
 	}
 	created, replayed, err := control.CreateManagedUser(
-		context.Background(), "wire-user-create", candidate, "1000000",
+		context.Background(), "wire-user-create", candidate, "100000000",
 		freshCredential.PasswordHash, strings.Repeat("a", 64),
 	)
 	require.NoError(t, err)
@@ -783,7 +785,7 @@ func TestHTTPControlPlaneRoleChangeForwardsJWTSessionAndReadsBackPublicShape(t *
 	require.NoError(t, credential.SetPassword("role wire password"))
 	var roleRequest map[string]any
 	roleWire := func(passwordHash *string) map[string]any {
-		user := managedUserTestWire("7301", "promoted", "2500000", "2026-09-09T00:01:00Z", passwordHash)
+		user := managedUserTestWire("7301", "promoted", "250000000", "2026-09-09T00:01:00Z", passwordHash)
 		user["role"] = service.RoleAdmin
 		return user
 	}
@@ -857,10 +859,10 @@ func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
 		writer.Header().Set("Content-Type", "application/json")
 		require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
 			"balance": map[string]any{
-				"ledger_id":               "user-balance:9:wire",
-				"balance_before_microusd": "1000000",
-				"balance_after_microusd":  "2000000",
-				"delta_microusd":          "1000000",
+				"ledger_id":             "user-balance:9:wire",
+				"balance_before_e8_usd": "100000000",
+				"balance_after_e8_usd":  "200000000",
+				"delta_e8_usd":          "100000000",
 			},
 			"replayed": true,
 		}))
@@ -871,11 +873,11 @@ func TestHTTPControlPlaneBalanceAdjustmentDecodesReplay(t *testing.T) {
 	require.NoError(t, err)
 	result, err := control.AdjustManagedUserBalance(context.Background(), ManagedBalanceAdjustment{
 		OperationID: "user-balance:9:wire", ActorUserID: 9, TargetUserID: 10,
-		Operation: "add", AmountMicroUSD: "1000000", Reason: "wire replay",
+		Operation: "add", AmountE8USD: "100000000", Reason: "wire replay",
 	})
 	require.NoError(t, err)
 	require.True(t, result.Replayed)
-	require.Equal(t, "2000000", result.BalanceAfterMicroUSD)
+	require.Equal(t, "200000000", result.BalanceAfterE8USD)
 }
 
 var _ ControlPlane = (*adminUserControlStub)(nil)

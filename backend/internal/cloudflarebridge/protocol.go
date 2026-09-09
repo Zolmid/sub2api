@@ -10,9 +10,10 @@ import (
 const (
 	// ProtocolVersion is sent on every Container-to-Worker control-plane request.
 	// Changes that are not backward compatible must use a new version and route.
-	ProtocolVersion = "2026-09-06.v1"
-	InternalHost    = "sub2api.internal"
-	UsageEventType  = "gateway.usage.v1"
+	ProtocolVersion    = "2026-09-08.v2"
+	UsageSchemaVersion = "2026-09-06.v1"
+	InternalHost       = "sub2api.internal"
+	UsageEventType     = "gateway.usage.v1"
 )
 
 const (
@@ -59,6 +60,7 @@ type Admission struct {
 	Account       *service.Account
 	Lease         Lease
 	UpstreamModel string
+	PriceCard     AdmittedPriceCard
 }
 
 type CompletionRequest struct {

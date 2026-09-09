@@ -26,7 +26,7 @@ func TestHTTPControlPlaneGetManagedUserUsesNonSecretDecimalContract(t *testing.T
 		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		requestBody = string(body)
-		_, _ = io.WriteString(w, `{"user":{"id":"9007199254740993","email":"reader@example.test","username":"reader","notes":"safe","status":"active","role":"user","concurrency":3,"rpm_limit":9,"balance_microusd":"2500000","allowed_group_ids":["9007199254740994"],"restrict_public_groups":true,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
+		_, _ = io.WriteString(w, `{"user":{"id":"9007199254740993","email":"reader@example.test","username":"reader","notes":"safe","status":"active","role":"user","concurrency":3,"rpm_limit":9,"balance_e8_usd":"250000000","allowed_group_ids":["9007199254740994"],"restrict_public_groups":true,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
 	}))
 	defer server.Close()
 
@@ -45,10 +45,12 @@ func TestHTTPControlPlaneGetManagedUserUsesNonSecretDecimalContract(t *testing.T
 	require.True(t, user.RestrictPublicGroups)
 }
 
-func TestDisplayBalanceFromMicroUSDFailsClosed(t *testing.T) {
-	require.Equal(t, 2.5, mustDisplayBalance(t, "2500000"))
-	for _, value := range []string{"", "01", "-1", "1.5", "9007199254740992", "18446744073709551616"} {
-		_, err := displayBalanceFromMicroUSD(value)
+func TestDisplayBalanceFromE8USDConvertsOnlyAtThePresentationBoundary(t *testing.T) {
+	require.Equal(t, 2.5, mustDisplayBalance(t, "250000000"))
+	require.Equal(t, 0.00000001, mustDisplayBalance(t, "1"))
+	require.Greater(t, mustDisplayBalance(t, maxPublicBalanceE8USDString), 9_000_000_000.0)
+	for _, value := range []string{"", "01", "-1", "1.5", "10000000000000000000000000000000000000000"} {
+		_, err := displayBalanceFromE8USD(value)
 		require.Error(t, err, value)
 	}
 }
@@ -59,7 +61,7 @@ func TestHTTPControlPlaneManagedBalanceHistoryUsesNonSecretWireContract(t *testi
 		require.Equal(t, "/v1/manage/users/balance-history", request.URL.Path)
 		require.NoError(t, json.NewDecoder(request.Body).Decode(&requestBody))
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(writer, `{"items":[{"id":"7","adjustment_type":"subtract","reason":"manual correction","delta_microusd":"-250000","balance_before_microusd":"1250000","balance_after_microusd":"1000000","created_at":"2026-09-07T01:02:03Z"}],"total":"2","total_recharged":1.25}`)
+		_, _ = io.WriteString(writer, `{"items":[{"id":"7","adjustment_type":"subtract","reason":"manual correction","delta_e8_usd":"-25000000","balance_before_e8_usd":"125000000","balance_after_e8_usd":"100000000","created_at":"2026-09-07T01:02:03Z"}],"total":"2","total_recharged_e8_usd":"125000000"}`)
 	}))
 	defer server.Close()
 
@@ -69,10 +71,10 @@ func TestHTTPControlPlaneManagedBalanceHistoryUsesNonSecretWireContract(t *testi
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{"id": "9007199254740993", "page": float64(2), "page_size": float64(15), "type": "admin_balance"}, requestBody)
 	require.Equal(t, int64(2), history.Total)
-	require.Equal(t, 1.25, history.TotalRecharged)
+	require.Equal(t, "125000000", history.TotalRechargedE8USD)
 	require.Len(t, history.Entries, 1)
 	require.Equal(t, int64(7), history.Entries[0].ID)
-	require.Equal(t, "-250000", history.Entries[0].DeltaMicroUSD)
+	require.Equal(t, "-25000000", history.Entries[0].DeltaE8USD)
 	require.Equal(t, "manual correction", history.Entries[0].Reason)
 }
 
@@ -91,10 +93,10 @@ func TestHTTPControlPlaneManagedBalanceHistoryReasonUsesUTF16Limit(t *testing.T)
 				require.NoError(t, json.NewEncoder(writer).Encode(map[string]any{
 					"items": []map[string]any{{
 						"id": "7", "adjustment_type": "add", "reason": test.reason,
-						"delta_microusd": "1", "balance_before_microusd": "0",
-						"balance_after_microusd": "1", "created_at": "2026-09-07T01:02:03Z",
+						"delta_e8_usd": "1", "balance_before_e8_usd": "0",
+						"balance_after_e8_usd": "1", "created_at": "2026-09-07T01:02:03Z",
 					}},
-					"total": "1", "total_recharged": 0.000001,
+					"total": "1", "total_recharged_e8_usd": "1",
 				}))
 			}))
 			defer server.Close()
@@ -114,14 +116,14 @@ func TestHTTPControlPlaneManagedBalanceHistoryReasonUsesUTF16Limit(t *testing.T)
 
 func mustDisplayBalance(t *testing.T, value string) float64 {
 	t.Helper()
-	balance, err := displayBalanceFromMicroUSD(value)
+	balance, err := displayBalanceFromE8USD(value)
 	require.NoError(t, err)
 	return balance
 }
 
 func TestHTTPControlPlaneGetManagedUserTreatsTombstoneAsNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"user":{"id":"41","email":"deleted@example.test","username":"","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}}`)
+		_, _ = io.WriteString(w, `{"user":{"id":"41","email":"deleted@example.test","username":"","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_e8_usd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}}`)
 	}))
 	defer server.Close()
 	client, err := NewHTTPControlPlane(server.URL, server.Client())
@@ -207,7 +209,7 @@ func TestHTTPControlPlaneManagedUserListFailsClosedOnMalformedPages(t *testing.T
 	for _, body := range []string{
 		"{\"next_cursor\":null}",
 		"{\"users\":[],\"next_cursor\":\"0\"}",
-		"{\"users\":[{\"id\":\"42\",\"email\":\"a@example.test\",\"username\":\"a\",\"notes\":\"\",\"status\":\"active\",\"role\":\"operator\",\"concurrency\":1,\"rpm_limit\":0,\"balance_microusd\":\"0\",\"allowed_group_ids\":[],\"restrict_public_groups\":false,\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}],\"next_cursor\":null}",
+		"{\"users\":[{\"id\":\"42\",\"email\":\"a@example.test\",\"username\":\"a\",\"notes\":\"\",\"status\":\"active\",\"role\":\"operator\",\"concurrency\":1,\"rpm_limit\":0,\"balance_e8_usd\":\"0\",\"allowed_group_ids\":[],\"restrict_public_groups\":false,\"created_at\":\"2026-09-06T01:02:03Z\",\"updated_at\":\"2026-09-06T02:03:04Z\",\"deleted_at\":null}],\"next_cursor\":null}",
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, body)
@@ -228,10 +230,10 @@ func TestHTTPControlPlaneManagedUserListPaginatesAndSkipsTombstones(t *testing.T
 		switch calls.Add(1) {
 		case 1:
 			require.JSONEq(t, `{"cursor":"0","limit":100}`, string(body))
-			_, _ = io.WriteString(w, `{"users":[{"id":"42","email":"first@example.test","username":"first","notes":"","status":"active","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"1000000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null},{"id":"43","email":"deleted@example.test","username":"deleted","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_microusd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}],"next_cursor":"43"}`)
+			_, _ = io.WriteString(w, `{"users":[{"id":"42","email":"first@example.test","username":"first","notes":"","status":"active","role":"user","concurrency":1,"rpm_limit":0,"balance_e8_usd":"100000000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null},{"id":"43","email":"deleted@example.test","username":"deleted","notes":"","status":"disabled","role":"user","concurrency":1,"rpm_limit":0,"balance_e8_usd":"0","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":"2026-09-06T02:03:04Z"}],"next_cursor":"43"}`)
 		case 2:
 			require.JSONEq(t, `{"cursor":"43","limit":100}`, string(body))
-			_, _ = io.WriteString(w, `{"users":[{"id":"9007199254740993","email":"second@example.test","username":"second","notes":"admin note","status":"active","role":"admin","concurrency":2,"rpm_limit":3,"balance_microusd":"2500000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}],"next_cursor":null}`)
+			_, _ = io.WriteString(w, `{"users":[{"id":"9007199254740993","email":"second@example.test","username":"second","notes":"admin note","status":"active","role":"admin","concurrency":2,"rpm_limit":3,"balance_e8_usd":"250000000","allowed_group_ids":[],"restrict_public_groups":false,"created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}],"next_cursor":null}`)
 		default:
 			t.Fatal("unexpected extra page")
 		}

@@ -21,10 +21,11 @@ const OPERATION_MAX = 128;
 const statuses = new Set(["active", "disabled"]);
 const roles = new Set(["user", "admin"]);
 const readablePrivacyModes = new Set(["training_off", "training_set_failed", "training_set_cf_blocked"]);
+const MAX_PUBLIC_BALANCE_E8_USD = 900719925474099100n;
 
 type User = {
   id: string; email: string; username: string; notes: string; status: string;
-  role: string; concurrency: number; rpm_limit: number; balance_microusd: string;
+  role: string; concurrency: number; rpm_limit: number; balance_e8_usd: string; balance_microusd?: string;
   allowed_group_ids: string[]; restrict_public_groups: boolean;
   created_at: string; updated_at: string; deleted_at: string | null;
 };
@@ -73,6 +74,33 @@ const cursorOK = (value: unknown): value is string =>
   isCanonicalUnsignedDecimal(value) && value.length <= ID_MAX;
 const sqlJSON = (value: unknown) => canonical(value);
 
+function legacyMicrousd(value: string): string | undefined {
+  try {
+    const amount = BigInt(value);
+    return amount % 100n === 0n ? (amount / 100n).toString() : undefined;
+  } catch { return undefined; }
+}
+function amountE8(body: Record<string, unknown>, e8Key: string, legacyKey: string): string | null {
+  const e8 = body[e8Key]; const legacy = body[legacyKey];
+  if (e8 === undefined && legacy === undefined) return null;
+  if (e8 !== undefined && (!isCanonicalUnsignedDecimal(e8) || e8.length > 40)) return null;
+  if (legacy !== undefined && (!isCanonicalUnsignedDecimal(legacy) || legacy.length > 38)) return null;
+  const legacyAsE8 = legacy === undefined ? undefined : (BigInt(legacy as string) * 100n).toString();
+  if (e8 !== undefined && legacyAsE8 !== undefined && e8 !== legacyAsE8) return null;
+  return (e8 ?? legacyAsE8)! as string;
+}
+
+function publicAmountE8(body: Record<string, unknown>, e8Key: string, legacyKey: string): string | null {
+  const amount = amountE8(body, e8Key, legacyKey);
+  if (amount === null) return null;
+  try { return BigInt(amount) <= MAX_PUBLIC_BALANCE_E8_USD ? amount : null; } catch { return null; }
+}
+
+function legacyDisplayUSD(value: bigint): number | undefined {
+  const display = Number(value) / 100_000_000;
+  return Number.isFinite(display) ? display : undefined;
+}
+
 function parsedArray(value: string, decimal = false): string[] | null {
   try { return stringArray(JSON.parse(value), 100, decimal); } catch { return null; }
 }
@@ -85,7 +113,8 @@ function userRow(row: Record<string, unknown>): User | null {
   return {
     id: String(row.id), email: String(row.email), username: String(row.username), notes: String(row.notes),
     status: String(row.status), role: String(row.role), concurrency: Number(row.concurrency),
-    rpm_limit: Number(row.rpm_limit), balance_microusd: String(row.balance_microusd),
+    rpm_limit: Number(row.rpm_limit), balance_e8_usd: String(row.balance_e8_usd),
+    ...(legacyMicrousd(String(row.balance_e8_usd)) === undefined ? {} : { balance_microusd: legacyMicrousd(String(row.balance_e8_usd)) }),
     allowed_group_ids: groups, restrict_public_groups: Number(row.restrict_public_groups) === 1,
     created_at: String(row.created_at), updated_at: String(row.updated_at),
     deleted_at: row.deleted_at === null ? null : String(row.deleted_at),
@@ -151,7 +180,7 @@ function accountOperationReadProjection(response: Record<string, unknown>): Reco
 async function first(env: Env, query: string, value: string): Promise<Record<string, unknown> | null> {
   return env.DB.prepare(query).bind(value).first<Record<string, unknown>>();
 }
-async function getUser(env: Env, value: string) { const row = await first(env, "SELECT id,email,username,notes,status,role,concurrency,rpm_limit,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,deleted_at FROM users WHERE id=?", value); return row ? userRow(row) : null; }
+async function getUser(env: Env, value: string) { const row = await first(env, "SELECT id,email,username,notes,status,role,concurrency,rpm_limit,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,deleted_at FROM users WHERE id=?", value); return row ? userRow(row) : null; }
 async function getGroup(env: Env, value: string) { const row = await first(env, "SELECT id,name,platform,status,is_exclusive,subscription_type,created_at,updated_at,deleted_at FROM groups WHERE id=?", value); return row ? groupRow(row) : null; }
 async function getKey(env: Env, value: string) { const row = await first(env, "SELECT id,user_id,group_id,name,status,ip_whitelist_json,ip_blacklist_json,expires_at,last_used_at,created_at,updated_at,deleted_at FROM api_keys WHERE id=?", value); return row ? keyRow(row) : null; }
 async function getAccount(env: Env, value: string): Promise<Account | null> {
@@ -269,20 +298,28 @@ async function balanceHistory(env: Env, body: Record<string, unknown>): Promise<
   const total = matchesLedger
     ? await env.DB.prepare("SELECT count(*) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>()
     : { total: 0 };
-  const recharged = await env.DB.prepare("SELECT coalesce(sum(CASE WHEN substr(delta_microusd,1,1)<>'-' AND delta_microusd<>'0' THEN CAST(delta_microusd AS INTEGER) ELSE 0 END), 0) AS total FROM balance_ledger WHERE target_user_id=?").bind(user.id).first<{ total: number }>();
+  const recharged = await env.DB.prepare("SELECT delta_e8_usd FROM balance_ledger WHERE target_user_id=?").bind(user.id).all<{ delta_e8_usd: string }>();
+  let totalRechargedE8USD = 0n;
+  for (const entry of recharged.results) {
+    if (isCanonicalUnsignedDecimal(entry.delta_e8_usd) && entry.delta_e8_usd !== "0") totalRechargedE8USD += BigInt(entry.delta_e8_usd);
+  }
   const rows = matchesLedger
-    ? await env.DB.prepare("SELECT CAST(rowid AS TEXT) AS id, adjustment_type, reason, delta_microusd, balance_before_microusd, balance_after_microusd, created_at FROM balance_ledger WHERE target_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").bind(user.id, pageSize, (page - 1) * pageSize).all<Record<string, unknown>>()
+    ? await env.DB.prepare("SELECT CAST(rowid AS TEXT) AS id, adjustment_type, reason, delta_e8_usd, balance_before_e8_usd, balance_after_e8_usd, created_at FROM balance_ledger WHERE target_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").bind(user.id, pageSize, (page - 1) * pageSize).all<Record<string, unknown>>()
     : { results: [] as Record<string, unknown>[] };
   const items = rows.results.map((row) => ({
     id: String(row.id),
     adjustment_type: String(row.adjustment_type),
     reason: String(row.reason),
-    delta_microusd: String(row.delta_microusd),
-    balance_before_microusd: String(row.balance_before_microusd),
-    balance_after_microusd: String(row.balance_after_microusd),
+    delta_e8_usd: String(row.delta_e8_usd),
+    balance_before_e8_usd: String(row.balance_before_e8_usd),
+    balance_after_e8_usd: String(row.balance_after_e8_usd),
+    ...(legacyMicrousd(String(row.delta_e8_usd)) === undefined ? {} : { delta_microusd: legacyMicrousd(String(row.delta_e8_usd)) }),
+    ...(legacyMicrousd(String(row.balance_before_e8_usd)) === undefined ? {} : { balance_before_microusd: legacyMicrousd(String(row.balance_before_e8_usd)) }),
+    ...(legacyMicrousd(String(row.balance_after_e8_usd)) === undefined ? {} : { balance_after_microusd: legacyMicrousd(String(row.balance_after_e8_usd)) }),
     created_at: String(row.created_at),
   }));
-  return json({ items, total: String(total?.total ?? 0), total_recharged: Number(recharged?.total ?? 0) / 1_000_000 });
+  const legacyTotal = legacyDisplayUSD(totalRechargedE8USD);
+  return json({ items, total: String(total?.total ?? 0), total_recharged_e8_usd: totalRechargedE8USD.toString(), ...(legacyTotal === undefined ? {} : { total_recharged: legacyTotal }) });
 }
 
 async function get(env: Env, route: string, body: Record<string, unknown>): Promise<Response> {
@@ -302,7 +339,7 @@ async function list(env: Env, route: string, body: Record<string, unknown>): Pro
   if (!cursorOK(cursor) || !Number.isInteger(limit) || Number(limit) < 1 || Number(limit) > PAGE_MAX) return error("INVALID_REQUEST");
   const size = Number(limit);
   if (route.includes("/users/")) {
-    const rows = await env.DB.prepare(pageQuery("users", "id,email,username,notes,status,role,concurrency,rpm_limit,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,deleted_at")).bind(cursor,cursor,cursor,size+1).all<Record<string, unknown>>();
+    const rows = await env.DB.prepare(pageQuery("users", "id,email,username,notes,status,role,concurrency,rpm_limit,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,updated_at,deleted_at")).bind(cursor,cursor,cursor,size+1).all<Record<string, unknown>>();
     const users = rows.results.slice(0,size).map(userRow); if (users.some((item) => !item)) return error("CONTROL_PLANE_UNAVAILABLE",503);
     return json({ users, next_cursor: rows.results.length > size ? users.at(-1)?.id ?? null : null });
   }
@@ -333,7 +370,7 @@ async function mutate(env: Env, route: string, body: Record<string, unknown>): P
 const userCreateKeys = [
   "operation_id", "semantic_digest", "id", "email", "password_hash",
   "username", "notes", "status", "role", "concurrency", "rpm_limit",
-  "balance_microusd", "allowed_group_ids", "restrict_public_groups",
+  "balance_e8_usd", "balance_microusd", "allowed_group_ids", "restrict_public_groups",
 ];
 const userUpdateKeys = [
   "operation_id", "id", "email", "password_hash", "username", "notes",
@@ -358,7 +395,7 @@ function validUserCreate(body: Record<string, unknown>, groups: string[] | null)
     body.status === "active" && body.role === "user" &&
     Number.isInteger(body.concurrency) && Number(body.concurrency) >= 1 && Number(body.concurrency) <= 100000 &&
     Number.isInteger(body.rpm_limit) && Number(body.rpm_limit) >= 0 && Number(body.rpm_limit) <= 1000000 &&
-    isCanonicalUnsignedDecimal(body.balance_microusd) && body.balance_microusd.length <= 40 &&
+    publicAmountE8(body, "balance_e8_usd", "balance_microusd") !== null &&
     groups !== null && typeof body.restrict_public_groups === "boolean";
 }
 
@@ -396,31 +433,37 @@ async function userMutation(env: Env, route: string, body: Record<string, unknow
   return updateUserMutation(env, route, body, operation);
 }
 
-const MAX_PUBLIC_BALANCE_MICROUSD = 9007199254740991n;
-
 async function balanceAdjustment(env: Env, route: string, body: Record<string, unknown>, operation: string): Promise<Response> {
-  if (!only(body, ["operation_id", "actor_user_id", "target_user_id", "operation", "amount_microusd", "reason"]) ||
+  const admittedAmount = amountE8(body, "amount_e8_usd", "amount_microusd");
+  if (!only(body, ["operation_id", "actor_user_id", "target_user_id", "operation", "amount_e8_usd", "amount_microusd", "reason"]) ||
     !id(body.actor_user_id) || !id(body.target_user_id) ||
     (body.operation !== "set" && body.operation !== "add" && body.operation !== "subtract") ||
-    !isCanonicalPositiveDecimal(body.amount_microusd) || body.amount_microusd.length > 40 ||
+    admittedAmount === null || admittedAmount === "0" ||
     !isBoundedString(body.reason, 4096, 0)) return error("INVALID_REQUEST");
-  const fingerprint = body;
+  const fingerprint = {
+    operation_id: operation,
+    actor_user_id: body.actor_user_id,
+    target_user_id: body.target_user_id,
+    operation: body.operation,
+    amount_e8_usd: admittedAmount,
+    reason: body.reason,
+  };
   const prior = await lookupOperation(env, route, operation, fingerprint);
   if (prior) return prior.kind === "replay" ? json({ ...prior.response, replayed: true }) : error("IDEMPOTENCY_CONFLICT", 409);
   const [actor, target] = await Promise.all([getUser(env, body.actor_user_id as string), getUser(env, body.target_user_id as string)]);
   if (!actor || actor.deleted_at !== null || actor.status !== "active" || actor.role !== "admin") return error("ACTOR_FORBIDDEN", 403);
   if (!target || target.deleted_at !== null) return error("TARGET_NOT_FOUND", 404);
   let before: bigint; let amount: bigint;
-  try { before = BigInt(target.balance_microusd); amount = BigInt(body.amount_microusd as string); } catch { return error("INVALID_REQUEST"); }
+  try { before = BigInt(target.balance_e8_usd); amount = BigInt(admittedAmount); } catch { return error("INVALID_REQUEST"); }
   const after = body.operation === "set" ? amount : body.operation === "add" ? before + amount : before - amount;
   if (after < 0n) return error("BALANCE_NEGATIVE", 409);
-  if (after > MAX_PUBLIC_BALANCE_MICROUSD) return error("BALANCE_OVERFLOW", 409);
+  if (after > MAX_PUBLIC_BALANCE_E8_USD) return error("BALANCE_OVERFLOW", 409);
   const delta = after - before;
-  const response = { balance: { ledger_id: operation, actor_user_id: actor.id, target_user_id: target.id, adjustment_type: body.operation, reason: body.reason, delta_microusd: delta.toString(), balance_before_microusd: before.toString(), balance_after_microusd: after.toString() } };
+  const response = { balance: { ledger_id: operation, actor_user_id: actor.id, target_user_id: target.id, adjustment_type: body.operation, reason: body.reason, delta_e8_usd: delta.toString(), balance_before_e8_usd: before.toString(), balance_after_e8_usd: after.toString(), ...(legacyMicrousd(delta.toString()) === undefined ? {} : { delta_microusd: legacyMicrousd(delta.toString()) }), ...(legacyMicrousd(before.toString()) === undefined ? {} : { balance_before_microusd: legacyMicrousd(before.toString()) }), ...(legacyMicrousd(after.toString()) === undefined ? {} : { balance_after_microusd: legacyMicrousd(after.toString()) }) } };
   const stamp = now();
   const saved = await managedOperation(env, route, operation, fingerprint, response, [
-    env.DB.prepare("UPDATE users SET balance_microusd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_microusd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind(after.toString(), stamp, target.id, before.toString(), actor.id),
-    env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_microusd,balance_before_microusd,balance_after_microusd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, actor.id, target.id, body.operation, body.reason, delta.toString(), before.toString(), after.toString(), stamp, operation),
+    env.DB.prepare("UPDATE users SET balance_e8_usd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_e8_usd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind(after.toString(), stamp, target.id, before.toString(), actor.id),
+    env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, actor.id, target.id, body.operation, body.reason, delta.toString(), before.toString(), after.toString(), stamp, operation),
   ]);
   if (saved) return json({ ...saved.response, replayed: saved.replay });
   const raced = await lookupOperation(env, route, operation, fingerprint);
@@ -439,6 +482,7 @@ async function createUserMutation(
   operation: string,
 ): Promise<Response> {
   const groups = stringArray(body.allowed_group_ids, 100, true);
+  const balanceE8USD = publicAmountE8(body, "balance_e8_usd", "balance_microusd");
   if (!only(body, userCreateKeys) || !id(body.id) || !validUserCreate(body, groups)) {
     return error("INVALID_REQUEST");
   }
@@ -453,7 +497,7 @@ async function createUserMutation(
     role: body.role,
     concurrency: body.concurrency,
     rpm_limit: body.rpm_limit,
-    balance_microusd: body.balance_microusd,
+    balance_e8_usd: balanceE8USD,
     allowed_group_ids: groups,
     restrict_public_groups: body.restrict_public_groups,
   };
@@ -477,7 +521,7 @@ async function createUserMutation(
     role: "user",
     concurrency: body.concurrency as number,
     rpm_limit: body.rpm_limit as number,
-    balance_microusd: body.balance_microusd as string,
+    balance_e8_usd: balanceE8USD!,
     allowed_group_ids: groups!,
     restrict_public_groups: body.restrict_public_groups as boolean,
     created_at: stamp,
@@ -485,10 +529,10 @@ async function createUserMutation(
     deleted_at: null,
   };
   const statement = env.DB.prepare(
-    "INSERT INTO users(id,status,role,concurrency,balance_microusd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) " +
+    "INSERT INTO users(id,status,role,concurrency,balance_e8_usd,allowed_group_ids_json,restrict_public_groups,created_at,email,password_hash,username,notes,rpm_limit,updated_at,deleted_at) " +
     "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE " + liveGroupPredicate,
   ).bind(
-    user.id, user.status, user.role, user.concurrency, user.balance_microusd,
+    user.id, user.status, user.role, user.concurrency, user.balance_e8_usd,
     sqlJSON(user.allowed_group_ids), user.restrict_public_groups ? 1 : 0,
     user.created_at, user.email, body.password_hash, user.username, user.notes,
     user.rpm_limit, user.updated_at, user.deleted_at, sqlJSON(user.allowed_group_ids),

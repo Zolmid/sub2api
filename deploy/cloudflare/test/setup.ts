@@ -25,6 +25,7 @@ async function resetFixture(): Promise<void> {
   DELETE FROM users;
   DELETE FROM groups;
   DELETE FROM model_aliases;
+  DELETE FROM pricing_active_version;
 `);
   await testEnv.DB.exec(testEnv.TEST_FIXTURE_SQL);
 }

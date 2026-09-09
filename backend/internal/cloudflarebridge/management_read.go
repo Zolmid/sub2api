@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -17,9 +18,11 @@ import (
 const managedListPageSize = 100
 
 const (
-	microUSDPerUSD       = uint64(1_000_000)
-	maxExactFloatInteger = uint64(1<<53 - 1)
+	e8USDPerUSD                 = int64(100_000_000)
+	maxPublicBalanceE8USDString = "900719925474099100"
 )
+
+var maxPublicBalanceE8USD, _ = new(big.Int).SetString(maxPublicBalanceE8USDString, 10)
 
 // ManagementReadControlPlane is the non-secret read subset used by the first
 // Cloudflare management slice. Authentication records containing password
@@ -129,7 +132,7 @@ type managedUserWire struct {
 	Role                 string   `json:"role"`
 	Concurrency          int      `json:"concurrency"`
 	RPMLimit             int      `json:"rpm_limit"`
-	BalanceMicroUSD      string   `json:"balance_microusd"`
+	BalanceE8USD         string   `json:"balance_e8_usd"`
 	AllowedGroupIDs      []string `json:"allowed_group_ids"`
 	RestrictPublicGroups bool     `json:"restrict_public_groups"`
 	CreatedAt            string   `json:"created_at"`
@@ -184,21 +187,20 @@ func canonicalUnsignedDecimal(value string) bool {
 	return isCanonicalPositiveDecimal(value)
 }
 
-// displayBalanceFromMicroUSD converts the fixed-point D1 representation only
-// at the presentation read boundary. Requiring the integer coefficient to be
-// exactly representable by float64 prevents a large D1 value from being
-// silently rounded before it reaches legacy display DTOs.
-func displayBalanceFromMicroUSD(value string) (float64, error) {
+// displayBalanceFromE8USD keeps the D1 coefficient exact until the legacy
+// presentation boundary. The returned float is display-only; all authority,
+// comparisons, mutations, and ledger values remain canonical integer strings.
+func displayBalanceFromE8USD(value string) (float64, error) {
 	if !canonicalUnsignedDecimal(value) || len(value) > 40 {
-		return 0, errors.New("invalid balance_microusd")
+		return 0, errors.New("invalid balance_e8_usd")
 	}
-	microUSD, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || microUSD > maxExactFloatInteger {
-		return 0, errors.New("balance_microusd is not exactly representable")
+	coefficient, ok := new(big.Int).SetString(value, 10)
+	if !ok {
+		return 0, errors.New("invalid balance_e8_usd")
 	}
-	balance := float64(microUSD) / float64(microUSDPerUSD)
-	if math.IsNaN(balance) || math.IsInf(balance, 0) || uint64(math.Round(balance*float64(microUSDPerUSD))) != microUSD {
-		return 0, errors.New("balance_microusd is not exactly representable")
+	balance, _ := new(big.Rat).SetFrac(coefficient, big.NewInt(e8USDPerUSD)).Float64()
+	if math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return 0, errors.New("balance_e8_usd is not representable at the display boundary")
 	}
 	return balance, nil
 }
@@ -228,7 +230,7 @@ func decodeManagedUser(wire managedUserWire) (*service.User, bool, error) {
 		len(wire.AllowedGroupIDs) > 100 {
 		return nil, false, errors.New("invalid managed user response")
 	}
-	balance, err := displayBalanceFromMicroUSD(wire.BalanceMicroUSD)
+	balance, err := displayBalanceFromE8USD(wire.BalanceE8USD)
 	if err != nil {
 		return nil, false, errors.New("invalid managed user response: balance")
 	}

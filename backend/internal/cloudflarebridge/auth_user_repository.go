@@ -94,7 +94,7 @@ type authUserWire struct {
 	Role                 string   `json:"role"`
 	Concurrency          int      `json:"concurrency"`
 	RPMLimit             int      `json:"rpm_limit"`
-	BalanceMicroUSD      string   `json:"balance_microusd"`
+	BalanceE8USD         string   `json:"balance_e8_usd"`
 	AllowedGroupIDs      []string `json:"allowed_group_ids"`
 	RestrictPublicGroups bool     `json:"restrict_public_groups"`
 	CreatedAt            string   `json:"created_at"`
@@ -134,7 +134,7 @@ func decodeAuthUser(wire authUserWire) (*service.User, error) {
 		(wire.TotpEnabled != (totpEnabledAt != nil)) {
 		return nil, errors.New("invalid auth user response")
 	}
-	balance, err := displayBalanceFromMicroUSD(wire.BalanceMicroUSD)
+	balance, err := displayBalanceFromE8USD(wire.BalanceE8USD)
 	if err != nil {
 		return nil, errors.New("invalid auth user response: balance")
 	}

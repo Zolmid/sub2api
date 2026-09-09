@@ -93,9 +93,9 @@ func (h *cloudflareAdminAPIHandler) GetBalanceHistory(c *gin.Context) {
 	}
 	items := make([]cloudflareAdminBalanceHistoryDTO, 0, len(result.Entries))
 	for _, entry := range result.Entries {
-		value, valueErr := signedDisplayBalanceFromMicroUSD(entry.DeltaMicroUSD)
-		before, beforeErr := displayBalanceFromMicroUSD(entry.BalanceBeforeMicroUSD)
-		after, afterErr := displayBalanceFromMicroUSD(entry.BalanceAfterMicroUSD)
+		value, valueErr := signedDisplayBalanceFromE8USD(entry.DeltaE8USD)
+		before, beforeErr := displayBalanceFromE8USD(entry.BalanceBeforeE8USD)
+		after, afterErr := displayBalanceFromE8USD(entry.BalanceAfterE8USD)
 		if valueErr != nil || beforeErr != nil || afterErr != nil {
 			response.ErrorFrom(c, ErrControlPlaneUnavailable)
 			return
@@ -111,7 +111,12 @@ func (h *cloudflareAdminAPIHandler) GetBalanceHistory(c *gin.Context) {
 	if pages < 1 {
 		pages = 1
 	}
-	response.Success(c, gin.H{"items": items, "total": result.Total, "page": page, "page_size": pageSize, "pages": pages, "total_recharged": result.TotalRecharged})
+	totalRecharged, totalErr := displayBalanceFromE8USD(result.TotalRechargedE8USD)
+	if totalErr != nil {
+		response.ErrorFrom(c, ErrControlPlaneUnavailable)
+		return
+	}
+	response.Success(c, gin.H{"items": items, "total": result.Total, "page": page, "page_size": pageSize, "pages": pages, "total_recharged": totalRecharged})
 }
 
 // cloudflareAdminAccountDTO only represents fields persisted by the Worker.

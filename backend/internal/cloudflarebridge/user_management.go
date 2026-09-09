@@ -44,20 +44,20 @@ type AdminBalanceControlPlane interface {
 }
 
 type ManagedBalanceAdjustment struct {
-	OperationID    string
-	ActorUserID    int64
-	TargetUserID   int64
-	Operation      string
-	AmountMicroUSD string
-	Reason         string
+	OperationID  string
+	ActorUserID  int64
+	TargetUserID int64
+	Operation    string
+	AmountE8USD  string
+	Reason       string
 }
 
 type ManagedBalanceAdjustmentResult struct {
-	LedgerID              string
-	BalanceBeforeMicroUSD string
-	BalanceAfterMicroUSD  string
-	DeltaMicroUSD         string
-	Replayed              bool
+	LedgerID           string
+	BalanceBeforeE8USD string
+	BalanceAfterE8USD  string
+	DeltaE8USD         string
+	Replayed           bool
 }
 
 type ManagedUserRoleChange struct {
@@ -97,7 +97,7 @@ type cloudflareUserMutationRequest struct {
 	Notes                *string
 	Status               *string
 	Role                 *string
-	BalanceMicroUSD      *string
+	BalanceE8USD         *string
 	Concurrency          *int
 	RPMLimit             *int
 	AllowedGroups        *[]int64
@@ -202,7 +202,7 @@ func (h *cloudflareAdminAPIHandler) authorizeRoleChange(c *gin.Context) (int64, 
 
 // UpdateBalance keeps the established public endpoint in Cloudflare mode. It
 // accepts the existing decimal UI representation only at this public edge,
-// converts it exactly once, then uses signed integer microusd across the
+// converts it exactly once, then uses signed integer e8 USD across the
 // Container-to-Worker boundary.
 func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 	userID, ok := cloudflareAdminIDParam(c, "id")
@@ -218,7 +218,7 @@ func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 		response.BadRequest(c, "Invalid request")
 		return
 	}
-	amount, valid := microUSDFromJSON(request.Balance)
+	amount, valid := e8USDFromJSON(request.Balance)
 	if !valid || amount == "0" || (request.Operation != "set" && request.Operation != "add" && request.Operation != "subtract") || utf16Length(request.Notes) > 4096 {
 		response.BadRequest(c, "Invalid balance adjustment")
 		return
@@ -244,7 +244,7 @@ func (h *cloudflareAdminAPIHandler) UpdateBalance(c *gin.Context) {
 		return
 	}
 	operationID := "user-balance:" + strconv.FormatInt(actorID, 10) + ":" + service.HashIdempotencyKey(key)
-	result, err := balances.AdjustManagedUserBalance(c.Request.Context(), ManagedBalanceAdjustment{OperationID: operationID, ActorUserID: actorID, TargetUserID: userID, Operation: request.Operation, AmountMicroUSD: amount, Reason: request.Notes})
+	result, err := balances.AdjustManagedUserBalance(c.Request.Context(), ManagedBalanceAdjustment{OperationID: operationID, ActorUserID: actorID, TargetUserID: userID, Operation: request.Operation, AmountE8USD: amount, Reason: request.Notes})
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -312,11 +312,11 @@ func (h *cloudflareAdminAPIHandler) CreateUser(c *gin.Context) {
 		AllowedGroups:        groupsOrEmpty(request.AllowedGroups),
 		RestrictPublicGroups: boolOr(request.RestrictPublicGroups, false),
 	}
-	balanceMicroUSD := "0"
-	if request.BalanceMicroUSD != nil {
-		balanceMicroUSD = *request.BalanceMicroUSD
+	balanceE8USD := "0"
+	if request.BalanceE8USD != nil {
+		balanceE8USD = *request.BalanceE8USD
 	}
-	user.Balance, err = displayBalanceFromMicroUSD(balanceMicroUSD)
+	user.Balance, err = displayBalanceFromE8USD(balanceE8USD)
 	if err != nil {
 		response.BadRequest(c, "Invalid balance")
 		return
@@ -327,7 +327,7 @@ func (h *cloudflareAdminAPIHandler) CreateUser(c *gin.Context) {
 	}
 
 	operationID := "user-create:" + strconv.FormatInt(subject.UserID, 10) + ":" + service.HashIdempotencyKey(idempotencyKey)
-	semanticToken, err := cloudflareUserSemanticToken(operationID, user, balanceMicroUSD, *request.Password)
+	semanticToken, err := cloudflareUserSemanticToken(operationID, user, balanceE8USD, *request.Password)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -338,7 +338,7 @@ func (h *cloudflareAdminAPIHandler) CreateUser(c *gin.Context) {
 		return
 	}
 	created, replayed, err := mutations.CreateManagedUser(
-		c.Request.Context(), operationID, user, balanceMicroUSD, user.PasswordHash, semanticToken,
+		c.Request.Context(), operationID, user, balanceE8USD, user.PasswordHash, semanticToken,
 	)
 	if err != nil {
 		response.ErrorFrom(c, mapManagedUserMutationError(err))
@@ -363,7 +363,7 @@ func (h *cloudflareAdminAPIHandler) UpdateUser(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if request.BalanceMicroUSD != nil {
+	if request.BalanceE8USD != nil {
 		response.BadRequest(c, "balance changes require the dedicated balance endpoint")
 		return
 	}
@@ -609,12 +609,12 @@ func decodeCloudflareUserMutation(c *gin.Context, create bool) (cloudflareUserMu
 			response.BadRequest(c, "balance changes require the dedicated balance endpoint")
 			return request, false
 		}
-		value, valid := microUSDFromJSON(raw)
+		value, valid := e8USDFromJSON(raw)
 		if !valid {
 			response.BadRequest(c, "Invalid balance")
 			return request, false
 		}
-		request.BalanceMicroUSD = &value
+		request.BalanceE8USD = &value
 	}
 	if raw, exists := fields["concurrency"]; exists {
 		value, valid := boundedJSONInteger(raw, 1, 100000)
@@ -753,7 +753,7 @@ func cloudflareUserGroupIDs(raw json.RawMessage) ([]int64, bool) {
 	return result, true
 }
 
-func microUSDFromJSON(raw json.RawMessage) (string, bool) {
+func e8USDFromJSON(raw json.RawMessage) (string, bool) {
 	var number json.Number
 	if err := json.Unmarshal(raw, &number); err != nil {
 		return "", false
@@ -762,9 +762,8 @@ func microUSDFromJSON(raw json.RawMessage) (string, bool) {
 	if !ok || value.Sign() < 0 {
 		return "", false
 	}
-	value.Mul(value, big.NewRat(int64(microUSDPerUSD), 1))
-	maximum := big.NewInt(maxJavaScriptSafeInteger)
-	if !value.IsInt() || value.Num().Cmp(maximum) > 0 {
+	value.Mul(value, big.NewRat(e8USDPerUSD, 1))
+	if !value.IsInt() || value.Num().Cmp(maxPublicBalanceE8USD) > 0 {
 		return "", false
 	}
 	return value.Num().String(), true
@@ -779,7 +778,7 @@ const (
 // cloudflareUserSemanticToken derives a slow, operation-salted equality token
 // for create retries. The Worker never receives plaintext or a fast reusable
 // verifier, and the persisted management operation contains only an outer hash.
-func cloudflareUserSemanticToken(operation string, user *service.User, balanceMicroUSD, password string) (string, error) {
+func cloudflareUserSemanticToken(operation string, user *service.User, balanceE8USD, password string) (string, error) {
 	payload := struct {
 		Email                string  `json:"email"`
 		Password             string  `json:"password"`
@@ -787,7 +786,7 @@ func cloudflareUserSemanticToken(operation string, user *service.User, balanceMi
 		Notes                string  `json:"notes"`
 		Status               string  `json:"status"`
 		Role                 string  `json:"role"`
-		BalanceMicroUSD      string  `json:"balance_microusd"`
+		BalanceE8USD         string  `json:"balance_e8_usd"`
 		Concurrency          int     `json:"concurrency"`
 		RPMLimit             int     `json:"rpm_limit"`
 		AllowedGroups        []int64 `json:"allowed_group_ids"`
@@ -799,7 +798,7 @@ func cloudflareUserSemanticToken(operation string, user *service.User, balanceMi
 		Notes:                user.Notes,
 		Status:               user.Status,
 		Role:                 user.Role,
-		BalanceMicroUSD:      balanceMicroUSD,
+		BalanceE8USD:         balanceE8USD,
 		Concurrency:          user.Concurrency,
 		RPMLimit:             user.RPMLimit,
 		AllowedGroups:        user.AllowedGroups,
@@ -972,14 +971,19 @@ func (c *HTTPControlPlane) CreateManagedUser(
 	ctx context.Context,
 	operation string,
 	user *service.User,
-	balanceMicroUSD string,
+	balanceE8USD string,
 	passwordHash string,
 	semanticToken string,
 ) (*service.User, bool, error) {
-	if user == nil || user.ID < 1 || passwordHash == "" || len(semanticToken) != 64 {
+	if user == nil || user.ID < 1 || passwordHash == "" || !isLowerHexDigest(semanticToken) ||
+		!unsignedE8USDWire(balanceE8USD) {
 		return nil, false, ErrNotMigrated
 	}
-	request := managedUserRequest(operation, user, balanceMicroUSD, passwordHash)
+	balance, _ := new(big.Int).SetString(balanceE8USD, 10)
+	if balance.Cmp(maxPublicBalanceE8USD) > 0 {
+		return nil, false, ErrNotMigrated
+	}
+	request := managedUserRequest(operation, user, balanceE8USD, passwordHash)
 	request["semantic_digest"] = semanticToken
 	var result managedUserMutationResponse
 	if err := c.postManagedMutation(ctx, "/v1/manage/users/create", request, &result); err != nil {
@@ -1126,7 +1130,7 @@ func (c *HTTPControlPlane) DeleteManagedUser(ctx context.Context, operation stri
 func managedUserRequest(
 	operation string,
 	user *service.User,
-	balanceMicroUSD string,
+	balanceE8USD string,
 	passwordHash string,
 ) map[string]any {
 	return map[string]any{
@@ -1140,7 +1144,7 @@ func managedUserRequest(
 		"role":                   user.Role,
 		"concurrency":            user.Concurrency,
 		"rpm_limit":              user.RPMLimit,
-		"balance_microusd":       balanceMicroUSD,
+		"balance_e8_usd":         balanceE8USD,
 		"allowed_group_ids":      managedUserGroupIDs(user.AllowedGroups),
 		"restrict_public_groups": user.RestrictPublicGroups,
 	}
@@ -1216,32 +1220,62 @@ var _ AdminUserRoleControlPlane = (*HTTPControlPlane)(nil)
 var _ AdminBalanceControlPlane = (*HTTPControlPlane)(nil)
 
 func (c *HTTPControlPlane) AdjustManagedUserBalance(ctx context.Context, adjustment ManagedBalanceAdjustment) (*ManagedBalanceAdjustmentResult, error) {
-	if adjustment.ActorUserID < 1 || adjustment.TargetUserID < 1 || !isCanonicalPositiveDecimal(adjustment.AmountMicroUSD) || adjustment.AmountMicroUSD == "0" {
+	if adjustment.ActorUserID < 1 || adjustment.TargetUserID < 1 ||
+		len(adjustment.OperationID) < 1 || len(adjustment.OperationID) > 128 ||
+		(adjustment.Operation != "set" && adjustment.Operation != "add" && adjustment.Operation != "subtract") ||
+		!unsignedE8USDWire(adjustment.AmountE8USD) || adjustment.AmountE8USD == "0" ||
+		utf16Length(adjustment.Reason) > 4096 {
 		return nil, ErrNotMigrated
 	}
 	var wire struct {
 		Balance struct {
-			LedgerID              string `json:"ledger_id"`
-			BalanceBeforeMicroUSD string `json:"balance_before_microusd"`
-			BalanceAfterMicroUSD  string `json:"balance_after_microusd"`
-			DeltaMicroUSD         string `json:"delta_microusd"`
+			LedgerID           string `json:"ledger_id"`
+			BalanceBeforeE8USD string `json:"balance_before_e8_usd"`
+			BalanceAfterE8USD  string `json:"balance_after_e8_usd"`
+			DeltaE8USD         string `json:"delta_e8_usd"`
 		} `json:"balance"`
 		Replayed bool `json:"replayed"`
 	}
-	err := c.post(ctx, "/v1/manage/users/balance-adjust", map[string]any{"operation_id": adjustment.OperationID, "actor_user_id": strconv.FormatInt(adjustment.ActorUserID, 10), "target_user_id": strconv.FormatInt(adjustment.TargetUserID, 10), "operation": adjustment.Operation, "amount_microusd": adjustment.AmountMicroUSD, "reason": adjustment.Reason}, &wire)
+	err := c.post(ctx, "/v1/manage/users/balance-adjust", map[string]any{"operation_id": adjustment.OperationID, "actor_user_id": strconv.FormatInt(adjustment.ActorUserID, 10), "target_user_id": strconv.FormatInt(adjustment.TargetUserID, 10), "operation": adjustment.Operation, "amount_e8_usd": adjustment.AmountE8USD, "reason": adjustment.Reason}, &wire)
 	if err != nil {
 		return nil, mapManagedUserMutationError(err)
 	}
-	if wire.Balance.LedgerID != adjustment.OperationID || !unsignedMicroUSDWire(wire.Balance.BalanceBeforeMicroUSD) || !unsignedMicroUSDWire(wire.Balance.BalanceAfterMicroUSD) || !signedMicroUSDWire(wire.Balance.DeltaMicroUSD) {
+	if wire.Balance.LedgerID != adjustment.OperationID || !validBalanceAdjustmentResult(adjustment, wire.Balance.BalanceBeforeE8USD, wire.Balance.BalanceAfterE8USD, wire.Balance.DeltaE8USD) {
 		return nil, errors.New("invalid balance adjustment response")
 	}
-	return &ManagedBalanceAdjustmentResult{LedgerID: wire.Balance.LedgerID, BalanceBeforeMicroUSD: wire.Balance.BalanceBeforeMicroUSD, BalanceAfterMicroUSD: wire.Balance.BalanceAfterMicroUSD, DeltaMicroUSD: wire.Balance.DeltaMicroUSD, Replayed: wire.Replayed}, nil
+	return &ManagedBalanceAdjustmentResult{LedgerID: wire.Balance.LedgerID, BalanceBeforeE8USD: wire.Balance.BalanceBeforeE8USD, BalanceAfterE8USD: wire.Balance.BalanceAfterE8USD, DeltaE8USD: wire.Balance.DeltaE8USD, Replayed: wire.Replayed}, nil
 }
 
-func signedMicroUSDWire(value string) bool {
-	return value == "0" || isCanonicalPositiveDecimal(value) || (strings.HasPrefix(value, "-") && isCanonicalPositiveDecimal(strings.TrimPrefix(value, "-")))
+func signedE8USDWire(value string) bool {
+	return len(value) <= 41 && (value == "0" || isCanonicalPositiveDecimal(value) || (strings.HasPrefix(value, "-") && isCanonicalPositiveDecimal(strings.TrimPrefix(value, "-"))))
 }
 
-func unsignedMicroUSDWire(value string) bool {
-	return value == "0" || isCanonicalPositiveDecimal(value)
+func unsignedE8USDWire(value string) bool {
+	return len(value) <= 40 && (value == "0" || isCanonicalPositiveDecimal(value))
+}
+
+func validBalanceAdjustmentResult(adjustment ManagedBalanceAdjustment, beforeValue, afterValue, deltaValue string) bool {
+	if !unsignedE8USDWire(beforeValue) || !unsignedE8USDWire(afterValue) || !signedE8USDWire(deltaValue) {
+		return false
+	}
+	before, beforeOK := new(big.Int).SetString(beforeValue, 10)
+	after, afterOK := new(big.Int).SetString(afterValue, 10)
+	amount, amountOK := new(big.Int).SetString(adjustment.AmountE8USD, 10)
+	delta, deltaOK := new(big.Int).SetString(deltaValue, 10)
+	if !beforeOK || !afterOK || !amountOK || !deltaOK {
+		return false
+	}
+	wantAfter := new(big.Int)
+	switch adjustment.Operation {
+	case "set":
+		wantAfter.Set(amount)
+	case "add":
+		wantAfter.Add(before, amount)
+	case "subtract":
+		wantAfter.Sub(before, amount)
+	default:
+		return false
+	}
+	wantDelta := new(big.Int).Sub(new(big.Int).Set(wantAfter), before)
+	return wantAfter.Sign() >= 0 && after.Cmp(wantAfter) == 0 && delta.Cmp(wantDelta) == 0
 }

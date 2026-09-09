@@ -280,9 +280,10 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}
 	requestID := resp.Header.Get("x-request-id")
 	writeStreamHeaders := s.newStreamHeaderWriter(c, resp.Header)
-	scanner := s.newUpstreamSSEScanner(resp.Body)
+	scanner := s.newUpstreamSSEScanner(newOpenAIUpstreamStreamReadLimitReader(resp.Body, s.cfg))
 
 	var usage OpenAIUsage
+	usagePresent := false
 	var firstTokenMs *int
 	clientDisconnected := false
 	clientOutputStarted := false
@@ -333,6 +334,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 				usageOnlyChunk := isOpenAIChatUsageOnlyStreamChunk(payload)
 				if u := extractCCStreamUsage(payload); u != nil {
 					usage = *u
+					usagePresent = true
 				}
 				if firstTokenMs == nil && !usageOnlyChunk {
 					elapsed := int(time.Since(startTime).Milliseconds())
@@ -360,6 +362,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			RequestID:                     requestID,
 			UpstreamHeaders:               resp.Header,
 			Usage:                         usage,
+			UsagePresent:                  usagePresent,
 			Model:                         originalModel,
 			BillingModel:                  billingModel,
 			UpstreamModel:                 upstreamModel,
@@ -504,8 +507,10 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	observer.ObserveOpenAI(respBody, strings.TrimSpace(gjson.GetBytes(respBody, "type").String()))
 
 	var usage OpenAIUsage
+	usagePresent := false
 	if parsedUsage, ok := extractOpenAIUsageFromJSONBytes(respBody); ok {
 		usage = parsedUsage
+		usagePresent = true
 	}
 	responseModel := gjson.GetBytes(respBody, "model").String()
 	if requiresBillableGrokChatUsage(account, billingModel, upstreamModel, responseModel) && !hasBillableGrokChatUsage(usage) {
@@ -529,6 +534,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 		RequestID:                     requestID,
 		UpstreamHeaders:               resp.Header,
 		Usage:                         usage,
+		UsagePresent:                  usagePresent,
 		Model:                         originalModel,
 		BillingModel:                  billingModel,
 		UpstreamModel:                 upstreamModel,

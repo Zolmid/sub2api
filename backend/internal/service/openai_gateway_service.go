@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -25,6 +26,59 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
+
+// upstreamStreamReadLimitReader applies the same configured total response
+// budget used by buffered responses to SSE. Scanner's per-line cap is not a
+// total cap: without this wrapper an upstream can keep a valid stream open
+// indefinitely and consume a Go container's bandwidth and accounting path.
+// Returning the canonical sentinel keeps the error mapping non-retryable and
+// free of upstream bytes.
+type upstreamStreamReadLimitReader struct {
+	reader     io.Reader
+	remaining  int64
+	emptyReads int
+}
+
+const maxConsecutiveEmptyUpstreamStreamReads = 100
+
+func newOpenAIUpstreamStreamReadLimitReader(reader io.Reader, cfg *config.Config) io.Reader {
+	return &upstreamStreamReadLimitReader{
+		reader:    reader,
+		remaining: resolveUpstreamResponseReadLimit(cfg),
+	}
+}
+
+func (r *upstreamStreamReadLimitReader) Read(p []byte) (int, error) {
+	if r == nil || r.reader == nil {
+		return 0, errors.New("response body is nil")
+	}
+	if r.remaining <= 0 {
+		var probe [1]byte
+		n, err := r.reader.Read(probe[:])
+		if n > 0 {
+			return 0, ErrUpstreamResponseBodyTooLarge
+		}
+		return r.finishRead(n, err)
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= int64(n)
+	return r.finishRead(n, err)
+}
+
+func (r *upstreamStreamReadLimitReader) finishRead(n int, err error) (int, error) {
+	if n != 0 || err != nil {
+		r.emptyReads = 0
+		return n, err
+	}
+	r.emptyReads++
+	if r.emptyReads >= maxConsecutiveEmptyUpstreamStreamReads {
+		return 0, io.ErrNoProgress
+	}
+	return 0, nil
+}
 
 const (
 	// ChatGPT internal API for OAuth accounts
@@ -236,7 +290,9 @@ type OpenAIForwardResult struct {
 	// UpstreamHeaders 是直接上游的响应头，用于按账户配置解析上游请求标识。
 	UpstreamHeaders http.Header
 	Usage           OpenAIUsage
-	Model           string // 原始模型（用于响应和日志显示）
+	// UsagePresent distinguishes an explicit all-zero usage object from absence.
+	UsagePresent bool
+	Model        string // 原始模型（用于响应和日志显示）
 	// BillingModel is the model used for cost calculation.
 	// When non-empty, CalculateCost uses this instead of Model.
 	// This is set by the Anthropic Messages conversion path where

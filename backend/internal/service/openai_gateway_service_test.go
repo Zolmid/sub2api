@@ -262,6 +262,61 @@ type cancelReadCloser struct{}
 func (c cancelReadCloser) Read(p []byte) (int, error) { return 0, context.Canceled }
 func (c cancelReadCloser) Close() error               { return nil }
 
+type chunkedStreamReader struct {
+	chunks []string
+}
+
+func (r *chunkedStreamReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[0])
+	r.chunks[0] = r.chunks[0][n:]
+	if r.chunks[0] == "" {
+		r.chunks = r.chunks[1:]
+	}
+	return n, nil
+}
+
+type emptyProgressReader struct{}
+
+func (emptyProgressReader) Read([]byte) (int, error) { return 0, nil }
+
+func TestOpenAIUpstreamStreamReadLimitReader(t *testing.T) {
+	t.Run("rejects bytes beyond configured total", func(t *testing.T) {
+		reader := newOpenAIUpstreamStreamReadLimitReader(strings.NewReader("abcd"), &config.Config{Gateway: config.GatewayConfig{UpstreamResponseReadMaxBytes: 3}})
+		body, err := io.ReadAll(reader)
+		require.Equal(t, "abc", string(body))
+		require.ErrorIs(t, err, ErrUpstreamResponseBodyTooLarge)
+	})
+
+	t.Run("accepts an exact limit", func(t *testing.T) {
+		reader := newOpenAIUpstreamStreamReadLimitReader(strings.NewReader("abc"), &config.Config{Gateway: config.GatewayConfig{UpstreamResponseReadMaxBytes: 3}})
+		body, err := io.ReadAll(reader)
+		require.NoError(t, err)
+		require.Equal(t, "abc", string(body))
+	})
+
+	t.Run("enforces the total while preserving chunked streaming", func(t *testing.T) {
+		reader := newOpenAIUpstreamStreamReadLimitReader(&chunkedStreamReader{chunks: []string{"a", "b", "c", "d"}}, &config.Config{Gateway: config.GatewayConfig{UpstreamResponseReadMaxBytes: 3}})
+		body, err := io.ReadAll(reader)
+		require.Equal(t, "abc", string(body))
+		require.ErrorIs(t, err, ErrUpstreamResponseBodyTooLarge)
+	})
+
+	t.Run("stops a reader that repeatedly returns no progress", func(t *testing.T) {
+		reader := newOpenAIUpstreamStreamReadLimitReader(emptyProgressReader{}, &config.Config{Gateway: config.GatewayConfig{UpstreamResponseReadMaxBytes: 3}})
+		buffer := make([]byte, 1)
+		for i := 0; i < maxConsecutiveEmptyUpstreamStreamReads-1; i++ {
+			n, err := reader.Read(buffer)
+			require.Zero(t, n)
+			require.NoError(t, err)
+		}
+		_, err := reader.Read(buffer)
+		require.ErrorIs(t, err, io.ErrNoProgress)
+	})
+}
+
 type errReadCloser struct {
 	err error
 }

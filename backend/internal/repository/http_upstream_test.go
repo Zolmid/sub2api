@@ -2,6 +2,7 @@ package repository
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,6 +23,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
+
+type httpUpstreamTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f httpUpstreamTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestHTTPUpstreamDoCanDisableRedirectsPerRequest(t *testing.T) {
 	var redirectedCalls atomic.Int64
@@ -49,6 +56,235 @@ func TestHTTPUpstreamDoCanDisableRedirectsPerRequest(t *testing.T) {
 	require.Equal(t, http.StatusFound, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
 	require.Zero(t, redirectedCalls.Load())
+}
+
+func TestHTTPUpstreamCloudflareGatewayBoundaryRejectsUnsafeRequestParts(t *testing.T) {
+	newRequest := func(t *testing.T) *http.Request {
+		t.Helper()
+		ctx := service.WithHTTPUpstreamProfile(context.Background(), service.HTTPUpstreamProfileOpenAI)
+		ctx = service.WithCloudflareUpstreamStartMarker(ctx, func(context.Context) error { return nil })
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.example.test/v1/chat/completions", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer test-token")
+		return req
+	}
+
+	upstream := NewHTTPUpstream(nil).(*httpUpstreamService)
+
+	t.Run("accepts canonical request", func(t *testing.T) {
+		require.NoError(t, upstream.validateCloudflareGatewayRequest(newRequest(t)))
+	})
+	t.Run("rejects host and path injection", func(t *testing.T) {
+		req := newRequest(t)
+		req.Host = "metadata.internal"
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+
+		req = newRequest(t)
+		req.URL.Path = "/v1/../private"
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+	})
+	t.Run("rejects forwarded, internal credential, injected, and ambiguous authorization headers", func(t *testing.T) {
+		req := newRequest(t)
+		req.Header.Set("X-Forwarded-Host", "metadata.internal")
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+
+		for _, name := range []string{"Cookie", "CF-Access-Client-Id", "CF-Access-Client-Secret", "CF-Connecting-IP", "CF-Ray", "CF-Worker", "X-Sub2API-Trace"} {
+			req = newRequest(t)
+			req.Header.Set(name, "forbidden")
+			require.Error(t, upstream.validateCloudflareGatewayRequest(req), name)
+		}
+
+		req = newRequest(t)
+		req.Header.Set("X-Test", "ok\r\ninjected: value")
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+
+		req = newRequest(t)
+		req.Header.Add("Authorization", "Bearer second-token")
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+	})
+	t.Run("rejects excessive header count and bytes", func(t *testing.T) {
+		req := newRequest(t)
+		for i := 0; i < 65; i++ {
+			req.Header.Add(fmt.Sprintf("X-SDK-Meta-%d", i), "ok")
+		}
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+
+		req = newRequest(t)
+		req.Header.Set("X-SDK-Meta", strings.Repeat("a", 16<<10))
+		req.Header.Set("X-SDK-Meta-2", strings.Repeat("b", 16<<10))
+		req.Header.Set("X-SDK-Meta-3", strings.Repeat("c", 16<<10))
+		req.Header.Set("X-SDK-Meta-4", strings.Repeat("d", 16<<10))
+		require.Error(t, upstream.validateCloudflareGatewayRequest(req))
+	})
+}
+
+func TestHTTPUpstreamCloudflareGatewayBoundaryDisablesRedirects(t *testing.T) {
+	ctx := service.WithCloudflareUpstreamStartMarker(context.Background(), func(context.Context) error { return nil })
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.test/v1/models", nil)
+	require.NoError(t, err)
+
+	client := (&httpUpstreamService{}).httpClientForUpstreamRequest(&http.Client{}, req)
+	require.NotNil(t, client.CheckRedirect)
+	require.ErrorIs(t, client.CheckRedirect(req, nil), http.ErrUseLastResponse)
+}
+
+func TestHTTPUpstreamCloudflareBoundaryStopsBeforeTransportAndMarksOnce(t *testing.T) {
+	newRequest := func(rawURL string, headers http.Header, started *atomic.Int64) *http.Request {
+		ctx := service.WithHTTPUpstreamProfile(context.Background(), service.HTTPUpstreamProfileOpenAI)
+		ctx = service.WithCloudflareUpstreamStartMarker(ctx, func(context.Context) error {
+			started.Add(1)
+			return nil
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer test-token")
+		for name, values := range headers {
+			for _, value := range values {
+				req.Header.Add(name, value)
+			}
+		}
+		return req
+	}
+
+	t.Run("invalid requests never reach transport or start the marker", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			rawURL  string
+			headers http.Header
+			tls     bool
+		}{
+			{name: "non HTTPS", rawURL: "http://upstream.example/v1/responses"},
+			{name: "private host", rawURL: "https://127.0.0.1/v1/responses"},
+			{name: "dangerous header through DoWithTLS", rawURL: "https://upstream.example/v1/responses", headers: http.Header{"Cookie": []string{"session=secret"}}, tls: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				started := &atomic.Int64{}
+				transportCalls := &atomic.Int64{}
+				svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+				resolverCalls := &atomic.Int64{}
+				svc.resolvePublicHost = func(string) error {
+					resolverCalls.Add(1)
+					return nil
+				}
+				entry, err := svc.getClientEntry("", 1, 1, service.HTTPUpstreamProfileOpenAI, false, false)
+				require.NoError(t, err)
+				entry.client.Transport = httpUpstreamTestRoundTripper(func(*http.Request) (*http.Response, error) {
+					transportCalls.Add(1)
+					return nil, errors.New("transport must not be reached")
+				})
+				req := newRequest(tc.rawURL, tc.headers, started)
+				var callErr error
+				if tc.tls {
+					// nil profile is the documented DoWithTLS compatibility path;
+					// it must still reject before acquiring a network round-trip.
+					_, callErr = svc.DoWithTLS(req, "", 1, 1, nil)
+				} else {
+					_, callErr = svc.Do(req, "", 1, 1)
+				}
+				require.Error(t, callErr)
+				require.Zero(t, started.Load())
+				require.Zero(t, resolverCalls.Load())
+				require.Zero(t, transportCalls.Load())
+			})
+		}
+	})
+
+	t.Run("public host dispatches once and redirect is not followed", func(t *testing.T) {
+		started := &atomic.Int64{}
+		transportCalls := &atomic.Int64{}
+		sequence := make([]string, 0, 3)
+		svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+		svc.resolvePublicHost = func(host string) error {
+			require.Equal(t, "upstream.example", host)
+			return nil
+		}
+		entry, err := svc.getClientEntry("", 1, 1, service.HTTPUpstreamProfileOpenAI, false, false)
+		require.NoError(t, err)
+		entry.client.Transport = httpUpstreamTestRoundTripper(func(*http.Request) (*http.Response, error) {
+			transportCalls.Add(1)
+			sequence = append(sequence, "transport")
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://redirected.example/v1/responses"}},
+				Body:       io.NopCloser(strings.NewReader("redirect")),
+			}, nil
+		})
+
+		ctx := service.WithHTTPUpstreamProfile(context.Background(), service.HTTPUpstreamProfileOpenAI)
+		ctx = service.WithCloudflareUpstreamStartMarker(ctx, func(context.Context) error {
+			sequence = append(sequence, "started")
+			started.Add(1)
+			return nil
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://upstream.example/v1/responses", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer test-token")
+		for i := 0; i < 2; i++ {
+			resp, err := svc.Do(req, "", 1, 1)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusFound, resp.StatusCode)
+			require.NoError(t, resp.Body.Close())
+		}
+		require.Equal(t, int64(1), started.Load())
+		require.Equal(t, int64(2), transportCalls.Load())
+		require.Equal(t, []string{"started", "transport", "transport"}, sequence)
+	})
+}
+
+func TestHTTPUpstreamCloudflareBoundaryPublicPrivateHostValidationIsDeterministic(t *testing.T) {
+	svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+	resolverCalls := &atomic.Int64{}
+	svc.resolvePublicHost = func(host string) error {
+		resolverCalls.Add(1)
+		require.Equal(t, "public.example", host)
+		return nil
+	}
+	ctx := service.WithCloudflareUpstreamStartMarker(context.Background(), func(context.Context) error { return nil })
+
+	publicReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://public.example/v1/models", nil)
+	require.NoError(t, err)
+	require.NoError(t, svc.validateRequestHost(publicReq))
+	require.Equal(t, int64(1), resolverCalls.Load())
+
+	privateReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://192.168.1.10/v1/models", nil)
+	require.NoError(t, err)
+	require.Error(t, svc.validateRequestHost(privateReq))
+	require.Equal(t, int64(1), resolverCalls.Load(), "private literals must fail before DNS")
+}
+
+func TestHTTPUpstreamCloudflareBoundaryCountsFinalGrokHeaders(t *testing.T) {
+	started := &atomic.Int64{}
+	transportCalls := &atomic.Int64{}
+	ctx := service.WithHTTPUpstreamProfile(context.Background(), service.HTTPUpstreamProfileOpenAI)
+	ctx = service.WithCloudflareUpstreamStartMarker(ctx, func(context.Context) error {
+		started.Add(1)
+		return nil
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+grokCLIProxyHost+"/v1/responses", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	// Authorization plus these 61 fields is valid before the controlled Grok
+	// headers are applied. Grok then adds four values, so dispatch must reject
+	// the final 66-value request before DNS or RoundTrip.
+	for i := 0; i < 61; i++ {
+		req.Header.Set(fmt.Sprintf("X-SDK-Meta-%d", i), "ok")
+	}
+
+	svc := NewHTTPUpstream(nil).(*httpUpstreamService)
+	svc.resolvePublicHost = func(string) error {
+		return errors.New("DNS must not be reached")
+	}
+	entry, err := svc.getClientEntry("", 1, 1, service.HTTPUpstreamProfileOpenAI, false, false)
+	require.NoError(t, err)
+	entry.client.Transport = httpUpstreamTestRoundTripper(func(*http.Request) (*http.Response, error) {
+		transportCalls.Add(1)
+		return nil, errors.New("transport must not be reached")
+	})
+
+	_, err = svc.Do(req, "", 1, 1)
+	require.ErrorContains(t, err, "headers exceed limit")
+	require.Zero(t, started.Load())
+	require.Zero(t, transportCalls.Load())
 }
 
 func TestHTTPUpstreamDoWithTLSPlainHTTPUsesConfiguredHTTPProxy(t *testing.T) {

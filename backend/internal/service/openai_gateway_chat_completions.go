@@ -579,6 +579,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 		RequestID:                     requestID,
 		UpstreamHeaders:               resp.Header,
 		Usage:                         usage,
+		UsagePresent:                  finalResponse.Usage != nil,
 		Model:                         originalModel,
 		BillingModel:                  billingModel,
 		UpstreamModel:                 upstreamModel,
@@ -662,6 +663,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	state.IncludeUsage = true
 
 	var usage OpenAIUsage
+	usagePresent := false
 	var firstTokenMs *int
 	firstChunk := true
 	clientDisconnected := false
@@ -680,7 +682,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 
-	scanner := s.newUpstreamSSEScanner(resp.Body)
+	scanner := s.newUpstreamSSEScanner(newOpenAIUpstreamStreamReadLimitReader(resp.Body, s.cfg))
 
 	streamInterval := time.Duration(0)
 	if s.cfg != nil && s.cfg.Gateway.StreamDataIntervalTimeout > 0 {
@@ -701,6 +703,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			RequestID:                     requestID,
 			UpstreamHeaders:               resp.Header,
 			Usage:                         usage,
+			UsagePresent:                  usagePresent,
 			Model:                         originalModel,
 			BillingModel:                  billingModel,
 			UpstreamModel:                 upstreamModel,
@@ -739,6 +742,8 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		observer.ObserveOpenAI([]byte(payload), event.Type)
 		refusalDetector.ObservePayload([]byte(payload))
 		s.parseSSEUsageBytesWithType([]byte(payload), event.Type, &usage)
+		usagePresent = usagePresent || gjson.GetBytes([]byte(payload), "usage").IsObject() ||
+			gjson.GetBytes([]byte(payload), "response.usage").IsObject()
 
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(event.Type)
 		if isTerminalEvent {

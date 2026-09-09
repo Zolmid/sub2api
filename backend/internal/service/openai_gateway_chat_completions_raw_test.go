@@ -115,6 +115,7 @@ func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDown
 	require.Equal(t, 9, result.Usage.InputTokens)
 	require.Equal(t, 4, result.Usage.OutputTokens)
 	require.Equal(t, 3, result.Usage.CacheReadInputTokens)
+	require.True(t, result.UsagePresent)
 	require.NotNil(t, upstream.lastReq)
 	require.NoError(t, upstream.lastReq.Context().Err())
 	require.Equal(t, HTTPUpstreamProfileOpenAI, HTTPUpstreamProfileFromContext(upstream.lastReq.Context()))
@@ -324,6 +325,46 @@ func TestForwardAsRawChatCompletions_NonStreamingCapturesCacheWriteUsage(t *test
 			require.Equal(t, 12, result.Usage.InputTokens)
 			require.Equal(t, 4, result.Usage.CacheReadInputTokens)
 			require.Equal(t, tt.wantWrite, result.Usage.CacheCreationInputTokens)
+			require.True(t, result.UsagePresent)
+		})
+	}
+}
+
+func TestBufferRawChatCompletionsUsagePresenceDistinguishesZeroFromUnknown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tt := range []struct {
+		name    string
+		body    string
+		present bool
+	}{
+		{
+			name:    "explicit zero usage",
+			body:    `{"id":"chatcmpl_zero","model":"gpt-5.6","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+			present: true,
+		},
+		{
+			name:    "usage omitted",
+			body:    `{"id":"chatcmpl_unknown","model":"gpt-5.6","choices":[]}`,
+			present: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}
+
+			result, err := (&OpenAIGatewayService{cfg: rawChatCompletionsTestConfig()}).bufferRawChatCompletions(c, resp, rawChatCompletionsTestAccount(), "gpt-5.6", "gpt-5.6", "gpt-5.6", nil, nil, time.Now())
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, tt.present, result.UsagePresent)
+			require.Zero(t, result.Usage.InputTokens)
+			require.Zero(t, result.Usage.OutputTokens)
 		})
 	}
 }

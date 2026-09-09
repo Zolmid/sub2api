@@ -24,6 +24,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/mod/semver"
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -163,6 +164,9 @@ type httpUpstreamService struct {
 	clients map[string]*upstreamClientEntry // 客户端缓存池，key 由隔离策略决定
 	// OpenAI 走 HTTP/HTTPS 代理时的 H2->H1 回退状态（key=标准化 proxyKey）
 	openAIHTTP2Fallbacks sync.Map
+	// resolvePublicHost is injectable only to make the final egress boundary
+	// testable without real DNS. Nil uses the production DNS-rebinding check.
+	resolvePublicHost func(string) error
 }
 
 // NewHTTPUpstream 创建通用 HTTP 上游服务
@@ -198,6 +202,9 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 //   - inFlight > 0 的客户端不会被淘汰，确保活跃请求不被中断
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	applyGrokCLIProxyHeaders(req)
+	if err := s.validateCloudflareGatewayRequest(req); err != nil {
+		return nil, err
+	}
 	if err := s.validateRequestHost(req); err != nil {
 		return nil, err
 	}
@@ -215,6 +222,11 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 执行请求
 	client := s.httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		atomic.AddInt64(&entry.inFlight, -1)
+		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+		return nil, err
+	}
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
@@ -252,6 +264,9 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		return s.Do(req, proxyURL, accountID, accountConcurrency)
 	}
 	applyGrokCLIProxyHeaders(req)
+	if err := s.validateCloudflareGatewayRequest(req); err != nil {
+		return nil, err
+	}
 	upstreamProfile := service.HTTPUpstreamProfileDefault
 	if req != nil {
 		upstreamProfile = service.HTTPUpstreamProfileFromContext(req.Context())
@@ -279,6 +294,11 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	client := s.httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		atomic.AddInt64(&entry.inFlight, -1)
+		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+		return nil, err
+	}
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
 		atomic.AddInt64(&entry.inFlight, -1)
@@ -306,6 +326,15 @@ func (s *httpUpstreamService) httpClientForUpstreamRequest(client *http.Client, 
 	ctx := req.Context()
 	switch {
 	case service.HTTPUpstreamRedirectsDisabled(ctx):
+		clone := *client
+		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		return &clone
+	case service.HTTPUpstreamCloudflareBoundary(ctx):
+		// A credential-bearing Cloudflare gateway request must not follow a
+		// redirect. Even a public redirect is a different authority and turns a
+		// configured upstream endpoint into an SSRF/header-forwarding primitive.
 		clone := *client
 		clone.CheckRedirect = func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -602,7 +631,7 @@ func (s *httpUpstreamService) shouldValidateResolvedIP() bool {
 // validateRequestHost 校验请求主机的解析结果不落在回环、私网、链路本地或未指定地址。
 // 是否全局启用由 security.url_allowlist 决定；带 WithHTTPUpstreamPublicHostsOnly 标记的请求无论配置如何都校验。
 func (s *httpUpstreamService) validateRequestHost(req *http.Request) error {
-	publicHostsOnly := req != nil && service.HTTPUpstreamPublicHostsOnly(req.Context())
+	publicHostsOnly := req != nil && (service.HTTPUpstreamPublicHostsOnly(req.Context()) || service.HTTPUpstreamCloudflareBoundary(req.Context()))
 	if !s.shouldValidateResolvedIP() && !publicHostsOnly {
 		return nil
 	}
@@ -613,10 +642,110 @@ func (s *httpUpstreamService) validateRequestHost(req *http.Request) error {
 	if host == "" {
 		return errors.New("request host is empty")
 	}
-	if err := urlvalidator.ValidateResolvedIP(host); err != nil {
+	if err := s.validateResolvedUpstreamHost(host); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *httpUpstreamService) validateResolvedUpstreamHost(host string) error {
+	if urlvalidator.IsBlockedHost(host) {
+		return errors.New("request host is not allowed: private or local address")
+	}
+	resolver := s.resolvePublicHost
+	if resolver == nil {
+		resolver = urlvalidator.ValidateResolvedIP
+	}
+	return resolver(host)
+}
+
+// validateCloudflareGatewayRequest is deliberately narrow: it only applies to
+// a request that carries the Cloudflare lease marker. Traditional deployments
+// retain their existing configured private-upstream and redirect behavior.
+//
+// The endpoint and credential can both originate from account configuration,
+// so they are treated as security-sensitive input at the final Go egress
+// boundary. This makes a malformed URL/header fail before DNS, TLS, or a
+// proxy can observe it.
+func (s *httpUpstreamService) validateCloudflareGatewayRequest(req *http.Request) error {
+	if req == nil || req.Context() == nil || !service.HTTPUpstreamCloudflareBoundary(req.Context()) {
+		return nil
+	}
+	if req.URL == nil || !req.URL.IsAbs() || !strings.EqualFold(req.URL.Scheme, "https") || req.URL.User != nil || req.URL.Hostname() == "" || req.URL.Fragment != "" {
+		return errors.New("invalid cloudflare upstream url")
+	}
+	if req.Host != "" && !strings.EqualFold(req.Host, req.URL.Host) {
+		return errors.New("cloudflare upstream Host does not match request url")
+	}
+	for _, segment := range strings.Split(req.URL.EscapedPath(), "/") {
+		if segment == "" {
+			continue
+		}
+		decoded, err := url.PathUnescape(segment)
+		if err != nil || decoded == "." || decoded == ".." || strings.Contains(decoded, "\\") {
+			return errors.New("invalid cloudflare upstream path")
+		}
+	}
+
+	const (
+		maxCloudflareGatewayHeaders     = 64
+		maxCloudflareGatewayHeaderBytes = 64 << 10
+	)
+	var (
+		authorizationValues []string
+		headerCount         int
+		headerBytes         int
+	)
+	for name, values := range req.Header {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return errors.New("invalid cloudflare upstream header")
+		}
+		lowerName := strings.ToLower(name)
+		switch lowerName {
+		case "host", "connection", "keep-alive", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "cookie", "cf-access-client-id", "cf-access-client-secret", "cf-connecting-ip", "cf-ray", "cf-worker":
+			return errors.New("forbidden cloudflare upstream header")
+		case "authorization":
+			authorizationValues = append(authorizationValues, values...)
+		}
+		if strings.HasPrefix(lowerName, "x-sub2api-") {
+			return errors.New("forbidden cloudflare upstream header")
+		}
+		for _, value := range values {
+			headerCount++
+			headerBytes += len(name) + len(value)
+			if headerCount > maxCloudflareGatewayHeaders || headerBytes > maxCloudflareGatewayHeaderBytes {
+				return errors.New("cloudflare upstream headers exceed limit")
+			}
+			if len(value) > 16<<10 || hasHTTPControl(value) {
+				return errors.New("invalid cloudflare upstream header value")
+			}
+		}
+	}
+
+	if service.HTTPUpstreamProfileFromContext(req.Context()) != service.HTTPUpstreamProfileOpenAI {
+		return nil
+	}
+	if len(authorizationValues) != 1 {
+		return errors.New("invalid cloudflare upstream authorization")
+	}
+	authorization := strings.TrimSpace(authorizationValues[0])
+	lowerAuthorization := strings.ToLower(authorization)
+	if authorization == "" || (!strings.HasPrefix(lowerAuthorization, "bearer ") && !strings.HasPrefix(lowerAuthorization, "agentassertion ")) {
+		return errors.New("invalid cloudflare upstream authorization")
+	}
+	if strings.TrimSpace(authorization[strings.IndexByte(authorization, ' ')+1:]) == "" {
+		return errors.New("invalid cloudflare upstream authorization")
+	}
+	return nil
+}
+
+func hasHTTPControl(value string) bool {
+	for _, r := range value {
+		if r <= 0x1f || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *httpUpstreamService) redirectChecker(req *http.Request, via []*http.Request) error {

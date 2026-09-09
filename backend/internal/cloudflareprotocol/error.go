@@ -216,15 +216,15 @@ func sanitizePublicDetail(s string) string {
 	if len(s) > 1024 {
 		s = s[:1024]
 	}
-	var b strings.Builder
+	clean := make([]rune, 0, len(s))
 	for _, r := range s {
 		if r == '\n' || r == '\r' || r == '\t' {
-			b.WriteByte(' ')
+			clean = append(clean, ' ')
 		} else if !unicode.IsControl(r) {
-			b.WriteRune(r)
+			clean = append(clean, r)
 		}
 	}
-	out := strings.TrimSpace(b.String())
+	out := strings.TrimSpace(string(clean))
 	lower := strings.ToLower(out)
 	for _, marker := range []string{"authorization", "bearer ", "api_key", "apikey", "token=", "password", "secret"} {
 		if strings.Contains(lower, marker) {

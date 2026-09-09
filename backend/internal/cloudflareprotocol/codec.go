@@ -848,7 +848,7 @@ func encodeChatResponse(response Response) (any, error) {
 	return result, nil
 }
 
-func encodeResponsesResponse(response Response) (any, error) {
+func encodeResponsesResponse(response Response) (map[string]any, error) {
 	output := []any{}
 	content := []any{}
 	for _, part := range response.Message.Parts {
@@ -1120,8 +1120,8 @@ func encodeChatEvent(event Event, limits EncodeLimits) ([]byte, error) {
 			return nil, err
 		}
 	}
-	choice := map[string]any{"index": event.ChoiceIndex, "delta": map[string]any{}, "finish_reason": nil}
-	delta := choice["delta"].(map[string]any)
+	delta := map[string]any{}
+	choice := map[string]any{"index": event.ChoiceIndex, "delta": delta, "finish_reason": nil}
 	result := map[string]any{"id": event.ResponseID, "object": "chat.completion.chunk", "created": event.CreatedAt, "model": event.Model, "choices": []any{choice}}
 	switch event.Kind {
 	case EventStarted:
@@ -1323,7 +1323,7 @@ func responseEventObject(event Event, limits EncodeLimits, completed bool) (map[
 		if err != nil {
 			return nil, err
 		}
-		return value.(map[string]any), nil
+		return value, nil
 	}
 	dl := limits.decodeLimits()
 	if err := validateID("event.response.id", response.ID, true, dl); err != nil {
@@ -1431,14 +1431,15 @@ func encodeGeminiEvent(event Event, limits EncodeLimits) ([]byte, error) {
 	if event.CreatedAt != "" {
 		return nil, fail(ErrLossy, "event.created_at", "Gemini cannot preserve created_at", nil)
 	}
-	candidate := map[string]any{"index": event.Index, "content": map[string]any{"role": "model", "parts": []any{}}}
+	content := map[string]any{"role": "model", "parts": []any{}}
+	candidate := map[string]any{"index": event.Index, "content": content}
 	result := map[string]any{"responseId": event.ResponseID, "modelVersion": event.Model, "candidates": []any{candidate}}
 	switch event.Kind {
 	case EventTextDelta:
 		if event.Text == "" {
 			return nil, fail(ErrValidation, "event.text", "text delta must not be empty", nil)
 		}
-		candidate["content"].(map[string]any)["parts"] = []any{map[string]any{"text": event.Text}}
+		content["parts"] = []any{map[string]any{"text": event.Text}}
 	case EventToolCallDone:
 		if event.ToolCall == nil {
 			return nil, fail(ErrValidation, "event.tool_call", "nil tool call", nil)

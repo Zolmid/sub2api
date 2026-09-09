@@ -417,7 +417,7 @@ func apply(ctx context.Context, t target, deps dependencies, a firstAdmin) error
 	}
 	statement, err := parseStatement(output)
 	if err != nil {
-		return errors.New("Wrangler mutation output was malformed or unsuccessful")
+		return errors.New("wrangler mutation output was malformed or unsuccessful")
 	}
 	row, err := exactlyOneRow(statement)
 	if err != nil || stringField(row, "inserted_id") != a.id() {
@@ -458,7 +458,7 @@ func runProtectedSQLFile(ctx context.Context, t target, deps dependencies, sql s
 	}
 	output, err = deps.runner.Run(ctx, wranglerPath(deps), wranglerArgs(t, "", path)...)
 	if err != nil {
-		return nil, errors.New("Wrangler SQL-file command failed")
+		return nil, errors.New("wrangler SQL-file command failed")
 	}
 	return output, nil
 }
@@ -470,7 +470,7 @@ func readBack(ctx context.Context, t target, deps dependencies, a firstAdmin) er
 	}
 	statement, err := parseStatement(output)
 	if err != nil {
-		return errors.New("Wrangler readback output was malformed or unsuccessful")
+		return errors.New("wrangler readback output was malformed or unsuccessful")
 	}
 	row, err := exactlyOneRow(statement)
 	if err != nil {

@@ -214,7 +214,10 @@ func validHeaderName(name string) bool {
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+		alphaNumeric := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')
+		if !alphaNumeric && !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
 			return false
 		}
 	}

@@ -21,6 +21,10 @@ import {
   subscriptionControlPlane,
 } from "./subscription-control";
 import {
+  isSettingsControlPath,
+  settingsControlPlane,
+} from "./settings-control";
+import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
   MAX_CONTROL_BODY_BYTES,
@@ -153,6 +157,9 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
     }
     if (isSubscriptionControlPath(url.pathname)) {
       return await subscriptionControlPlane(request, env, url.pathname);
+    }
+    if (isSettingsControlPath(url.pathname)) {
+      return await settingsControlPlane(request, env, url.pathname);
     }
     switch (url.pathname) {
       case "/v1/auth/resolve":

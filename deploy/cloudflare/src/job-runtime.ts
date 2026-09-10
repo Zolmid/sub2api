@@ -1,6 +1,7 @@
 /** Durable, generic D1 authority for at-least-once Cloudflare Queue work. */
 
 const MAX_TIME_MS = 4_102_444_800_000;
+const MAX_MUTABLE_VERSION = 2_147_483_647;
 const MAX_BATCH = 100;
 const OPAQUE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 
@@ -75,6 +76,12 @@ type JobRow = {
   error_code: string | null;
   replay_of_job_id: string | null;
   replay_key: string | null;
+  replay_actor: string | null;
+  replay_reason_code: string | null;
+  replay_evidence_ref: string | null;
+  replay_source_version: number | null;
+  replay_source_status: "dead_letter" | "manual_review" | null;
+  replay_evidence_kind: ReplayInput["evidenceKind"] | null;
   created_at_ms: number;
   updated_at_ms: number;
   completed_at_ms: number | null;
@@ -110,6 +117,10 @@ export type AuthorityInput = Readonly<{
   owner: string;
   leaseToken: string;
   nowMs: number;
+}>;
+
+export type RenewLeaseInput = AuthorityInput & Readonly<{
+  leaseExpiresAtMs: number;
 }>;
 
 export type ClaimInput = Readonly<{
@@ -177,6 +188,7 @@ type OutboxRow = {
   available_at_ms: number;
   publish_owner: string | null;
   publish_lease_expires_at_ms: number | null;
+  job_route: string;
 };
 
 type SQLValue = string | number | null;
@@ -191,7 +203,7 @@ function safeTime(value: number): boolean {
 }
 
 function positiveVersion(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= 1;
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_MUTABLE_VERSION;
 }
 
 function assertText(value: string, maximum: number, field: string): void {
@@ -244,7 +256,8 @@ const JOB_COLUMNS = `job_id,route,job_type,idempotency_key,payload_codec,
   payload_body,payload_digest,status,version,attempt_count,max_attempts,
   base_delay_ms,max_delay_ms,available_at_ms,lease_owner,lease_token,
   delivery_id,lease_expires_at_ms,result_digest,error_code,replay_of_job_id,
-  replay_key,created_at_ms,updated_at_ms,completed_at_ms`;
+  replay_key,replay_actor,replay_reason_code,replay_evidence_ref,replay_source_version,
+  replay_source_status,replay_evidence_kind,created_at_ms,updated_at_ms,completed_at_ms`;
 
 async function loadJobRow(db: D1Database, jobId: string): Promise<JobRow | null> {
   return db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs WHERE job_id=?`)
@@ -290,6 +303,27 @@ export function parseQueueEnvelope(value: unknown): QueueEnvelope | null {
 
 function envelopeJSON(jobId: string, route: string, version: number): string {
   return JSON.stringify(makeQueueEnvelope(jobId, route, version));
+}
+
+type InitialOutboxRow = Readonly<{
+  job_id: string;
+  job_version: number;
+  envelope_json: string;
+  created_at_ms: number;
+}>;
+
+async function initialOutboxMatches(
+  db: D1Database,
+  jobId: string,
+  route: string,
+  createdAtMs: number,
+): Promise<boolean> {
+  const outbox = await db.prepare(`SELECT job_id,job_version,envelope_json,created_at_ms
+    FROM background_job_outbox WHERE job_id=? AND job_version=1`)
+    .bind(jobId).first<InitialOutboxRow>();
+  return outbox !== null && outbox.job_id === jobId && outbox.job_version === 1 &&
+    outbox.envelope_json === envelopeJSON(jobId, route, 1) &&
+    outbox.created_at_ms === createdAtMs;
 }
 
 function changes(result: D1Result): number {
@@ -352,15 +386,18 @@ export async function createAndEnqueueJob(
   validateCreate(input);
   const outboxId = crypto.randomUUID();
   const results = await db.batch([
-    db.prepare(`INSERT OR IGNORE INTO background_jobs(
+    db.prepare(`INSERT INTO background_jobs(
       job_id,route,job_type,idempotency_key,payload_codec,payload_body,payload_digest,
       status,version,attempt_count,max_attempts,base_delay_ms,max_delay_ms,
       available_at_ms,created_at_ms,updated_at_ms
-    ) VALUES(?,?,?,?,?,?,?,'queued',1,0,?,?,?,?,?,?)`).bind(
+    ) SELECT ?,?,?,?,?,?,?,'queued',1,0,?,?,?,?,?,?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM background_jobs WHERE job_id=? OR (route=? AND idempotency_key=?)
+      )`).bind(
       input.jobId, input.route, input.jobType, input.idempotencyKey,
       input.payloadCodec, input.payloadBody, input.payloadDigest,
       input.maxAttempts, input.baseDelayMs, input.maxDelayMs,
-      input.nowMs, input.nowMs, input.nowMs,
+      input.nowMs, input.nowMs, input.nowMs, input.jobId, input.route, input.idempotencyKey,
     ),
     db.prepare(`INSERT INTO background_job_transitions(
       transition_id,job_id,event_type,from_status,to_status,from_version,to_version,
@@ -376,18 +413,35 @@ export async function createAndEnqueueJob(
     ),
   ]);
   const applied = verifyBatch(results, 3);
-  const row = await loadJobRow(db, input.jobId) ??
-    await db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs WHERE route=? AND idempotency_key=?`)
-      .bind(input.route, input.idempotencyKey).first<JobRow>();
+  const row = await db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs
+    WHERE job_id=? OR (route=? AND idempotency_key=?) ORDER BY job_id LIMIT 1`)
+    .bind(input.jobId, input.route, input.idempotencyKey).first<JobRow>();
   if (applied) return { kind: "applied", reason: "created", job: row ? jobRecord(row) : null, outboxCreated: true };
-  const same = row !== null && row.route === input.route && row.job_type === input.jobType &&
+  const transition = row && await db.prepare(`SELECT transition_id,event_type,from_status,to_status,
+    from_version,to_version,actor,reason_code,evidence_ref,created_at_ms
+    FROM background_job_transitions WHERE job_id=? AND to_version=1`)
+    .bind(row.job_id).first<{
+      transition_id: string; event_type: string; from_status: string | null; to_status: string;
+      from_version: number; to_version: number; actor: string; reason_code: string | null;
+      evidence_ref: string | null; created_at_ms: number;
+    }>();
+  const submissionSame = row !== null && row.route === input.route && row.job_type === input.jobType &&
+    row.job_id === input.jobId &&
     row.idempotency_key === input.idempotencyKey && row.payload_codec === input.payloadCodec &&
     row.payload_body === input.payloadBody && row.payload_digest === input.payloadDigest &&
     row.max_attempts === input.maxAttempts && row.base_delay_ms === input.baseDelayMs &&
-    row.max_delay_ms === input.maxDelayMs;
+    row.max_delay_ms === input.maxDelayMs && row.created_at_ms === input.nowMs &&
+    transition?.transition_id === input.operationId && transition.event_type === "created" &&
+    transition.from_status === null && transition.to_status === "queued" &&
+    transition.from_version === 0 && transition.to_version === 1 &&
+    transition.actor === input.actor && transition.reason_code === null && transition.evidence_ref === null &&
+    transition.created_at_ms === input.nowMs;
+  const same = submissionSame && await initialOutboxMatches(
+    db, input.jobId, input.route, input.nowMs,
+  );
   return {
     kind: same ? "noop" : "conflict",
-    reason: same ? "idempotent_create" : "idempotency_conflict",
+    reason: same ? "idempotent_create" : submissionSame ? "initial_outbox_corrupt" : "idempotency_conflict",
     job: row ? jobRecord(row) : null,
     outboxCreated: false,
   };
@@ -410,6 +464,7 @@ type TransitionSpec = Readonly<{
 }>;
 
 async function applyTransition(db: D1Database, spec: TransitionSpec): Promise<MutationResult> {
+  if (spec.expectedVersion >= MAX_MUTABLE_VERSION) throw new Error("VERSION_EXHAUSTED");
   const nextVersion = spec.expectedVersion + 1;
   const statements = [
     db.prepare(spec.updateSQL).bind(...spec.updateBindings),
@@ -484,7 +539,7 @@ export async function claimJob(
     actor: input.owner,
     nowMs: input.nowMs,
     updateSQL: `UPDATE background_jobs SET status='claimed',version=version+1,
-      attempt_count=attempt_count+1,lease_owner=?,lease_token=?,delivery_id=?,
+      attempt_count=attempt_count+1,result_digest=NULL,error_code=NULL,lease_owner=?,lease_token=?,delivery_id=?,
       lease_expires_at_ms=?,updated_at_ms=?
       WHERE job_id=? AND route=? AND version=? AND status=?
         AND available_at_ms<=? AND attempt_count<max_attempts`,
@@ -511,6 +566,42 @@ export async function startJob(db: D1Database, input: AuthorityInput): Promise<M
       WHERE job_id=? AND version=? AND status='claimed' AND lease_owner=?
         AND lease_token=? AND lease_expires_at_ms>?`,
     updateBindings: [input.nowMs, row.job_id, row.version, input.owner, input.leaseToken, input.nowMs],
+  });
+}
+
+export async function renewJobLease(
+  db: D1Database,
+  input: RenewLeaseInput,
+): Promise<MutationResult> {
+  assertAuthority(input);
+  assertTime(input.leaseExpiresAtMs);
+  if (input.leaseExpiresAtMs <= input.nowMs) throw new Error("INVALID_LEASE");
+  const row = await loadJobRow(db, input.jobId);
+  if (!row || (row.status !== "claimed" && row.status !== "running") ||
+    !authorityMatches(row, input) || row.lease_expires_at_ms === null ||
+    input.leaseExpiresAtMs <= row.lease_expires_at_ms) {
+    return {
+      kind: "noop",
+      reason: "stale_or_nonextending_lease",
+      job: row ? jobRecord(row) : null,
+      outboxCreated: false,
+    };
+  }
+  return applyTransition(db, {
+    jobId: row.job_id,
+    expectedVersion: row.version,
+    operationId: input.operationId,
+    fromStatus: row.status,
+    toStatus: row.status,
+    eventType: "lease_renewed",
+    actor: input.owner,
+    nowMs: input.nowMs,
+    updateSQL: `UPDATE background_jobs SET version=version+1,lease_expires_at_ms=?,updated_at_ms=?
+      WHERE job_id=? AND version=? AND status=? AND lease_owner=? AND lease_token=?
+        AND lease_expires_at_ms>? AND lease_expires_at_ms<? AND updated_at_ms<=?`,
+    updateBindings: [input.leaseExpiresAtMs, input.nowMs, row.job_id, row.version,
+      row.status, input.owner, input.leaseToken, input.nowMs, input.leaseExpiresAtMs,
+      input.nowMs],
   });
 }
 
@@ -567,7 +658,7 @@ export async function recordRetryableFailure(
       lease_expires_at_ms=NULL,updated_at_ms=?,completed_at_ms=?
       WHERE job_id=? AND version=? AND status=? AND lease_owner=? AND lease_token=?
         AND lease_expires_at_ms>?`,
-    updateBindings: [toStatus, input.errorCode, input.nowMs + delay, input.nowMs,
+    updateBindings: [toStatus, input.errorCode, exhausted ? row.available_at_ms : input.nowMs + delay, input.nowMs,
       exhausted ? input.nowMs : null, row.job_id, row.version, row.status,
       input.owner, input.leaseToken, input.nowMs],
     outbox: exhausted ? undefined : { route: row.route, availableAtMs: input.nowMs + delay },
@@ -691,7 +782,7 @@ export async function recoverExpiredJob(
       error_code='claim_lease_expired',available_at_ms=?,lease_owner=NULL,
       lease_token=NULL,delivery_id=NULL,lease_expires_at_ms=NULL,updated_at_ms=?,completed_at_ms=?
       WHERE job_id=? AND version=? AND status='claimed' AND lease_expires_at_ms<=?`,
-    updateBindings: [toStatus, input.nowMs + delay, input.nowMs,
+    updateBindings: [toStatus, exhausted ? row.available_at_ms : input.nowMs + delay, input.nowMs,
       exhausted ? input.nowMs : null, row.job_id, row.version, input.nowMs],
     outbox: exhausted ? undefined : { route: row.route, availableAtMs: input.nowMs + delay },
   });
@@ -716,23 +807,35 @@ export async function replayTerminalJob(
   const source = await loadJobRow(db, input.sourceJobId);
   if (!source || source.version !== input.expectedSourceVersion ||
     (source.status !== "dead_letter" && source.status !== "manual_review")) {
-    return { kind: "noop", reason: "source_not_replayable_or_stale", job: null, outboxCreated: false };
+    const existing = await db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs
+      WHERE job_id=? OR replay_key=? OR (route=? AND idempotency_key=?) ORDER BY job_id LIMIT 1`)
+      .bind(input.newJobId, input.replayKey, source?.route ?? "", input.idempotencyKey).first<JobRow>();
+    return existing
+      ? { kind: "conflict", reason: "replay_conflict", job: jobRecord(existing), outboxCreated: false }
+      : { kind: "noop", reason: "source_not_replayable_or_stale", job: null, outboxCreated: false };
   }
   const evidence = `${input.evidenceKind}:${input.evidenceRef}`;
   if (evidence.length > 256) throw new Error("INVALID_EVIDENCE_REF");
   const results = await db.batch([
-    db.prepare(`INSERT OR IGNORE INTO background_jobs(
+    db.prepare(`INSERT INTO background_jobs(
       job_id,route,job_type,idempotency_key,payload_codec,payload_body,payload_digest,
       status,version,attempt_count,max_attempts,base_delay_ms,max_delay_ms,
       available_at_ms,replay_of_job_id,replay_key,replay_actor,replay_reason_code,
-      replay_evidence_ref,created_at_ms,updated_at_ms
+      replay_evidence_ref,replay_source_version,replay_source_status,replay_evidence_kind,
+      created_at_ms,updated_at_ms
     ) SELECT ?,route,job_type,?,payload_codec,payload_body,payload_digest,
-      'queued',1,0,max_attempts,base_delay_ms,max_delay_ms,?,?,?,?,?,?,?,?
-      FROM background_jobs
-      WHERE job_id=? AND version=? AND status IN ('dead_letter','manual_review')`).bind(
+      'queued',1,0,max_attempts,base_delay_ms,max_delay_ms,?,?,?,?,?,?,?,?,?,?,?
+      FROM background_jobs AS source
+      WHERE source.job_id=? AND source.version=? AND source.status IN ('dead_letter','manual_review')
+        AND NOT EXISTS (
+          SELECT 1 FROM background_jobs AS existing
+          WHERE existing.job_id=? OR existing.replay_key=?
+            OR (existing.route=source.route AND existing.idempotency_key=?)
+        )`).bind(
       input.newJobId, input.idempotencyKey, input.nowMs, input.sourceJobId,
-      input.replayKey, input.actor, input.reasonCode, evidence, input.nowMs,
-      input.nowMs, input.sourceJobId, input.expectedSourceVersion,
+      input.replayKey, input.actor, input.reasonCode, evidence, input.expectedSourceVersion,
+      source.status, input.evidenceKind, input.nowMs, input.nowMs, input.sourceJobId,
+      input.expectedSourceVersion, input.newJobId, input.replayKey, input.idempotencyKey,
     ),
     db.prepare(`INSERT INTO background_job_transitions(
       transition_id,job_id,event_type,from_status,to_status,from_version,to_version,
@@ -748,12 +851,40 @@ export async function replayTerminalJob(
     ),
   ]);
   const applied = verifyBatch(results, 3);
-  const created = await loadJobRow(db, input.newJobId);
-  const idempotent = created?.replay_of_job_id === input.sourceJobId &&
-    created.replay_key === input.replayKey;
+  const created = await db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs
+    WHERE job_id=? OR replay_key=? OR (route=? AND idempotency_key=?) ORDER BY job_id LIMIT 1`)
+    .bind(input.newJobId, input.replayKey, source.route, input.idempotencyKey).first<JobRow>();
+  const transition = created && await db.prepare(`SELECT transition_id,event_type,from_status,to_status,
+    from_version,to_version,actor,reason_code,evidence_ref,created_at_ms
+    FROM background_job_transitions WHERE job_id=? AND to_version=1`)
+    .bind(created.job_id).first<{
+      transition_id: string; event_type: string; from_status: string | null; to_status: string;
+      from_version: number; to_version: number; actor: string; reason_code: string | null;
+      evidence_ref: string | null; created_at_ms: number;
+    }>();
+  const replaySame = created?.job_id === input.newJobId && created.route === source.route &&
+    created.job_type === source.job_type && created.idempotency_key === input.idempotencyKey &&
+    created.payload_codec === source.payload_codec && created.payload_body === source.payload_body &&
+    created.payload_digest === source.payload_digest && created.max_attempts === source.max_attempts &&
+    created.base_delay_ms === source.base_delay_ms && created.max_delay_ms === source.max_delay_ms &&
+    created.available_at_ms === input.nowMs && created.replay_of_job_id === input.sourceJobId &&
+    created.replay_key === input.replayKey && created.replay_actor === input.actor &&
+    created.replay_reason_code === input.reasonCode && created.replay_evidence_ref === evidence &&
+    created.replay_source_version === input.expectedSourceVersion &&
+    created.replay_source_status === source.status && created.replay_evidence_kind === input.evidenceKind &&
+    created.created_at_ms === input.nowMs &&
+    transition?.transition_id === input.operationId && transition.event_type === "replayed" &&
+    transition.from_status === null && transition.to_status === "queued" &&
+    transition.from_version === 0 && transition.to_version === 1 && transition.actor === input.actor &&
+    transition.reason_code === input.reasonCode && transition.evidence_ref === evidence &&
+    transition.created_at_ms === input.nowMs;
+  const idempotent = replaySame && await initialOutboxMatches(
+    db, input.newJobId, source.route, input.nowMs,
+  );
   return {
     kind: applied ? "applied" : idempotent ? "noop" : "conflict",
-    reason: applied ? "replayed" : idempotent ? "idempotent_replay" : "replay_conflict",
+    reason: applied ? "replayed" : idempotent ? "idempotent_replay" :
+      replaySame ? "initial_outbox_corrupt" : "replay_conflict",
     job: created ? jobRecord(created) : null,
     outboxCreated: applied,
   };
@@ -763,7 +894,9 @@ function outboxRecord(row: OutboxRow): OutboxRecord {
   let parsed: unknown;
   try { parsed = JSON.parse(row.envelope_json); } catch { throw new Error("CORRUPT_OUTBOX_ENVELOPE"); }
   const envelope = parseQueueEnvelope(parsed);
-  if (!envelope || envelope.jobId !== row.job_id || envelope.jobVersion !== row.job_version) {
+  if (!envelope || envelope.jobId !== row.job_id || envelope.route !== row.job_route ||
+    envelope.jobVersion !== row.job_version ||
+    row.envelope_json !== envelopeJSON(row.job_id, row.job_route, row.job_version)) {
     throw new Error("CORRUPT_OUTBOX_ENVELOPE");
   }
   return {
@@ -779,8 +912,9 @@ function outboxRecord(row: OutboxRow): OutboxRecord {
   };
 }
 
-const OUTBOX_COLUMNS = `outbox_id,job_id,job_version,envelope_json,state,version,
-  available_at_ms,publish_owner,publish_lease_expires_at_ms`;
+const OUTBOX_COLUMNS = `outbox.outbox_id,outbox.job_id,outbox.job_version,outbox.envelope_json,
+  outbox.state,outbox.version,outbox.available_at_ms,outbox.publish_owner,
+  outbox.publish_lease_expires_at_ms,job.route AS job_route`;
 
 export async function listDrainableOutbox(
   db: D1Database,
@@ -789,10 +923,11 @@ export async function listDrainableOutbox(
 ): Promise<readonly OutboxRecord[]> {
   assertTime(nowMs);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_BATCH) throw new Error("INVALID_LIMIT");
-  const result = await db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM background_job_outbox
-    WHERE available_at_ms<=? AND (
-      state='pending' OR (state='publishing' AND publish_lease_expires_at_ms<=?)
-    ) ORDER BY available_at_ms,outbox_id LIMIT ?`).bind(nowMs, nowMs, limit).all<OutboxRow>();
+  const result = await db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM background_job_outbox AS outbox
+    JOIN background_jobs AS job ON job.job_id=outbox.job_id
+    WHERE outbox.available_at_ms<=? AND (
+      outbox.state='pending' OR (outbox.state='publishing' AND outbox.publish_lease_expires_at_ms<=?)
+    ) ORDER BY outbox.available_at_ms,outbox.outbox_id LIMIT ?`).bind(nowMs, nowMs, limit).all<OutboxRow>();
   return result.results.map(outboxRecord);
 }
 
@@ -809,7 +944,9 @@ export async function claimOutbox(
   assertText(input.outboxId, 160, "OUTBOX_ID");
   assertText(input.owner, 160, "OWNER");
   assertTime(input.nowMs);
-  if (!positiveVersion(input.expectedVersion) || !Number.isInteger(input.leaseMs) ||
+  if (!positiveVersion(input.expectedVersion)) throw new Error("INVALID_VERSION");
+  if (input.expectedVersion >= MAX_MUTABLE_VERSION) throw new Error("OUTBOX_VERSION_EXHAUSTED");
+  if (!Number.isInteger(input.leaseMs) ||
     input.leaseMs < 1 || input.leaseMs > 86_400_000 ||
     input.nowMs + input.leaseMs > MAX_TIME_MS) throw new Error("INVALID_OUTBOX_CLAIM");
   const updated = await db.prepare(`UPDATE background_job_outbox
@@ -819,7 +956,8 @@ export async function claimOutbox(
     )`).bind(input.owner, input.nowMs + input.leaseMs, input.outboxId,
       input.expectedVersion, input.nowMs, input.nowMs).run();
   if (changes(updated) !== 1) return null;
-  const row = await db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM background_job_outbox WHERE outbox_id=?`)
+  const row = await db.prepare(`SELECT ${OUTBOX_COLUMNS} FROM background_job_outbox AS outbox
+    JOIN background_jobs AS job ON job.job_id=outbox.job_id WHERE outbox.outbox_id=?`)
     .bind(input.outboxId).first<OutboxRow>();
   return row ? outboxRecord(row) : null;
 }
@@ -836,12 +974,15 @@ export async function markOutboxPublished(
   assertText(input.outboxId, 160, "OUTBOX_ID");
   assertText(input.owner, 160, "OWNER");
   assertTime(input.nowMs);
-  if (!positiveVersion(input.expectedVersion)) throw new Error("INVALID_VERSION");
+  if (!positiveVersion(input.expectedVersion) || input.expectedVersion >= MAX_MUTABLE_VERSION) {
+    throw new Error("OUTBOX_VERSION_EXHAUSTED");
+  }
   const result = await db.prepare(`UPDATE background_job_outbox
     SET state='published',version=version+1,publish_owner=NULL,
       publish_lease_expires_at_ms=NULL,published_at_ms=?,last_error_code=NULL
-    WHERE outbox_id=? AND version=? AND state='publishing' AND publish_owner=?`)
-    .bind(input.nowMs, input.outboxId, input.expectedVersion, input.owner).run();
+    WHERE outbox_id=? AND version=? AND state='publishing' AND publish_owner=?
+      AND publish_lease_expires_at_ms>?`)
+    .bind(input.nowMs, input.outboxId, input.expectedVersion, input.owner, input.nowMs).run();
   return changes(result) === 1;
 }
 
@@ -851,6 +992,7 @@ export async function releaseOutbox(
     outboxId: string;
     expectedVersion: number;
     owner: string;
+    nowMs: number;
     availableAtMs: number;
     errorCode: string;
   }>,
@@ -858,14 +1000,18 @@ export async function releaseOutbox(
   assertText(input.outboxId, 160, "OUTBOX_ID");
   assertText(input.owner, 160, "OWNER");
   assertText(input.errorCode, 96, "ERROR_CODE");
+  assertTime(input.nowMs);
   assertTime(input.availableAtMs);
-  if (!positiveVersion(input.expectedVersion)) throw new Error("INVALID_VERSION");
+  if (!positiveVersion(input.expectedVersion) || input.expectedVersion >= MAX_MUTABLE_VERSION) {
+    throw new Error("OUTBOX_VERSION_EXHAUSTED");
+  }
   const result = await db.prepare(`UPDATE background_job_outbox
     SET state='pending',version=version+1,publish_owner=NULL,
       publish_lease_expires_at_ms=NULL,available_at_ms=?,last_error_code=?
-    WHERE outbox_id=? AND version=? AND state='publishing' AND publish_owner=?`)
+    WHERE outbox_id=? AND version=? AND state='publishing' AND publish_owner=?
+      AND publish_lease_expires_at_ms>?`)
     .bind(input.availableAtMs, input.errorCode, input.outboxId,
-      input.expectedVersion, input.owner).run();
+      input.expectedVersion, input.owner, input.nowMs).run();
   return changes(result) === 1;
 }
 
@@ -875,8 +1021,19 @@ export type OutboxPublisher = Readonly<{
 
 export type DrainResult = Readonly<{
   outboxId: string;
-  outcome: "published" | "publish_failed" | "published_unmarked" | "claim_lost";
+  outcome:
+    | "published"
+    | "publish_failed"
+    | "publish_failed_unreleased"
+    | "published_unmarked"
+    | "claim_lost";
 }>;
+
+function readDrainClock(now: (() => number) | undefined): number {
+  const value = (now ?? Date.now)();
+  assertTime(value);
+  return value;
+}
 
 export async function drainOutbox(
   db: D1Database,
@@ -887,12 +1044,16 @@ export async function drainOutbox(
     leaseMs: number;
     failureDelayMs: number;
     limit?: number;
+    now?: () => number;
   }>,
 ): Promise<readonly DrainResult[]> {
   assertText(input.owner, 160, "OWNER");
   assertTime(input.nowMs);
   if (!Number.isInteger(input.failureDelayMs) || input.failureDelayMs < 0 ||
-    input.nowMs + input.failureDelayMs > MAX_TIME_MS) throw new Error("INVALID_FAILURE_DELAY");
+    input.failureDelayMs > MAX_TIME_MS ||
+    (input.now !== undefined && typeof input.now !== "function")) {
+    throw new Error("INVALID_FAILURE_DELAY");
+  }
   const rows = await listDrainableOutbox(db, input.nowMs, input.limit ?? 25);
   const outcomes: DrainResult[] = [];
   for (const row of rows) {
@@ -907,19 +1068,28 @@ export async function drainOutbox(
     try {
       await publisher.send(claimed.envelope);
     } catch {
-      await releaseOutbox(db, {
+      const failureNowMs = readDrainClock(input.now);
+      if (failureNowMs + input.failureDelayMs > MAX_TIME_MS) {
+        throw new Error("INVALID_FAILURE_DELAY");
+      }
+      const released = await releaseOutbox(db, {
         outboxId: claimed.outboxId, expectedVersion: claimed.version,
-        owner: input.owner, availableAtMs: input.nowMs + input.failureDelayMs,
+        owner: input.owner, nowMs: failureNowMs,
+        availableAtMs: failureNowMs + input.failureDelayMs,
         errorCode: "queue_publish_failed",
       });
-      outcomes.push({ outboxId: claimed.outboxId, outcome: "publish_failed" });
+      outcomes.push({
+        outboxId: claimed.outboxId,
+        outcome: released ? "publish_failed" : "publish_failed_unreleased",
+      });
       continue;
     }
     let marked = false;
     try {
+      const publishedNowMs = readDrainClock(input.now);
       marked = await markOutboxPublished(db, {
         outboxId: claimed.outboxId, expectedVersion: claimed.version,
-        owner: input.owner, nowMs: input.nowMs,
+        owner: input.owner, nowMs: publishedNowMs,
       });
     } catch {
       // Publish already succeeded. Let the durable publisher lease expire so

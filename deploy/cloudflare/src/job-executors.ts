@@ -6,6 +6,7 @@ import type {
   JobExecutorResult,
 } from "./job-worker";
 import type { JobRecord } from "./job-runtime";
+import { createSubscriptionExpiryMaintenanceExecutor } from "./subscription-expiry-job";
 
 export const JOB_EXECUTION_PRIVATE_PATH = "/internal/cloudflare/jobs/execute";
 export const JOB_EXECUTION_RPC_VERSION = 1 as const;
@@ -24,6 +25,10 @@ export const REGISTERED_BACKGROUND_JOB_ROUTES = Object.freeze(
 );
 
 type BackgroundJobRoute = (typeof REGISTERED_BACKGROUND_JOB_ROUTES)[number];
+type ContainerBackgroundJobRoute = Exclude<
+  BackgroundJobRoute,
+  typeof BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1
+>;
 
 type ContainerJobEnv = Pick<Env, "SUB2API_CONTAINER">;
 
@@ -218,11 +223,26 @@ export function createGatewayJobExecutors(
   dispatch: ContainerDispatch = (request: Request) =>
     getContainer(env.SUB2API_CONTAINER, "gateway").fetch(request),
 ): JobExecutorMap {
-  const entries = REGISTERED_BACKGROUND_JOB_ROUTES.map(
-    (route): readonly [BackgroundJobRoute, JobExecutor] => [
+  const entries = REGISTERED_BACKGROUND_JOB_ROUTES.filter(
+    (route): route is ContainerBackgroundJobRoute =>
+      route !== BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1,
+  ).map(
+    (route): readonly [ContainerBackgroundJobRoute, JobExecutor] => [
       route,
       (input) => executeJobInGatewayContainer(input, dispatch),
     ],
   );
   return Object.freeze(Object.fromEntries(entries)) as JobExecutorMap;
+}
+
+/** The subscription expiry route is the sole Worker-local background executor. */
+export function createWorkerJobExecutors(
+  env: Pick<Env, "DB" | "SUB2API_CONTAINER">,
+  dispatch?: ContainerDispatch,
+): JobExecutorMap {
+  return Object.freeze({
+    ...createGatewayJobExecutors(env, dispatch),
+    [BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1]:
+      createSubscriptionExpiryMaintenanceExecutor(env.DB),
+  });
 }

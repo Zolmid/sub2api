@@ -41,8 +41,9 @@ current migration responsibilities:
 - `subscription-expiry-maintenance.v1`
 
 These names are versioned constants, not prefixes. Any other route remains
-`manual_review` with `unknown_route` evidence. Registered routes dispatch to
-the gateway Container on the private path
+`manual_review` with `unknown_route` evidence. `oauth-refresh.v1`,
+`email-delivery.v1`, and `payment-reconciliation.v1` retain the gateway
+Container boundary on the private path
 `/internal/cloudflare/jobs/execute`. The entire `/internal/cloudflare`
 namespace is reserved: public Worker ingress returns 404 for that path or any
 descendant before fixture or routing headers are honored. The boundary applies
@@ -89,10 +90,29 @@ ambiguous Container outcomes fail closed to `manual_review`. Only an explicit,
 validated `retryable_failure` response from the private Go endpoint may enter
 the retry path.
 
-This is still infrastructure only. The recognized routes are not end-to-end
-complete until the Go gateway implements the private endpoint above and maps
-each route's provider/payment/email/subscription behavior into the response
-contract without logging or returning secret payload material.
+`subscription-expiry-maintenance.v1` is the one deliberate Worker-local
+exception. Each scheduled event derives a two-minute deterministic bucket and
+uses it for the job ID, idempotency key, operation ID, timestamp, payload
+digest, and D1 outbox intent. Duplicate delivery for the same bucket is an
+idempotent create, not another sweep. Its exact JSON payload is kept only in
+D1, includes the bucket cutoff and cursor, and is re-hashed and validated
+before execution; malformed, altered, or metadata-mismatched payloads enter
+manual review.
+
+The local executor invokes `SubscriptionRuntime.sweepExpired` with its stable
+per-bucket/cursor operation ID and at most 100 rows. A full batch writes a
+deterministic cursor follow-up job through the same D1 job/outbox primitive
+before the current job succeeds. The sweep and the job-state transition remain
+separate D1 commits: this does not claim a fabricated cross-operation
+transaction. If the Worker fails after a sweep, the durable transition ledger
+is auditable and retry/replay of that sweep operation is safe because the
+subscription runtime returns its stored idempotent result instead of applying
+the subscription transition twice.
+
+This is still infrastructure only. The three Container routes are not
+end-to-end complete until the Go gateway implements the private endpoint above
+and maps their provider/payment/email behavior into the response contract
+without logging or returning secret payload material.
 
 Do not retry `manual_review` or `dead_letter` records by modifying them. Use
 the existing audited replay API with a new job ID, idempotency key, replay key,

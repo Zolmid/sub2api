@@ -19,6 +19,7 @@ import {
   MAX_JOB_EXECUTION_PAYLOAD_BYTES,
   MAX_JOB_EXECUTION_RESPONSE_BYTES,
   createGatewayJobExecutors,
+  createWorkerJobExecutors,
 } from "../src/job-executors";
 
 const db = env.DB;
@@ -88,6 +89,11 @@ describe("background job Queue worker", () => {
       Response.json({ v: 1, kind: "succeeded", resultDigest: "sha256:unused" })
     );
     expect(Object.keys(executors).sort()).toEqual([
+      BACKGROUND_JOB_ROUTES.EMAIL_DELIVERY_V1,
+      BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
+      BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
+    ].sort());
+    expect(Object.keys(createWorkerJobExecutors(env)).sort()).toEqual([
       BACKGROUND_JOB_ROUTES.EMAIL_DELIVERY_V1,
       BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
       BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
@@ -162,16 +168,6 @@ describe("background job Queue worker", () => {
         route: BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
         body: { v: 1, kind: "permanent_failure", errorCode: "invalid_reconciliation" },
         expected: { status: "failed", errorCode: "invalid_reconciliation" },
-      },
-      {
-        route: BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1,
-        body: {
-          v: 1,
-          kind: "manual_review",
-          reasonCode: "operator_required",
-          evidenceRef: "container:subscription-maintenance",
-        },
-        expected: { status: "manual_review", errorCode: "operator_required" },
       },
     ] as const;
 

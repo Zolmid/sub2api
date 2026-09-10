@@ -30,8 +30,9 @@ import {
 } from "./job-worker";
 import {
   JOB_EXECUTION_PRIVATE_PATH,
-  createGatewayJobExecutors,
+  createWorkerJobExecutors,
 } from "./job-executors";
+import { enqueueSubscriptionExpiryMaintenance } from "./subscription-expiry-job";
 import { emailControlPlane } from "./email-control";
 import { oauthRefreshControlPlane } from "./oauth-refresh-control";
 import { OAuthRefreshAuthorityDO } from "./oauth-refresh-runtime";
@@ -442,7 +443,7 @@ const worker = {
     if (batch.queue === BACKGROUND_JOB_QUEUE_NAME) {
       await consumeJobQueueBatch(batch, {
         db: env.DB,
-        executors: createGatewayJobExecutors(env),
+        executors: createWorkerJobExecutors(env),
       });
       return;
     }
@@ -455,17 +456,21 @@ const worker = {
   },
 
   async scheduled(
-    _controller: ScheduledController,
+    controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
     // The bounded outbox drain never calls the Container and therefore cannot
     // defeat idle scale-to-zero.
+    const expiryMaintenance = Number.isSafeInteger(controller.scheduledTime)
+      ? enqueueSubscriptionExpiryMaintenance(env.DB, controller.scheduledTime)
+      : Promise.resolve();
     ctx.waitUntil(Promise.all([
       drainOutbox(env),
       recoverStaleAdmissions(env),
       drainBackgroundJobOutbox(env),
       recoverExpiredBackgroundJobs(env.DB),
+      expiryMaintenance,
     ]).then(() => undefined));
   },
 };

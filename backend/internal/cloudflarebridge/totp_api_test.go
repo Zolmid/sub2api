@@ -166,14 +166,20 @@ func TestCloudflareTOTPLoginRequiresWorkerChallengeBeforeIssuingJWT(t *testing.T
 	require.Equal(t, http.StatusOK, verified.Code, verified.Body.String())
 	var verifiedEnvelope struct {
 		Data struct {
-			AccessToken string `json:"access_token"`
-			User        struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			TokenType    string `json:"token_type"`
+			User         struct {
 				ID string `json:"id"`
 			} `json:"user"`
 		} `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(verified.Body.Bytes(), &verifiedEnvelope))
 	require.NotEmpty(t, verifiedEnvelope.Data.AccessToken)
+	require.NotEmpty(t, verifiedEnvelope.Data.RefreshToken)
+	require.NotZero(t, verifiedEnvelope.Data.ExpiresIn)
+	require.Equal(t, "Bearer", verifiedEnvelope.Data.TokenType)
 	require.Equal(t, strconv.FormatInt(userID, 10), verifiedEnvelope.Data.User.ID)
 
 	current := callJSON(t, handler, http.MethodGet, "/api/v1/auth/me",
@@ -224,7 +230,7 @@ func TestCloudflareTOTPProfileEndpointsRequirePasswordAndBindStepUpToJWT(t *test
 	require.Equal(t, http.StatusOK, stepUp.Code, stepUp.Body.String())
 	require.Contains(t, stepUp.Body.String(), `"expires_in":900`)
 	require.Equal(t, 1, control.stepUpCalls)
-	require.Regexp(t, `^[0-9a-f]{16}$`, control.lastSessionID)
+	require.Regexp(t, `^[0-9a-f]{32}$`, control.lastSessionID)
 	require.Equal(t, "654321", control.lastCode)
 
 	wrongDisable := callJSON(t, handler, http.MethodPost,

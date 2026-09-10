@@ -168,9 +168,19 @@ func newCloudflareAPIKeyDTO(key *service.APIKey) *cloudflareAPIKeyDTO {
 }
 
 type cloudflareAuthResponse struct {
-	AccessToken string             `json:"access_token"`
-	TokenType   string             `json:"token_type"`
-	User        *cloudflareUserDTO `json:"user"`
+	AccessToken  string             `json:"access_token"`
+	RefreshToken string             `json:"refresh_token,omitempty"`
+	ExpiresIn    int                `json:"expires_in,omitempty"`
+	TokenType    string             `json:"token_type"`
+	User         *cloudflareUserDTO `json:"user,omitempty"`
+}
+
+type cloudflareRefreshTokenRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+type cloudflareLogoutRequest struct {
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 type cloudflareCreateAPIKeyRequest struct {
@@ -269,7 +279,7 @@ func (h *cloudflareUserAPIHandler) Login(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
-	token, user, err := h.authService.Login(c.Request.Context(), request.Email, request.Password)
+	_, user, err := h.authService.Login(c.Request.Context(), request.Email, request.Password)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -291,8 +301,19 @@ func (h *cloudflareUserAPIHandler) Login(c *gin.Context) {
 		})
 		return
 	}
+	pair, err := h.authService.GenerateTokenPair(c.Request.Context(), user, "")
+	if err != nil {
+		response.ErrorFrom(c, service.ErrServiceUnavailable)
+		return
+	}
 	h.authService.RecordSuccessfulLogin(c.Request.Context(), user.ID)
-	response.Success(c, cloudflareAuthResponse{AccessToken: token, TokenType: "Bearer", User: newCloudflareUserDTO(user)})
+	response.Success(c, cloudflareAuthResponse{
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+		TokenType:    "Bearer",
+		User:         newCloudflareUserDTO(user),
+	})
 }
 
 type cloudflareLogin2FARequest struct {
@@ -322,15 +343,64 @@ func (h *cloudflareUserAPIHandler) Login2FA(c *gin.Context) {
 		response.ErrorFrom(c, errCloudflareTOTPLoginExpired)
 		return
 	}
-	token, err := h.authService.GenerateToken(c.Request.Context(), user)
+	pair, err := h.authService.GenerateTokenPair(c.Request.Context(), user, "")
 	if err != nil {
 		response.ErrorFrom(c, errCloudflareTOTPUnavailable)
 		return
 	}
 	h.authService.RecordSuccessfulLogin(c.Request.Context(), user.ID)
 	response.Success(c, cloudflareAuthResponse{
-		AccessToken: token, TokenType: "Bearer", User: newCloudflareUserDTO(user),
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresIn:    pair.ExpiresIn,
+		TokenType:    "Bearer",
+		User:         newCloudflareUserDTO(user),
 	})
+}
+
+func (h *cloudflareUserAPIHandler) RefreshToken(c *gin.Context) {
+	var request cloudflareRefreshTokenRequest
+	if err := decodeCloudflareJSON(c, &request); err != nil || strings.TrimSpace(request.RefreshToken) == "" {
+		response.BadRequest(c, "Invalid request")
+		return
+	}
+	result, err := h.authService.RefreshTokenPair(c.Request.Context(), request.RefreshToken)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, cloudflareAuthResponse{
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		ExpiresIn:    result.ExpiresIn,
+		TokenType:    "Bearer",
+		User:         nil,
+	})
+}
+
+func (h *cloudflareUserAPIHandler) Logout(c *gin.Context) {
+	var request cloudflareLogoutRequest
+	_ = decodeCloudflareJSON(c, &request)
+	if strings.TrimSpace(request.RefreshToken) != "" {
+		_ = h.authService.RevokeRefreshToken(c.Request.Context(), request.RefreshToken)
+	}
+	response.Success(c, struct {
+		Message string `json:"message"`
+	}{Message: "Logged out successfully"})
+}
+
+func (h *cloudflareUserAPIHandler) RevokeAllSessions(c *gin.Context) {
+	subject, ok := authenticatedCloudflareUser(c)
+	if !ok {
+		return
+	}
+	if err := h.authService.RevokeAllUserTokens(c.Request.Context(), subject.UserID); err != nil {
+		response.ErrorFrom(c, service.ErrServiceUnavailable)
+		return
+	}
+	response.Success(c, struct {
+		Message string `json:"message"`
+	}{Message: "All sessions have been revoked. Please log in again."})
 }
 
 func (h *cloudflareUserAPIHandler) CurrentUser(c *gin.Context) {

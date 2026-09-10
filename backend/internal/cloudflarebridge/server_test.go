@@ -24,22 +24,57 @@ import (
 
 type fakeControlPlane struct {
 	disabledTOTPControlPlane
-	mu            sync.Mutex
-	key           *service.APIKey
-	account       *service.Account
-	touchCount    int
-	admitCount    int
-	admitErr      error
-	startCount    int
-	start         *StartRequest
-	startErr      error
-	completion    *CompletionRequest
-	completionErr error
-	release       *ReleaseRequest
-	releaseCount  int
-	renewCount    int
-	renewErr      error
-	leaseExpiry   time.Time
+	mu             sync.Mutex
+	key            *service.APIKey
+	account        *service.Account
+	touchCount     int
+	admitCount     int
+	admitErr       error
+	startCount     int
+	start          *StartRequest
+	startErr       error
+	completion     *CompletionRequest
+	completionErr  error
+	release        *ReleaseRequest
+	releaseCount   int
+	renewCount     int
+	renewErr       error
+	leaseExpiry    time.Time
+	sessions       map[string]*service.RefreshTokenData
+	userSessions   map[int64]map[string]struct{}
+	familySessions map[string]map[string]struct{}
+}
+
+type noAuthSessionControlPlane struct {
+	disabledTOTPControlPlane
+}
+
+func (noAuthSessionControlPlane) ResolveAPIKey(context.Context, string) (*service.APIKey, error) {
+	return nil, service.ErrAPIKeyNotFound
+}
+
+func (noAuthSessionControlPlane) TouchAPIKey(context.Context, int64, time.Time) error {
+	return nil
+}
+
+func (noAuthSessionControlPlane) Admit(context.Context, AdmissionRequest) (*Admission, error) {
+	return nil, ErrControlPlaneUnavailable
+}
+
+func (noAuthSessionControlPlane) Start(context.Context, StartRequest) error {
+	return ErrControlPlaneUnavailable
+}
+
+func (noAuthSessionControlPlane) Renew(context.Context, RenewRequest) (*Lease, error) {
+	return nil, ErrControlPlaneUnavailable
+}
+
+func (noAuthSessionControlPlane) Complete(context.Context, CompletionRequest) error {
+	return ErrControlPlaneUnavailable
+}
+
+func (noAuthSessionControlPlane) Release(context.Context, ReleaseRequest) error {
+	return nil
 }
 
 func (f *fakeControlPlane) ResolveAPIKey(_ context.Context, key string) (*service.APIKey, error) {
@@ -124,6 +159,151 @@ func (f *fakeControlPlane) Release(_ context.Context, request ReleaseRequest) er
 	copy := request
 	f.release = &copy
 	return nil
+}
+
+func (f *fakeControlPlane) StoreRefreshToken(_ context.Context, tokenHash string, data *service.RefreshTokenData, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	f.storeRefreshTokenLocked(tokenHash, data)
+	return nil
+}
+
+func (f *fakeControlPlane) GetRefreshToken(_ context.Context, tokenHash string) (*service.RefreshTokenData, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	data := f.sessions[tokenHash]
+	if data == nil {
+		return nil, service.ErrRefreshTokenNotFound
+	}
+	copy := *data
+	return &copy, nil
+}
+
+func (f *fakeControlPlane) DeleteRefreshToken(_ context.Context, tokenHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	f.deleteRefreshTokenLocked(tokenHash)
+	return nil
+}
+
+func (f *fakeControlPlane) DeleteUserRefreshTokens(_ context.Context, userID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	for tokenHash := range f.userSessions[userID] {
+		f.deleteRefreshTokenLocked(tokenHash)
+	}
+	delete(f.userSessions, userID)
+	return nil
+}
+
+func (f *fakeControlPlane) DeleteTokenFamily(_ context.Context, familyID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	for tokenHash := range f.familySessions[familyID] {
+		f.deleteRefreshTokenLocked(tokenHash)
+	}
+	delete(f.familySessions, familyID)
+	return nil
+}
+
+func (f *fakeControlPlane) AddToUserTokenSet(context.Context, int64, string, time.Duration) error {
+	return nil
+}
+
+func (f *fakeControlPlane) AddToFamilyTokenSet(context.Context, string, string, time.Duration) error {
+	return nil
+}
+
+func (f *fakeControlPlane) GetUserTokenHashes(_ context.Context, userID int64) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	out := make([]string, 0, len(f.userSessions[userID]))
+	for tokenHash := range f.userSessions[userID] {
+		out = append(out, tokenHash)
+	}
+	return out, nil
+}
+
+func (f *fakeControlPlane) GetFamilyTokenHashes(_ context.Context, familyID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	out := make([]string, 0, len(f.familySessions[familyID]))
+	for tokenHash := range f.familySessions[familyID] {
+		out = append(out, tokenHash)
+	}
+	return out, nil
+}
+
+func (f *fakeControlPlane) IsTokenInFamily(_ context.Context, familyID string, tokenHash string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	_, ok := f.familySessions[familyID][tokenHash]
+	return ok, nil
+}
+
+func (f *fakeControlPlane) RotateRefreshToken(_ context.Context, oldHash, newHash string, newData *service.RefreshTokenData, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureAuthSessions()
+	old := f.sessions[oldHash]
+	if old == nil {
+		return service.ErrRefreshTokenReused
+	}
+	if newData == nil || newData.TokenVersion != old.TokenVersion {
+		return service.ErrRefreshTokenReused
+	}
+	f.deleteRefreshTokenLocked(oldHash)
+	f.storeRefreshTokenLocked(newHash, newData)
+	return nil
+}
+
+func (f *fakeControlPlane) ensureAuthSessions() {
+	if f.sessions == nil {
+		f.sessions = map[string]*service.RefreshTokenData{}
+	}
+	if f.userSessions == nil {
+		f.userSessions = map[int64]map[string]struct{}{}
+	}
+	if f.familySessions == nil {
+		f.familySessions = map[string]map[string]struct{}{}
+	}
+}
+
+func (f *fakeControlPlane) storeRefreshTokenLocked(tokenHash string, data *service.RefreshTokenData) {
+	copy := *data
+	f.sessions[tokenHash] = &copy
+	if f.userSessions[copy.UserID] == nil {
+		f.userSessions[copy.UserID] = map[string]struct{}{}
+	}
+	f.userSessions[copy.UserID][tokenHash] = struct{}{}
+	if f.familySessions[copy.FamilyID] == nil {
+		f.familySessions[copy.FamilyID] = map[string]struct{}{}
+	}
+	f.familySessions[copy.FamilyID][tokenHash] = struct{}{}
+}
+
+func (f *fakeControlPlane) deleteRefreshTokenLocked(tokenHash string) {
+	data := f.sessions[tokenHash]
+	if data == nil {
+		return
+	}
+	delete(f.sessions, tokenHash)
+	delete(f.userSessions[data.UserID], tokenHash)
+	if len(f.userSessions[data.UserID]) == 0 {
+		delete(f.userSessions, data.UserID)
+	}
+	delete(f.familySessions[data.FamilyID], tokenHash)
+	if len(f.familySessions[data.FamilyID]) == 0 {
+		delete(f.familySessions, data.FamilyID)
+	}
 }
 
 type fakeHTTPUpstream struct {
@@ -278,6 +458,12 @@ func testControlPlane() *fakeControlPlane {
 			Extra: map[string]any{openai_compat.ExtraKeyResponsesSupported: false},
 		},
 	}
+}
+
+func TestNewHandlerRejectsControlPlaneWithoutAuthSessions(t *testing.T) {
+	handler, err := NewHandler(testRuntimeConfig(t), noAuthSessionControlPlane{}, &fakeHTTPUpstream{})
+	require.Nil(t, handler)
+	require.EqualError(t, err, "cloudflare auth session control plane is required")
 }
 
 func serveGatewayRequest(t *testing.T, handler http.Handler, path, apiKey, body string) *httptest.ResponseRecorder {

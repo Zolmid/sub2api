@@ -72,3 +72,9 @@ type RefreshTokenCache interface {
 	// 用于验证Token家族关系
 	IsTokenInFamily(ctx context.Context, familyID string, tokenHash string) (bool, error)
 }
+
+// RefreshTokenRotator is an optional stronger contract for refresh-token
+// stores that can atomically replace one session hash with another.
+type RefreshTokenRotator interface {
+	RotateRefreshToken(ctx context.Context, oldHash, newHash string, newData *RefreshTokenData, ttl time.Duration) error
+}

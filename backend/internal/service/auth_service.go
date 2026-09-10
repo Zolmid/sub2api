@@ -1702,6 +1702,13 @@ type TokenPairWithUser struct {
 	UserRole string
 }
 
+type preparedRefreshToken struct {
+	RawToken  string
+	TokenHash string
+	Data      *RefreshTokenData
+	TTL       time.Duration
+}
+
 // GenerateTokenPair 生成Access Token和Refresh Token对
 // familyID: 可选的Token家族ID，用于Token轮转时保持家族关系
 func (s *AuthService) GenerateTokenPair(ctx context.Context, user *User, familyID string) (*TokenPair, error) {
@@ -1741,10 +1748,21 @@ func (s *AuthService) GenerateTokenPair(ctx context.Context, user *User, familyI
 
 // generateRefreshToken 生成并存储Refresh Token
 func (s *AuthService) generateRefreshToken(ctx context.Context, user *User, familyID string) (string, error) {
+	prepared, err := s.prepareRefreshToken(ctx, user, familyID)
+	if err != nil {
+		return "", err
+	}
+	if err := s.storePreparedRefreshToken(ctx, prepared); err != nil {
+		return "", err
+	}
+	return prepared.RawToken, nil
+}
+
+func (s *AuthService) prepareRefreshToken(ctx context.Context, user *User, familyID string) (*preparedRefreshToken, error) {
 	// 生成随机Token
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", fmt.Errorf("generate random bytes: %w", err)
+		return nil, fmt.Errorf("generate random bytes: %w", err)
 	}
 	rawToken := refreshTokenPrefix + hex.EncodeToString(tokenBytes)
 
@@ -1755,12 +1773,12 @@ func (s *AuthService) generateRefreshToken(ctx context.Context, user *User, fami
 	if familyID == "" {
 		familyBytes := make([]byte, 16)
 		if _, err := rand.Read(familyBytes); err != nil {
-			return "", fmt.Errorf("generate family id: %w", err)
+			return nil, fmt.Errorf("generate family id: %w", err)
 		}
 		familyID = hex.EncodeToString(familyBytes)
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	ttl := time.Duration(s.cfg.JWT.RefreshTokenExpireDays) * 24 * time.Hour
 
 	data := &RefreshTokenData{
@@ -1772,24 +1790,37 @@ func (s *AuthService) generateRefreshToken(ctx context.Context, user *User, fami
 		ExpiresAt:    now.Add(ttl),
 	}
 
+	return &preparedRefreshToken{
+		RawToken:  rawToken,
+		TokenHash: tokenHash,
+		Data:      data,
+		TTL:       ttl,
+	}, nil
+}
+
+func (s *AuthService) storePreparedRefreshToken(ctx context.Context, prepared *preparedRefreshToken) error {
+	if prepared == nil || prepared.Data == nil {
+		return errors.New("refresh token data not prepared")
+	}
+
 	// 存储Token数据
-	if err := s.refreshTokenCache.StoreRefreshToken(ctx, tokenHash, data, ttl); err != nil {
-		return "", fmt.Errorf("store refresh token: %w", err)
+	if err := s.refreshTokenCache.StoreRefreshToken(ctx, prepared.TokenHash, prepared.Data, prepared.TTL); err != nil {
+		return fmt.Errorf("store refresh token: %w", err)
 	}
 
 	// 添加到用户Token集合
-	if err := s.refreshTokenCache.AddToUserTokenSet(ctx, user.ID, tokenHash, ttl); err != nil {
+	if err := s.refreshTokenCache.AddToUserTokenSet(ctx, prepared.Data.UserID, prepared.TokenHash, prepared.TTL); err != nil {
 		logger.LegacyPrintf("service.auth", "[Auth] Failed to add token to user set: %v", err)
 		// 不影响主流程
 	}
 
 	// 添加到家族Token集合
-	if err := s.refreshTokenCache.AddToFamilyTokenSet(ctx, familyID, tokenHash, ttl); err != nil {
+	if err := s.refreshTokenCache.AddToFamilyTokenSet(ctx, prepared.Data.FamilyID, prepared.TokenHash, prepared.TTL); err != nil {
 		logger.LegacyPrintf("service.auth", "[Auth] Failed to add token to family set: %v", err)
 		// 不影响主流程
 	}
 
-	return rawToken, nil
+	return nil
 }
 
 // RefreshTokenPair 使用Refresh Token刷新Token对
@@ -1813,7 +1844,7 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 		if errors.Is(err, ErrRefreshTokenNotFound) {
 			// Token不存在，可能是已被使用（Token轮转）或已过期
 			logger.LegacyPrintf("service.auth", "[Auth] Refresh token not found, possible reuse attack")
-			return nil, ErrRefreshTokenInvalid
+			return nil, ErrRefreshTokenReused
 		}
 		logger.LegacyPrintf("service.auth", "[Auth] Error getting refresh token: %v", err)
 		return nil, ErrServiceUnavailable
@@ -1860,6 +1891,40 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 			logger.LegacyPrintf("service.auth", "[Auth] Session binding mismatch on refresh for user %d, family revoked", data.UserID)
 			return nil, ErrSessionBindingMismatch
 		}
+	}
+
+	if rotator, ok := s.refreshTokenCache.(RefreshTokenRotator); ok {
+		newRefresh, err := s.prepareRefreshToken(ctx, user, data.FamilyID)
+		if err != nil {
+			return nil, err
+		}
+		accessToken, err := s.generateAccessToken(user, data.FamilyID, sessionBindingHashFromContext(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("generate access token: %w", err)
+		}
+		if err := rotator.RotateRefreshToken(ctx, tokenHash, newRefresh.TokenHash, newRefresh.Data, newRefresh.TTL); err != nil {
+			switch {
+			case errors.Is(err, ErrRefreshTokenNotFound), errors.Is(err, ErrRefreshTokenReused):
+				return nil, ErrRefreshTokenReused
+			case errors.Is(err, ErrRefreshTokenExpired):
+				return nil, ErrRefreshTokenExpired
+			case errors.Is(err, ErrTokenRevoked):
+				return nil, ErrTokenRevoked
+			case errors.Is(err, ErrRefreshTokenInvalid):
+				return nil, ErrRefreshTokenInvalid
+			default:
+				logger.LegacyPrintf("service.auth", "[Auth] Failed to rotate refresh token atomically: %v", err)
+				return nil, ErrServiceUnavailable
+			}
+		}
+		return &TokenPairWithUser{
+			TokenPair: TokenPair{
+				AccessToken:  accessToken,
+				RefreshToken: newRefresh.RawToken,
+				ExpiresIn:    s.GetAccessTokenExpiresIn(),
+			},
+			UserRole: user.Role,
+		}, nil
 	}
 
 	// Token轮转：立即使旧Token失效

@@ -75,6 +75,12 @@ func NewHTTPControlPlane(baseURL string, client *http.Client) (*HTTPControlPlane
 				return http.ErrUseLastResponse
 			},
 		}
+	} else if client.CheckRedirect == nil {
+		copy := *client
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		client = &copy
 	}
 	return &HTTPControlPlane{baseURL: parsed.String(), client: client}, nil
 }

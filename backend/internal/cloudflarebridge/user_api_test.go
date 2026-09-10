@@ -443,11 +443,17 @@ func loginToken(t *testing.T, client http.Handler, email, password string) strin
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	var envelope struct {
 		Data struct {
-			AccessToken string `json:"access_token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			TokenType    string `json:"token_type"`
 		} `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
 	require.NotEmpty(t, envelope.Data.AccessToken)
+	require.NotEmpty(t, envelope.Data.RefreshToken)
+	require.NotZero(t, envelope.Data.ExpiresIn)
+	require.Equal(t, "Bearer", envelope.Data.TokenType)
 	return envelope.Data.AccessToken
 }
 
@@ -463,8 +469,11 @@ func TestCloudflareUserAPIEndToEndLoginJWTAndOwnerIsolation(t *testing.T) {
 	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
 	var loginEnvelope struct {
 		Data struct {
-			AccessToken string `json:"access_token"`
-			User        struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			TokenType    string `json:"token_type"`
+			User         struct {
 				ID            string   `json:"id"`
 				Balance       float64  `json:"balance"`
 				AllowedGroups []string `json:"allowed_groups"`
@@ -477,6 +486,9 @@ func TestCloudflareUserAPIEndToEndLoginJWTAndOwnerIsolation(t *testing.T) {
 	require.Equal(t, []string{"9007199254741097"}, loginEnvelope.Data.User.AllowedGroups)
 	token := loginEnvelope.Data.AccessToken
 	require.NotEmpty(t, token)
+	require.NotEmpty(t, loginEnvelope.Data.RefreshToken)
+	require.NotZero(t, loginEnvelope.Data.ExpiresIn)
+	require.Equal(t, "Bearer", loginEnvelope.Data.TokenType)
 
 	list := callJSON(t, handler, http.MethodGet, "/api/v1/keys", token, "")
 	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
@@ -568,6 +580,75 @@ func TestCloudflareUserAPIEndToEndLoginJWTAndOwnerIsolation(t *testing.T) {
 	require.Equal(t, http.StatusOK, deleted.Code, deleted.Body.String())
 	afterDelete := callJSON(t, handler, http.MethodGet, createdPath, token, "")
 	require.Equal(t, http.StatusNotFound, afterDelete.Code, afterDelete.Body.String())
+}
+
+func TestCloudflareUserAPIRefreshLogoutAndRevokeAllSessions(t *testing.T) {
+	control, password, _, _ := newUserAPIControlPlane(t)
+	handler, err := NewHandler(testRuntimeConfig(t), control, &fakeHTTPUpstream{})
+	require.NoError(t, err)
+
+	login := callJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "",
+		`{"email":"user@example.test","password":"`+password+`"}`)
+	require.Equal(t, http.StatusOK, login.Code, login.Body.String())
+	var loginEnvelope struct {
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(login.Body.Bytes(), &loginEnvelope))
+	require.NotEmpty(t, loginEnvelope.Data.AccessToken)
+	require.NotEmpty(t, loginEnvelope.Data.RefreshToken)
+
+	refresh := callJSON(t, handler, http.MethodPost, "/api/v1/auth/refresh", "",
+		`{"refresh_token":"`+loginEnvelope.Data.RefreshToken+`"}`)
+	require.Equal(t, http.StatusOK, refresh.Code, refresh.Body.String())
+	var refreshEnvelope struct {
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+			TokenType    string `json:"token_type"`
+			User         any    `json:"user"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(refresh.Body.Bytes(), &refreshEnvelope))
+	require.NotEmpty(t, refreshEnvelope.Data.AccessToken)
+	require.NotEmpty(t, refreshEnvelope.Data.RefreshToken)
+	require.NotEqual(t, loginEnvelope.Data.RefreshToken, refreshEnvelope.Data.RefreshToken)
+	require.NotZero(t, refreshEnvelope.Data.ExpiresIn)
+	require.Equal(t, "Bearer", refreshEnvelope.Data.TokenType)
+	require.Nil(t, refreshEnvelope.Data.User)
+
+	reused := callJSON(t, handler, http.MethodPost, "/api/v1/auth/refresh", "",
+		`{"refresh_token":"`+loginEnvelope.Data.RefreshToken+`"}`)
+	require.Equal(t, http.StatusUnauthorized, reused.Code, reused.Body.String())
+	require.Contains(t, reused.Body.String(), "REFRESH_TOKEN_REUSED")
+
+	logout := callJSON(t, handler, http.MethodPost, "/api/v1/auth/logout", "",
+		`{"refresh_token":"`+refreshEnvelope.Data.RefreshToken+`"}`)
+	require.Equal(t, http.StatusOK, logout.Code, logout.Body.String())
+	logoutAgain := callJSON(t, handler, http.MethodPost, "/api/v1/auth/logout", "", `{}`)
+	require.Equal(t, http.StatusOK, logoutAgain.Code, logoutAgain.Body.String())
+	afterLogout := callJSON(t, handler, http.MethodPost, "/api/v1/auth/refresh", "",
+		`{"refresh_token":"`+refreshEnvelope.Data.RefreshToken+`"}`)
+	require.Equal(t, http.StatusUnauthorized, afterLogout.Code, afterLogout.Body.String())
+
+	secondLogin := callJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "",
+		`{"email":"user@example.test","password":"`+password+`"}`)
+	require.Equal(t, http.StatusOK, secondLogin.Code, secondLogin.Body.String())
+	var secondEnvelope struct {
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(secondLogin.Body.Bytes(), &secondEnvelope))
+	revokeAll := callJSON(t, handler, http.MethodPost, "/api/v1/auth/revoke-all-sessions", secondEnvelope.Data.AccessToken, `{}`)
+	require.Equal(t, http.StatusOK, revokeAll.Code, revokeAll.Body.String())
+	afterRevoke := callJSON(t, handler, http.MethodPost, "/api/v1/auth/refresh", "",
+		`{"refresh_token":"`+secondEnvelope.Data.RefreshToken+`"}`)
+	require.Equal(t, http.StatusUnauthorized, afterRevoke.Code, afterRevoke.Body.String())
 }
 
 func TestCloudflareUserAPIFailsClosedForBadPasswordDisabledDeletedAndTokenChange(t *testing.T) {

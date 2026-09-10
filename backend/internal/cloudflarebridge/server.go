@@ -118,10 +118,14 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	if !ok {
 		return nil, errors.New("cloudflare totp control plane is required")
 	}
+	authSessionCache, ok := control.(service.RefreshTokenCache)
+	if !ok {
+		return nil, errors.New("cloudflare auth session control plane is required")
+	}
 	groupReader := NewManagedGroupReader(control)
 	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
-	userAuthService := service.NewAuthService(nil, authUserRepo, nil, nil, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
+	userAuthService := service.NewAuthService(nil, authUserRepo, nil, authSessionCache, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
 	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService, totpControl)
 	totpAPIHandler, err := newCloudflareTOTPHandler(control, authUserRepo)
 	if err != nil {
@@ -151,6 +155,8 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	v1.GET("/settings/public", userAPIHandler.PublicSettings)
 	v1.POST("/auth/login", userAPIHandler.Login)
 	v1.POST("/auth/login/2fa", userAPIHandler.Login2FA)
+	v1.POST("/auth/refresh", userAPIHandler.RefreshToken)
+	v1.POST("/auth/logout", userAPIHandler.Logout)
 	authenticated := v1.Group("")
 	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
 	keys := authenticated.Group("/keys")
@@ -161,6 +167,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	keys.DELETE("/:id", userAPIHandler.DeleteAPIKey)
 	authenticated.GET("/groups/available", userAPIHandler.GetAvailableGroups)
 	authenticated.GET("/auth/me", userAPIHandler.CurrentUser)
+	authenticated.POST("/auth/revoke-all-sessions", userAPIHandler.RevokeAllSessions)
 	totp := authenticated.Group("/user/totp")
 	totp.GET("/status", totpAPIHandler.GetStatus)
 	totp.GET("/verification-method", totpAPIHandler.GetVerificationMethod)

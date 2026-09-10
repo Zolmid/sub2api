@@ -2049,7 +2049,7 @@ func exportPostgreSQLRestoreSnapshotWith(ctx context.Context, database *sql.DB, 
 	if err != nil {
 		return err
 	}
-	if err := validateRestorePostgreSQLColumns(inventory, columns); err != nil {
+	if err := validateRestorePostgreSQLColumns(inventory, columns, mappingProfileVersion); err != nil {
 		return err
 	}
 	allTables := map[string]bool{}
@@ -2103,7 +2103,7 @@ func exportPostgreSQLRestoreSnapshotWith(ctx context.Context, database *sql.DB, 
 	return nil
 }
 
-func validateRestorePostgreSQLColumns(inventory map[string]bool, columns map[string][]string) error {
+func validateRestorePostgreSQLColumns(inventory map[string]bool, columns map[string][]string, mappingProfileVersion string) error {
 	for _, spec := range RestoreCoverageMatrix() {
 		if spec.Classification != Transformed || !inventory[spec.SourceTable] {
 			continue
@@ -2116,7 +2116,7 @@ func validateRestorePostgreSQLColumns(inventory map[string]bool, columns map[str
 		sort.Strings(expected)
 		sort.Strings(actual)
 		if !equalStrings(expected, actual) {
-			return fmt.Errorf("restore source table %q columns differ from %s", spec.SourceTable, RestoreMappingProfileVersion)
+			return fmt.Errorf("restore source table %q columns differ from %s", spec.SourceTable, mappingProfileVersion)
 		}
 	}
 	return nil

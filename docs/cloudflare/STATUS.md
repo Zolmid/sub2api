@@ -1,39 +1,46 @@
 # Cloudflare migration status
 
-Updated: 2026-09-10. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
+Updated: 2026-09-11. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
 
-## 2026-09-10 verified integration checkpoint
+## 2026-09-11 accepted implementation checkpoint
 
-- Fork branch `codex/cloudflare-native` at `62bb448e4` has one tree-equivalent
-  integration of the previously local migration work. GitHub Actions runs
+- HEAD is `d5a8c6ee0` on `codex/cloudflare-native`. The previous remote fork
+  checkpoint `62bb448e4` has verified successful GitHub Actions runs
   `34480545960` (CI), `34480545943` (Cloudflare native CI), and `34480545820`
-  (Security Scan) all completed successfully. This is repository CI evidence,
-  not a Cloudflare deployment or real-upstream acceptance result.
-- The credential-free Cloudflare aggregate now exercises the Worker type
-  contract, TypeScript, workerd, fresh and repeated D1 migrations, the focused
-  Go bridge race/vet gates, and the traditional cancellation regression. An
-  independent clean-tree run passed 24 Worker test files / 377 tests. Backend
-  unit and integration tags, full golangci-lint v2.13, and the Node 20 / pnpm 9
-  frontend lint, typecheck, and 13-file / 168-test critical suite also passed.
-- Request admission now uses durable user/key rate-limit state, multi-account
-  scheduler policy, recoverable account leases, exact E8 reservation and
-  settlement, durable usage outbox publication, and post-commit scheduler
-  cleanup recovery. The Go gateway routes the existing `/v1/chat/completions`,
-  `/v1/responses`, and `/v1/messages` paths through that common lifecycle.
-  Unknown usage remains explicit and a committed billing outcome is not
-  converted into a retryable gateway failure merely because lease cleanup
-  needs scheduled recovery.
-- Canonical offline migration and restore validation covers migrations 0001
-  through 0017, including subscription, OAuth-refresh, auth-cache, encrypted
-  settings, payment, and email schema/runtime foundations. Those foundations
-  are not automatically complete features: subscription management/admission,
-  provider OAuth calls, cache/settings entrypoint integration, payment webhook
-  verification, email-provider delivery, and concrete background-job executor
-  wiring remain open until their public/private routes and failure tests pass.
+  (Security Scan). At `d5a8c6ee0`, CI and Cloudflare native CI are in progress;
+  Security Scan run `34499465854` is successful. The in-progress runs are not
+  reported as passed.
+- Parent-local evidence is layered, not one combined `d5a8c6ee0` acceptance
+  run: at `4e23bd99a`, Worker tests passed with 28 files / 413 tests,
+  TypeScript and Wrangler generated-type checks passed, and the production
+  configuration dry-run rebuilt the frontend, Go Container, and Worker without
+  deployment. The service integration passed
+  `go test -race -tags=unit ./internal/service -count=1` (239.396s), the
+  untagged service suite passed (122.112s), and service vet passed. An isolated
+  pre-cherry-pick email layer at `f8b70bd8c` reports 29 files / 417 Worker
+  tests plus TypeScript and generated-type checks; it is not combined
+  `d5a8c6ee0` evidence.
+- Committed foundations now include canonical migration `0018_auth_sessions.sql`
+  and offline restore profile selection/reporting through `0001-0018`; Go +
+  Worker auth-session storage, rotation, and consumed-token reuse detection;
+  the admission retry-at-capacity race fix; multi-account scheduler
+  policy/runtime; account, user, and API-key rate limits with lease cleanup;
+  exact versioned pricing, reservation, settlement, and outbox-conflict
+  handling; and a registered, bounded background-job executor spine.
+- The Worker has complete private subscription control routes and runtime
+  tests, but no Go/public/admission wiring. It also has an encrypted settings
+  private adapter, with a Go `SettingRepository` bridge, bounded to at most 16
+  mutations; broad admin `UpdateSettings` composition is not implemented.
+  Payment has a private state-machine adapter without provider, webhook, or
+  public Go wiring. Email has a private D1 adapter with independent token and
+  delivery keyrings, without provider sending or a producer.
+- `/internal/cloudflare` and `/v1/private` are reserved from public ingress,
+  including encoded/normalized variants, and the service test harness cleanup
+  removes race-prone shared state across the committed service test suite.
 - No Cloudflare account resource, DNS record, paid Container, Queue, real
-  provider credential, production ledger, or R2 bucket was created or changed.
-  Remote deployment, real-upstream calls, and any object-storage addition stay
-  behind their explicit authorization boundary.
+  provider credential, production ledger, R2 bucket, remote deployment, or
+  real provider/email/payment/OAuth call was performed. Staging and production
+  remain outside this checkpoint.
 
 ## Completed and locally evidenced
 
@@ -230,14 +237,17 @@ fail closed.
 
 ## Explicitly not complete
 
-This branch is not yet a full Sub2API Cloudflare migration. Account writes
-outside the bounded OpenAI API-key CRUD contract, default subscriptions/default
-balance, complete repositories, subscriptions,
-pricing, usage reservation and authoritative request settlement, multi-account
-scheduling policy, OAuth refresh/rotation, rate limits/cooldowns beyond the
-first lease path, batch/images/files, imports/exports, backup/restore,
-reconciliation operations, performance/resource measurements, and production
-runbooks remain open matrix items. No undeclared fallback supplies them.
+This branch is not yet a full Sub2API Cloudflare migration. The committed
+foundations above are not broad public integrations. Open dependencies are the
+auth-settings composition correction pending outside this checkpoint;
+OAuth-provider wiring; subscription Go/public/admission wiring; payment
+provider/webhook/public wiring; email provider and producer wiring; broader
+protocol routes (models, embeddings, images, batch, Gemini, and WebSocket);
+the object-storage decision; complete management/repository/background
+producers; composed fault/performance validation; and remote, staging, and
+production acceptance. Default subscription/balance behavior, imports/exports,
+backup/restore, and reconciliation remain open where not covered by a bounded
+contract. No undeclared fallback supplies them.
 
 Before applying migration `0004_user_live_email_identity.sql` to any existing
 D1 database, operators must identify and resolve duplicate live emails after
@@ -261,25 +271,23 @@ product such as R2; they have not been silently removed or stored in D1/KV.
 
 ## Next executable acceptance sequence
 
-1. Retain a dedicated concurrency probe for a group-reference change racing a
-   user mutation, and drive the remaining embedded-console flows—especially
-   ambiguous admin-user create retry—in a real browser. The bounded account
-   CRUD and API-key rebind browser flows plus the composed API lifecycle now
-   pass separately.
-2. Treat the existing user-owned API-key lifecycle plus the administrator
-   owner-list/group-rebind contract as the complete current API-key management
-   surface; do not invent administrator CRUD routes absent from the upstream
-   public contract. Keep OAuth/import/test/refresh/batch/export account
-   operations fail-closed until separately designed and tested.
-3. Extend the now-verified manual balance ledger into exact request
-   reservation/settlement. Versioned pricing, reservation caps, default
-   subscription, and default-balance behavior must be explicit before gateway
-   billing is enabled.
-4. Expand account selection and policy state only after those durable CRUD
-   contracts are stable. OAuth, payment, and background-job work remain stage D
-   gates, not implied by CRUD success.
-5. Keep remote Cloudflare and real-upstream verification behind their separate
-   authorization and disposable-resource requirements.
+1. Resolve the pending auth-settings composition correction outside this
+   checkpoint; do not describe it as committed or accepted here.
+2. Add OAuth provider wiring; subscription Go/public/admission wiring; payment
+   provider, webhook, and public wiring; and email provider plus producer
+   wiring, each with focused failure and retry evidence.
+3. Decide whether durable object storage is required, then design the missing
+   management/repository/background producers and any approved storage adapter.
+4. Add the broader protocol routes—models, embeddings, images, batch, Gemini,
+   and WebSocket—with route-specific streaming, size, and failure checks.
+5. Run composed fault/performance validation over the integrated paths, then
+   obtain separately authorized remote, staging, and production evidence.
+
+The bounded account CRUD, API-key rebind, balance, auth/TOTP, scheduler,
+pricing/reservation, and private-adapter tests remain layer-specific evidence;
+none is a substitute for the sequence above.
+
+## Historical checkpoints (superseded by the accepted checkpoint above)
 
 # 2026-09-07 — D1 administrator balance-adjustment ledger (local verification)
 

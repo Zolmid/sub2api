@@ -1,7 +1,8 @@
 # Cloudflare-native architecture
 
-Status: staged migration, with the first gateway and bounded management/TOTP
-vertical slices locally verified. This document does not claim full
+Status: staged migration, with the first gateway, scheduler/billing
+foundations, private control planes, and bounded management/TOTP vertical
+slices locally verified. This document does not claim full
 compatibility; see
 `COMPATIBILITY.md` and `STATUS.md` for the remaining baseline surface.
 
@@ -72,7 +73,9 @@ canceled. Traditional requests retain their previous detached-context behavior.
 | State | Authority | Why |
 | --- | --- | --- |
 | Users, API-key hashes, groups, accounts, request admissions | D1 | Durable relational facts and queryable recovery state |
-| Completion events, outbox, usage records and future ledger entries | D1 | Durable idempotency and reconciliation; monetary values use fixed-point integers or exact decimal text, never `REAL` |
+| Scheduler policy/runtime observations and account state | D1 for durable observations; `AccountLeaseDO` plus user/API-key rate-limit DOs for serialized leases and fixed-window admissions | Freshness/evidence and policy inputs remain queryable in D1; counters, expiry, fencing, and compensation remain in the named business DOs |
+| Pricing snapshots, billing reservations, settlements, and monetary ledger events | D1 records plus `BillingPrincipalDO` keyed by user ID | Versioned pricing, exact E8 values, reservation state, settlement/recovery, and balance/ledger mutations share the per-user coordinator; unknown usage remains explicit |
+| Completion events, outbox, usage records and future projection entries | D1 | Durable idempotency and reconciliation; monetary values use fixed-point integers or exact decimal text, never `REAL` |
 | Per-account active leases, concurrency, cooldown, refresh version | `AccountLeaseDO`, keyed only by account ID | One serialization authority even when the account belongs to multiple groups |
 | TOTP challenges, attempt lockout, and step-up grants | `TOTPSecurityDO`, keyed only by user ID | One serialization authority per user; only token/session hashes and bounded expiries persist in DO SQLite |
 | Administrator role-change audit | D1 `admin_role_change_audit` | Minimal durable actor/target/old/new-role facts; update/delete triggers make records append-only |

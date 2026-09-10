@@ -39,10 +39,37 @@ This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.
 
-Verified date: 2026-09-10. Commands below are run from a clean checkout unless
+Verified date: 2026-09-11. Commands below are run from a clean checkout unless
 the row explicitly describes an older composed-runtime checkpoint.
 
-## 2026-09-10 clean integration and GitHub Actions
+## 2026-09-11 accepted implementation checkpoint
+
+The accepted checkout is `d5a8c6ee0` on `codex/cloudflare-native`. Evidence is
+kept by layer and commit; there is no single combined `d5a8c6ee0` acceptance
+run.
+
+| Layer | Evidence | Result and boundary |
+| --- | --- | --- |
+| Previous remote fork checkpoint | `62bb448e4`: GitHub Actions `34480545960` (CI), `34480545943` (Cloudflare native CI), and `34480545820` (Security Scan) | Verified successful runs. This is repository evidence, not Cloudflare deployment or real-upstream acceptance. |
+| New remote checkpoint | `d5a8c6ee0`: GitHub Actions CI and Cloudflare native CI; Security Scan `34499465854` | Security Scan successful; CI and Cloudflare native CI are in progress and are not counted as passed. |
+| Worker and Wrangler layer | `4e23bd99a`: 28 Worker test files / 413 tests, TypeScript check, Wrangler generated-type check, and production-config dry-run rebuilding frontend, Go Container, and Worker | Locally verified layer evidence; the dry-run did not deploy. |
+| Service layer | Parent-local service-race integration: `go test -race -tags=unit ./internal/service -count=1` (239.396s); untagged service suite (122.112s); service vet | Passed at the stated service-race integration. This is separate from Worker and remote workflow evidence. |
+| Isolated email layer | Pre-cherry-pick `f8b70bd8c`: 29 Worker test files / 417 tests, TypeScript check, and Wrangler generated-type check | Separately reported layer evidence; not a combined `d5a8c6ee0` result. |
+
+The committed implementation covered by these layers includes migration
+`0018_auth_sessions.sql` and offline restore profile selection, Go + Worker
+auth-session rotation/reuse detection, the admission retry race correction,
+multi-account scheduler policy/runtime, user/key rate limits and lease
+cleanup, exact pricing/reservation/settlement with outbox conflict evidence,
+and the registered bounded background-job executor spine. Worker-only private
+subscription, settings, payment, and email adapters are tested separately;
+their missing public/producer/provider wiring remains open.
+
+No Cloudflare resource, DNS, paid Container, Queue, R2, production secret,
+real provider credential, real email/payment/OAuth call, production ledger, or
+remote deployment was performed.
+
+## Historical 2026-09-10 clean integration and GitHub Actions checkpoint
 
 The tree published as fork commit `62bb448e4` passed all three push workflows:
 
@@ -69,7 +96,7 @@ tree. They do not turn foundation-only modules into wired features and do not
 constitute remote Cloudflare, paid-resource, production, browser, or real-
 provider acceptance.
 
-## Current stage C management increments
+## Historical stage C management increments before `d5a8c6ee0`
 
 ### Account CRUD implementation check
 

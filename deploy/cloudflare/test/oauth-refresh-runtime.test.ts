@@ -122,7 +122,7 @@ describe("OAuth refresh actual 0013 migration", () => {
         "oauth_credentials_invalidated", "published", NOW, null).run()).rejects.toThrow();
   });
 
-  it("has deterministic lease-core account/fence/completion bounds", () => {
+  it("has deterministic lease-core account/fence/completion bounds", async () => {
     const first = transitionOAuthRefreshLease(emptyLease(), {
       kind: "acquire", input: { accountId: "1", credentialVersion: 4, operationId: "oauth-test-a",
         owner: "owner-a", nowMs: NOW, leaseMs: 1_000 },
@@ -146,6 +146,17 @@ describe("OAuth refresh actual 0013 migration", () => {
       kind: "acquire", input: { accountId: "1", credentialVersion: 4, operationId: "oauth-test-overflow",
         owner: "owner-a", nowMs: NOW, leaseMs: 1_000 },
     })).toThrow("COUNTER_OVERFLOW");
+
+    const takeover = transitionOAuthRefreshLease(first.state, {
+      kind: "acquire", input: { accountId: "1", credentialVersion: 4, operationId: "oauth-test-takeover",
+        owner: "owner-b", nowMs: NOW + 1_000, leaseMs: 1_000 },
+    });
+    expect(takeover.result).toMatchObject({
+      kind: "acquired", takeover: true,
+      predecessor: { accountId: "1", credentialVersion: 4, operationId: "oauth-test-a", owner: "owner-a", fence: 1 },
+    });
+    await expect(fingerprintCredentialEnvelope("你".repeat(30_000)))
+      .rejects.toThrow("INVALID_CREDENTIAL_ENVELOPE");
   });
 
   it("requires one live attempt, terminalizes takeover, and has stable terminal replays", async () => {

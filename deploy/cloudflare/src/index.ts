@@ -33,6 +33,8 @@ import {
   createGatewayJobExecutors,
 } from "./job-executors";
 import { emailControlPlane } from "./email-control";
+import { oauthRefreshControlPlane } from "./oauth-refresh-control";
+import { OAuthRefreshAuthorityDO } from "./oauth-refresh-runtime";
 
 const USAGE_QUEUE_NAMES = new Set([
   "sub2api-usage",
@@ -45,6 +47,7 @@ export {
   APIKeyRateLimitDO,
   AuthLoginAdmissionDO,
   BillingPrincipalDO,
+  OAuthRefreshAuthorityDO,
   TOTPSecurityDO,
   UserRateLimitDO,
   ContainerProxy,
@@ -418,7 +421,8 @@ export async function routePrivateControlPlane(
   // Email delivery remains a D1-authoritative private protocol. Handle its
   // narrow namespace before the legacy control-plane switch, without adding
   // any public Worker route or provider/network side effect.
-  return (await emailControlPlane(request, env)) ?? controlPlane(request, env);
+  return (await oauthRefreshControlPlane(request, env)) ??
+    (await emailControlPlane(request, env)) ?? controlPlane(request, env);
 }
 
 // Requests have already passed the SDK allow-host gate. Returning fetch

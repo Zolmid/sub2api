@@ -24,7 +24,8 @@
       { "name": "API_KEY_RATE_LIMIT", "class_name": "APIKeyRateLimitDO" },
       { "name": "BILLING_PRINCIPAL", "class_name": "BillingPrincipalDO" },
       { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" },
-      { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" }
+      { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" },
+      { "name": "OAUTH_REFRESH_AUTHORITY", "class_name": "OAuthRefreshAuthorityDO" }
     ]
   },
   "migrations": [
@@ -32,7 +33,8 @@
     { "tag": "v2-auth-login-admission", "new_sqlite_classes": ["AuthLoginAdmissionDO"] },
     { "tag": "v3-totp-security", "new_sqlite_classes": ["TOTPSecurityDO"] },
     { "tag": "v4-billing-principal", "new_sqlite_classes": ["BillingPrincipalDO"] },
-    { "tag": "v5-scheduler-rate-limits", "new_sqlite_classes": ["UserRateLimitDO", "APIKeyRateLimitDO"] }
+    { "tag": "v5-scheduler-rate-limits", "new_sqlite_classes": ["UserRateLimitDO", "APIKeyRateLimitDO"] },
+    { "tag": "v6-oauth-refresh-authority", "new_sqlite_classes": ["OAuthRefreshAuthorityDO"] }
   ],
   "d1_databases": [{ "binding": "DB", "database_name": "sub2api-cloudflare", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }],
   "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],

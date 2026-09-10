@@ -28,7 +28,8 @@
       { "name": "API_KEY_RATE_LIMIT", "class_name": "APIKeyRateLimitDO" },
       { "name": "BILLING_PRINCIPAL", "class_name": "BillingPrincipalDO" },
       { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" },
-      { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" }
+      { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" },
+      { "name": "OAUTH_REFRESH_AUTHORITY", "class_name": "OAuthRefreshAuthorityDO" }
     ]
   },
   "migrations": [
@@ -51,6 +52,10 @@
     {
       "tag": "v5-scheduler-rate-limits",
       "new_sqlite_classes": ["UserRateLimitDO", "APIKeyRateLimitDO"]
+    },
+    {
+      "tag": "v6-oauth-refresh-authority",
+      "new_sqlite_classes": ["OAuthRefreshAuthorityDO"]
     }
   ],
   "d1_databases": [

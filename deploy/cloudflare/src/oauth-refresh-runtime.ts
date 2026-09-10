@@ -57,9 +57,26 @@ export type RefreshLeaseRequest = Readonly<{
   leaseMs: number;
 }>;
 
+export type RefreshLeasePredecessor = Readonly<{
+  accountId: string;
+  credentialVersion: number;
+  operationId: string;
+  owner: string;
+  fence: number;
+  leaseExpiresAtMs: number;
+}>;
+
 export type RefreshLease =
-  | Readonly<{ kind: "acquired"; fence: number; leaseExpiresAtMs: number; takeover: boolean }>
+  | Readonly<{
+    kind: "acquired";
+    fence: number;
+    leaseExpiresAtMs: number;
+    takeover: boolean;
+    /** Present only for an atomically-observed expired predecessor. */
+    predecessor?: RefreshLeasePredecessor;
+  }>
   | Readonly<{ kind: "busy"; retryAfterMs: number }>
+  | Readonly<{ kind: "account_mismatch" }>
   | Readonly<{ kind: "already_refreshed" }>;
 
 export type RefreshFinish = Readonly<{
@@ -175,7 +192,8 @@ function assertBegin(input: RefreshBeginInput): void {
 }
 
 function assertEnvelope(value: string, field: string): void {
-  if (value.length < 1 || value.length > 65_536) throw new Error(`INVALID_${field}`);
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes < 1 || bytes > 65_536) throw new Error(`INVALID_${field}`);
 }
 
 async function digest(value: string): Promise<string> {
@@ -628,7 +646,20 @@ export function transitionOAuthRefreshLease(
       credentialVersion: input.credentialVersion, fence, acquiredAtMs: input.nowMs,
       leaseExpiresAtMs: expires, lastCompletedCredentialVersion: prior.lastCompletedCredentialVersion,
     };
-    return { state, result: { kind: "acquired", fence, leaseExpiresAtMs: expires, takeover: active } };
+    const predecessor = active
+      ? {
+        accountId: prior.accountId!, credentialVersion: prior.credentialVersion!,
+        operationId: prior.operationId!, owner: prior.owner!, fence: prior.fence,
+        leaseExpiresAtMs: prior.leaseExpiresAtMs!,
+      }
+      : undefined;
+    return {
+      state,
+      result: {
+        kind: "acquired", fence, leaseExpiresAtMs: expires, takeover: active,
+        ...(predecessor ? { predecessor } : {}),
+      },
+    };
   }
   const input = action.input;
   assertAccountId(input.accountId);
@@ -699,12 +730,20 @@ export class OAuthRefreshAuthorityDO extends DurableObject<Env> {
   }
 
   async acquire(input: RefreshLeaseRequest): Promise<RefreshLease> {
-    return this.ctx.storage.transactionSync(() => {
-      const prior = this.state();
-      const transition = transitionOAuthRefreshLease(prior, { kind: "acquire", input });
-      if (transition.state !== prior) this.save(transition.state);
-      return transition.result as RefreshLease;
-    });
+    try {
+      return this.ctx.storage.transactionSync(() => {
+        const prior = this.state();
+        const transition = transitionOAuthRefreshLease(prior, { kind: "acquire", input });
+        if (transition.state !== prior) this.save(transition.state);
+        return transition.result as RefreshLease;
+      });
+    } catch (cause) {
+      // RPC callers need a deterministic rejection without a raw exception.
+      if (cause instanceof Error && cause.message === "DO_ACCOUNT_MISMATCH") {
+        return { kind: "account_mismatch" };
+      }
+      throw cause;
+    }
   }
 
   async finish(input: RefreshFinish): Promise<"finished" | "stale"> {

@@ -19,7 +19,7 @@ CREATE TABLE auth_sessions (
   token_version TEXT NOT NULL CHECK(
     length(token_version) BETWEEN 1 AND 19
     AND token_version NOT GLOB '*[^0-9]*'
-    AND substr(token_version, 1, 1) BETWEEN '1' AND '9'
+    AND (token_version = '0' OR substr(token_version, 1, 1) BETWEEN '1' AND '9')
     AND (length(token_version) < 19 OR token_version <= '9223372036854775807')
   ),
   family_id TEXT NOT NULL CHECK(
@@ -28,18 +28,22 @@ CREATE TABLE auth_sessions (
     AND family_id NOT GLOB '*[^A-Za-z0-9._:-]*'
   ),
   binding_hash TEXT NOT NULL CHECK(
-    length(binding_hash) = 64
-    AND binding_hash NOT GLOB '*[^0-9a-f]*'
+    binding_hash = '' OR (
+      length(binding_hash) = 32
+      AND binding_hash NOT GLOB '*[^0-9a-f]*'
+    )
   ),
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'consumed', 'revoked', 'expired')),
   created_at TEXT NOT NULL CHECK(
     length(created_at) = 24
     AND created_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
   ),
   expires_at TEXT NOT NULL CHECK(
     length(expires_at) = 24
     AND expires_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(expires_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', expires_at) = expires_at
     AND expires_at > created_at
   ),
@@ -47,6 +51,7 @@ CREATE TABLE auth_sessions (
     consumed_at IS NULL OR (
       length(consumed_at) = 24
       AND consumed_at GLOB '????-??-??T??:??:??.???Z'
+      AND substr(consumed_at, 12, 2) BETWEEN '00' AND '23'
       AND strftime('%Y-%m-%dT%H:%M:%fZ', consumed_at) = consumed_at
     )
   ),
@@ -61,6 +66,7 @@ CREATE TABLE auth_sessions (
     revoked_at IS NULL OR (
       length(revoked_at) = 24
       AND revoked_at GLOB '????-??-??T??:??:??.???Z'
+      AND substr(revoked_at, 12, 2) BETWEEN '00' AND '23'
       AND strftime('%Y-%m-%dT%H:%M:%fZ', revoked_at) = revoked_at
     )
   ),
@@ -70,6 +76,7 @@ CREATE TABLE auth_sessions (
   updated_at TEXT NOT NULL CHECK(
     length(updated_at) = 24
     AND updated_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(updated_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) = updated_at
   ),
   CHECK(
@@ -97,6 +104,7 @@ CREATE TABLE auth_session_family_revocations (
   revoked_at TEXT NOT NULL CHECK(
     length(revoked_at) = 24
     AND revoked_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(revoked_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', revoked_at) = revoked_at
   ),
   detail_hash TEXT NOT NULL CHECK(
@@ -142,6 +150,7 @@ CREATE TABLE auth_session_audit_events (
   created_at TEXT NOT NULL CHECK(
     length(created_at) = 24
     AND created_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
   )
 );
@@ -164,6 +173,7 @@ CREATE TABLE auth_session_rotation_witnesses (
   created_at TEXT NOT NULL CHECK(
     length(created_at) = 24
     AND created_at GLOB '????-??-??T??:??:??.???Z'
+    AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
     AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
   )
 );
@@ -184,11 +194,7 @@ BEGIN
         AND old_session.user_id = new_session.user_id
         AND old_session.family_id = new_session.family_id
         AND old_session.binding_hash = new_session.binding_hash
-        AND (
-          length(new_session.token_version) > length(old_session.token_version)
-          OR (length(new_session.token_version) = length(old_session.token_version)
-            AND new_session.token_version > old_session.token_version)
-        )
+        AND new_session.token_version = old_session.token_version
         AND NOT EXISTS(
           SELECT 1 FROM auth_session_family_revocations revoked
           WHERE revoked.family_id = old_session.family_id

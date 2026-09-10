@@ -9,6 +9,7 @@ import {
 
 const MAX_I64_TEXT = "9223372036854775807";
 const HASH_RE = /^[0-9a-f]{64}$/;
+const BINDING_HASH_RE = /^[0-9a-f]{32}$/;
 const FAMILY_RE = /^[A-Za-z0-9._:-]+$/;
 const UTC_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/;
 const ROUTE_PREFIX = "/v1/auth-sessions/";
@@ -69,8 +70,13 @@ function isCanonicalPositiveDecimal(value: unknown): value is string {
     (value.length === MAX_I64_TEXT.length && value <= MAX_I64_TEXT);
 }
 
-function decimalGreaterThan(left: string, right: string): boolean {
-  return left.length > right.length || (left.length === right.length && left > right);
+function isCanonicalNonNegativeDecimal(value: unknown): value is string {
+  if (value === "0") return true;
+  return isCanonicalPositiveDecimal(value);
+}
+
+function isBindingHash(value: unknown): value is string {
+  return value === "" || (typeof value === "string" && BINDING_HASH_RE.test(value));
 }
 
 function isFamilyID(value: unknown): value is string {
@@ -123,9 +129,9 @@ function readSession(value: Record<string, unknown>): Session | null {
     !SESSION_FIELDS.every((field) => Object.hasOwn(value, field)) ||
     !isHash(value.token_hash) ||
     !isCanonicalPositiveDecimal(value.user_id) ||
-    !isCanonicalPositiveDecimal(value.token_version) ||
+    !isCanonicalNonNegativeDecimal(value.token_version) ||
     !isFamilyID(value.family_id) ||
-    !isHash(value.binding_hash) ||
+    !isBindingHash(value.binding_hash) ||
     !isUtc(value.created_at) ||
     !isUtc(value.expires_at) ||
     value.created_at >= value.expires_at
@@ -344,10 +350,16 @@ async function store(request: Request, db: D1Database): Promise<Response> {
       return failure("AUTH_SESSION_CONFLICT", 409);
     }
   } catch {
-    const existing = await loadSession(db, session.token_hash);
-    return existing && sessionMatches(existing, session)
-      ? ok()
-      : failure("AUTH_SESSION_CONFLICT", 409);
+    try {
+      const existing = await loadSession(db, session.token_hash);
+      if (!existing) return error("AUTH_SESSION_UNAVAILABLE", 503);
+      const active = classify(existing, stamp());
+      return active.ok && sessionMatches(active.row, session)
+        ? ok()
+        : failure("AUTH_SESSION_CONFLICT", 409);
+    } catch {
+      return error("AUTH_SESSION_UNAVAILABLE", 503);
+    }
   }
 
   return ok();
@@ -363,12 +375,15 @@ async function get(request: Request, db: D1Database): Promise<Response> {
 }
 
 async function contains(request: Request, db: D1Database): Promise<Response> {
-  const body = readRecord(await readJson(request), ["token_hash"]);
-  if (!body || !isHash(body.token_hash)) return error("INVALID_REQUEST");
+  const body = readRecord(await readJson(request), ["family_id", "token_hash"]);
+  if (!body || !isFamilyID(body.family_id) || !isHash(body.token_hash)) {
+    return error("INVALID_REQUEST");
+  }
   const active = classify(await loadSession(db, body.token_hash), stamp());
+  const belongsToFamily = active.ok && active.row.family_id === body.family_id;
   return json({
-    contains: active.ok,
-    code: active.ok ? "OK" : active.code,
+    contains: belongsToFamily,
+    code: belongsToFamily ? "OK" : active.ok ? "AUTH_SESSION_NOT_FOUND" : active.code,
   });
 }
 
@@ -461,8 +476,7 @@ async function listBy(
          SELECT 1 FROM auth_session_family_revocations
          WHERE family_id=auth_sessions.family_id
        )
-     ORDER BY created_at, token_hash
-     LIMIT 512`,
+     ORDER BY created_at, token_hash`,
   ).bind(body[key], at).all<{ token_hash: string }>();
   return json({ token_hashes: rows.results.map((row) => row.token_hash) });
 }
@@ -488,6 +502,19 @@ async function classifyRotationFailure(
   if (old.status === "active" && old.expires_at <= at) {
     return failure("AUTH_SESSION_EXPIRED", 404);
   }
+  if (old.status === "active") {
+    const replacement = await loadSession(db, session.token_hash);
+    if (
+      old.user_id !== session.user_id ||
+      old.token_version !== session.token_version ||
+      old.family_id !== session.family_id ||
+      old.binding_hash !== session.binding_hash ||
+      replacement !== null
+    ) {
+      return failure("AUTH_SESSION_CONFLICT", 409);
+    }
+    return error("AUTH_SESSION_UNAVAILABLE", 503);
+  }
   if (old.status === "revoked" || old.status === "expired") {
     return failure(
       old.status === "expired" ? "AUTH_SESSION_EXPIRED" : "AUTH_SESSION_REVOKED",
@@ -495,10 +522,6 @@ async function classifyRotationFailure(
     );
   }
   if (old.status === "consumed") {
-    if (old.replaced_by_token_hash === session.token_hash) {
-      const replacement = await loadSession(db, session.token_hash);
-      if (replacement && sessionMatches(replacement, session)) return ok();
-    }
     await revokeFamily(
       db,
       old.family_id,
@@ -518,8 +541,7 @@ async function rotate(request: Request, db: D1Database): Promise<Response> {
   const session = readSession(body);
   if (
     !session ||
-    body.old_token_hash === session.token_hash ||
-    !decimalGreaterThan(session.token_version, "0")
+    body.old_token_hash === session.token_hash
   ) {
     return error("INVALID_REQUEST");
   }
@@ -538,10 +560,7 @@ async function rotate(request: Request, db: D1Database): Promise<Response> {
          SET status='consumed', consumed_at=?, replaced_by_token_hash=?, updated_at=?
          WHERE token_hash=? AND status='active' AND expires_at>?
            AND user_id=? AND family_id=? AND binding_hash=?
-           AND (
-             length(?) > length(token_version)
-             OR (length(?) = length(token_version) AND ? > token_version)
-           )
+           AND token_version=?
            AND NOT EXISTS(
              SELECT 1 FROM auth_session_family_revocations
              WHERE family_id=auth_sessions.family_id
@@ -559,8 +578,6 @@ async function rotate(request: Request, db: D1Database): Promise<Response> {
         session.user_id,
         session.family_id,
         session.binding_hash,
-        session.token_version,
-        session.token_version,
         session.token_version,
         session.token_hash,
       ),
@@ -605,7 +622,11 @@ async function rotate(request: Request, db: D1Database): Promise<Response> {
       ).bind(body.old_token_hash, session.token_hash, detail, at),
     ]);
   } catch {
-    return classifyRotationFailure(db, body.old_token_hash, session, at, detail);
+    try {
+      return await classifyRotationFailure(db, body.old_token_hash, session, at, detail);
+    } catch {
+      return error("AUTH_SESSION_UNAVAILABLE", 503);
+    }
   }
   return await exactWitnessExists(db, body.old_token_hash, session, detail)
     ? ok()

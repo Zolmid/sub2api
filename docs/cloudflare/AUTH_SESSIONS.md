@@ -25,11 +25,13 @@ Session records contain only:
 `token_hash`, `user_id`, `token_version`, `family_id`, `binding_hash`,
 `created_at`, and `expires_at`.
 
-`token_hash` and `binding_hash` are SHA-256 hex digests. Refresh and access
-tokens must never be sent to, returned by, or stored in the Worker. Numeric
-identifiers and counters that cross JSON/JavaScript boundaries use canonical
-decimal strings; `token_version` is stored as text so int64 values do not lose
-precision.
+`token_hash` is the full SHA-256 hex digest of the refresh token. The optional
+`binding_hash` preserves the existing Go session-binding contract: either an
+empty string or the 32-character lowercase hex encoding of its truncated
+SHA-256 fingerprint. Refresh and access tokens must never be sent to, returned
+by, or stored in the Worker. Numeric identifiers and counters that cross
+JSON/JavaScript boundaries use canonical decimal strings; `token_version` is
+stored as text so non-negative int64 values do not lose precision.
 
 ## Rotation Atomicity
 
@@ -37,7 +39,10 @@ precision.
 record. D1 consumes the old active token, inserts the replacement, records a
 bounded audit digest, and inserts a rotation witness in one D1 batch. The
 witness trigger asserts that the consumed row and replacement row match the
-same user, family, binding hash, and strictly greater decimal `token_version`.
+same user, family, binding hash, and user revocation `token_version`. A normal
+refresh rotation deliberately keeps that version unchanged; password or
+credential changes invalidate the family before rotation rather than using
+the refresh-token sequence as the user version.
 
 This is a D1 atomic protocol, not a distributed transaction. If the batch fails
 before the witness is created, callers receive a stable conflict, expiry,

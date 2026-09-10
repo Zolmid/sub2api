@@ -13,13 +13,17 @@ function hex(seed: number): string {
   return seed.toString(16).padStart(64, "0");
 }
 
+function bindingHex(seed: number): string {
+  return seed.toString(16).padStart(32, "0");
+}
+
 function session(seed: number, overrides: Partial<Record<string, string>> = {}) {
   return {
     token_hash: hex(seed),
     user_id: "1001",
     token_version: String(seed),
     family_id: `family-${seed}`,
-    binding_hash: hex(900 + seed),
+    binding_hash: bindingHex(900 + seed),
     created_at: "2026-09-10T00:00:00.000Z",
     expires_at: future,
     ...overrides,
@@ -55,7 +59,10 @@ async function store(record: ReturnType<typeof session>) {
 describe("auth sessions control plane", () => {
   it("stores and gets a session without persisting plaintext token material", async () => {
     const tokenHash = await sha256(rawRefresh);
-    const record = session(1, { token_hash: tokenHash, binding_hash: await sha256("binding") });
+    const record = session(1, {
+      token_hash: tokenHash,
+      binding_hash: (await sha256("binding")).slice(0, 32),
+    });
     await store(record);
 
     const loaded = await invoke("/v1/auth-sessions/get", { token_hash: tokenHash });
@@ -87,9 +94,19 @@ describe("auth sessions control plane", () => {
     await store(other);
     await store(expired);
 
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: one.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: one.family_id,
+      token_hash: one.token_hash,
+    })).json())
       .toEqual({ contains: true, code: "OK" });
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: expired.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: "wrong-family",
+      token_hash: one.token_hash,
+    })).json()).toEqual({ contains: false, code: "AUTH_SESSION_NOT_FOUND" });
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: expired.family_id,
+      token_hash: expired.token_hash,
+    })).json())
       .toEqual({ contains: false, code: "AUTH_SESSION_EXPIRED" });
     await expectCode(
       await invoke("/v1/auth-sessions/get", { token_hash: expired.token_hash }),
@@ -103,7 +120,10 @@ describe("auth sessions control plane", () => {
 
     expect((await invoke("/v1/auth-sessions/delete", { token_hash: one.token_hash })).status)
       .toBe(200);
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: one.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: one.family_id,
+      token_hash: one.token_hash,
+    })).json())
       .toEqual({ contains: false, code: "AUTH_SESSION_REVOKED" });
 
     expect((await invoke("/v1/auth-sessions/revoke-user", { user_id: "1001" })).status)
@@ -111,24 +131,30 @@ describe("auth sessions control plane", () => {
     expect(await (await invoke("/v1/auth-sessions/list-user", { user_id: "1001" })).json())
       .toEqual({ token_hashes: [] });
 
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: other.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: other.family_id,
+      token_hash: other.token_hash,
+    })).json())
       .toEqual({ contains: true, code: "OK" });
     expect((await invoke("/v1/auth-sessions/revoke-family", { family_id: "other-family" })).status)
       .toBe(200);
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: other.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: other.family_id,
+      token_hash: other.token_hash,
+    })).json())
       .toEqual({ contains: false, code: "AUTH_SESSION_REVOKED" });
   });
 
   it("allows exactly one distinct concurrent rotation winner", async () => {
-    const old = session(20, { family_id: "race-family", token_version: "1" });
+    const old = session(20, { family_id: "race-family", token_version: "7" });
     const nextA = session(21, {
       family_id: old.family_id,
-      token_version: "2",
+      token_version: old.token_version,
       binding_hash: old.binding_hash,
     });
     const nextB = session(22, {
       family_id: old.family_id,
-      token_version: "3",
+      token_version: old.token_version,
       binding_hash: old.binding_hash,
     });
     await store(old);
@@ -152,10 +178,10 @@ describe("auth sessions control plane", () => {
   });
 
   it("treats an exact rotation retry as idempotent", async () => {
-    const old = session(30, { family_id: "retry-family", token_version: "9223372036854775806" });
+    const old = session(30, { family_id: "retry-family", token_version: "0" });
     const next = session(31, {
       family_id: old.family_id,
-      token_version: "9223372036854775807",
+      token_version: old.token_version,
       binding_hash: old.binding_hash,
     });
     await store(old);
@@ -171,12 +197,12 @@ describe("auth sessions control plane", () => {
     const old = session(40, { family_id: "reuse-family", token_version: "1" });
     const child = session(41, {
       family_id: old.family_id,
-      token_version: "2",
+      token_version: old.token_version,
       binding_hash: old.binding_hash,
     });
     const attacker = session(42, {
       family_id: old.family_id,
-      token_version: "3",
+      token_version: old.token_version,
       binding_hash: old.binding_hash,
     });
     await store(old);
@@ -187,10 +213,85 @@ describe("auth sessions control plane", () => {
     expect(replay.status).toBe(409);
     await expectCode(replay, "AUTH_SESSION_REUSE");
 
-    expect(await (await invoke("/v1/auth-sessions/contains", { token_hash: child.token_hash })).json())
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: child.family_id,
+      token_hash: child.token_hash,
+    })).json())
       .toEqual({ contains: false, code: "AUTH_SESSION_REUSE" });
     expect(await (await invoke("/v1/auth-sessions/list-family", { family_id: old.family_id })).json())
       .toEqual({ token_hashes: [] });
+  });
+
+  it("returns complete user and family membership lists beyond the former boundary", async () => {
+    const records = Array.from({ length: 513 }, (_, index) => session(1_000 + index, {
+      user_id: "1001",
+      token_version: "1",
+      family_id: "large-family",
+    }));
+    for (const record of records) await store(record);
+
+    const byUser = await (await invoke("/v1/auth-sessions/list-user", { user_id: "1001" }))
+      .json<{ token_hashes: string[] }>();
+    const byFamily = await (await invoke("/v1/auth-sessions/list-family", {
+      family_id: "large-family",
+    })).json<{ token_hashes: string[] }>();
+    expect(byUser.token_hashes).toHaveLength(513);
+    expect(byFamily.token_hashes).toHaveLength(513);
+    expect(new Set(byFamily.token_hashes)).toEqual(new Set(records.map((record) => record.token_hash)));
+  });
+
+  it("reports a readable D1 write outage as unavailable instead of a semantic conflict", async () => {
+    const batchUnavailable = {
+      prepare: env.DB.prepare.bind(env.DB),
+      batch: async () => {
+        throw new Error("forced batch outage");
+      },
+      exec: env.DB.exec.bind(env.DB),
+      dump: env.DB.dump?.bind(env.DB),
+    } as unknown as D1Database;
+    const databaseEnv = { ...env, DB: batchUnavailable } as Env;
+
+    const notStored = session(60, { binding_hash: "" });
+    const failedStore = await invoke("/v1/auth-sessions/store", notStored, databaseEnv);
+    expect(failedStore.status).toBe(503);
+    await expectCode(failedStore, "AUTH_SESSION_UNAVAILABLE");
+
+    const old = session(61, { family_id: "outage-family", token_version: "0", binding_hash: "" });
+    const next = session(62, {
+      family_id: old.family_id,
+      token_version: old.token_version,
+      binding_hash: old.binding_hash,
+    });
+    await store(old);
+    const failedRotate = await invoke(
+      "/v1/auth-sessions/rotate",
+      { old_token_hash: old.token_hash, ...next },
+      databaseEnv,
+    );
+    expect(failedRotate.status).toBe(503);
+    await expectCode(failedRotate, "AUTH_SESSION_UNAVAILABLE");
+  });
+
+  it("rejects hour 24 at the D1 schema boundary", async () => {
+    const invalid = session(63, {
+      created_at: "2026-09-10T24:00:00.000Z",
+      expires_at: "2030-01-01T00:00:00.000Z",
+    });
+    await expect(env.DB.prepare(
+      `INSERT INTO auth_sessions(
+         token_hash,user_id,token_version,family_id,binding_hash,status,
+         created_at,expires_at,updated_at
+       ) VALUES(?,?,?,?,?,'active',?,?,?)`,
+    ).bind(
+      invalid.token_hash,
+      invalid.user_id,
+      invalid.token_version,
+      invalid.family_id,
+      invalid.binding_hash,
+      invalid.created_at,
+      invalid.expires_at,
+      invalid.created_at,
+    ).run()).rejects.toThrow("CHECK constraint failed");
   });
 
   it("rejects malformed hashes, IDs, times, unknown fields, oversized bodies, and unavailable D1", async () => {
@@ -198,6 +299,8 @@ describe("auth sessions control plane", () => {
       { ...session(50), token_hash: "not-a-hash" },
       { ...session(50), user_id: "9007199254740993.1" },
       { ...session(50), token_version: "9223372036854775808" },
+      { ...session(50), token_version: "00" },
+      { ...session(50), binding_hash: hex(50) },
       { ...session(50), family_id: "bad family" },
       { ...session(50), created_at: "2026-09-10T00:00:00Z" },
       { ...session(50), expires_at: "2026-09-09T00:00:00.000Z" },
@@ -238,7 +341,7 @@ describe("auth sessions control plane", () => {
     } as unknown as D1Database;
     const unavailable = await invoke(
       "/v1/auth-sessions/contains",
-      { token_hash: hex(100) },
+      { family_id: "unavailable-family", token_hash: hex(100) },
       { ...env, DB: brokenDB } as Env,
     );
     expect(unavailable.status).toBe(503);

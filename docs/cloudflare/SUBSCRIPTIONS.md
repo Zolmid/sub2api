@@ -1,11 +1,9 @@
 # Cloudflare-native subscriptions
 
 This lane adds the D1-authoritative persistence foundation for subscription
-plans, user subscriptions, quota windows, and subscription mutation history.
-It intentionally does **not** wire routes, billing, request admission, the
-control plane, or `src/index.ts`. Callers must explicitly instantiate
-`SubscriptionRuntime` with the primary D1 binding and provide validated UTC
-instants and configured-timezone calendar boundaries.
+plans, user subscriptions, quota windows, and subscription mutation history,
+plus a private Worker control-plane adapter. It does not expose a public API,
+wire Go handlers, billing, request admission, schedulers, or `src/index.ts`.
 
 ## Authority and representation
 
@@ -65,6 +63,42 @@ a typed result or throws `SubscriptionRuntimeError` with a stable `code`.
 - `reserveUsage`
 - `sweepExpired`
 
+## Private control-plane contract
+
+The Worker exposes every runtime operation only through
+`http://sub2api.internal`, as `POST`, with
+`X-Sub2API-Bridge-Version: 2026-09-09.v3` and a non-empty
+`X-Sub2API-Container-Id`. Bodies are JSON and capped by the shared 64 KiB
+control-plane limit. Each successful response is the runtime result unchanged.
+The exact route registry is:
+
+- `/v1/subscriptions/plans/create` -> `createPlan`
+- `/v1/subscriptions/plans/get` -> `getPlan`
+- `/v1/subscriptions/plans/list` -> `listPlans`
+- `/v1/subscriptions/assign-or-extend` -> `assignOrExtend`
+- `/v1/subscriptions/get` -> `getSubscription`
+- `/v1/subscriptions/list` -> `listSubscriptions`
+- `/v1/subscriptions/revoke` -> `revoke`
+- `/v1/subscriptions/restore` -> `restore`
+- `/v1/subscriptions/extend` -> `extend`
+- `/v1/subscriptions/windows/activate` -> `activateWindows`
+- `/v1/subscriptions/windows/maintain` -> `maintainWindows`
+- `/v1/subscriptions/windows/reset` -> `resetWindows`
+- `/v1/subscriptions/usage/reserve` -> `reserveUsage`
+- `/v1/subscriptions/expiry/sweep` -> `sweepExpired`
+
+Unknown routes, wrong host/version, non-POST requests, and missing container
+identity fail with `404 NOT_FOUND`. Malformed or oversized JSON gets
+`400 INVALID_REQUEST`. Runtime validation errors map to 400, missing
+references to 404, and idempotency/version/state/quota conflicts to 409, all
+using `{ "error": { "code": "...", "message": "..." } }`. D1 failures,
+unexpected exceptions, and corrupt internal runtime state return only
+`503 SUBSCRIPTION_UNAVAILABLE`; their details are never bridged.
+
+Go bridge wiring and remote Cloudflare deployment remain separate integration
+work. This adapter neither changes the Go backend nor creates or deploys any
+Cloudflare resource.
+
 Mutation calls carry an operation key. Mutations of an existing subscription
 also carry `expected_version`, except `assignOrExtend`, which retries a bounded
 CAS loop so two independent deliveries can each apply once without losing an
@@ -119,11 +153,10 @@ returns its stored result without overwriting a later extension.
 
 ## Intentional integration boundary
 
-No shared entrypoint imports this module yet. Billing and request admission do
-not reserve subscription quota, management routes do not expose these methods,
-and no scheduler invokes `sweepExpired`. A later integration lane must map
-authenticated actors and request identities into these strict calls, perform
-window maintenance before reservation, translate stable error codes, and wire
-cache invalidation after committed D1 mutations. That wiring must preserve the
-operation key and expected-version contracts rather than adding an unguarded
-read/modify/write layer.
+Billing and request admission do not reserve subscription quota, management
+routes do not expose these methods, and no scheduler invokes `sweepExpired`.
+A later Go integration lane must map authenticated actors and request
+identities into this private protocol, perform window maintenance before
+reservation, and wire cache invalidation after committed D1 mutations. It must
+preserve the operation key and expected-version contracts rather than adding an
+unguarded read/modify/write layer.

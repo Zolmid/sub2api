@@ -17,6 +17,10 @@ import {
   isAuthSessionsPath,
 } from "./auth-sessions";
 import {
+  isSubscriptionControlPath,
+  subscriptionControlPlane,
+} from "./subscription-control";
+import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
   MAX_CONTROL_BODY_BYTES,
@@ -146,6 +150,9 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
     }
     if (isAuthSessionsPath(url.pathname)) {
       return await authSessionsControlPlane(request, env, url.pathname);
+    }
+    if (isSubscriptionControlPath(url.pathname)) {
+      return await subscriptionControlPlane(request, env, url.pathname);
     }
     switch (url.pathname) {
       case "/v1/auth/resolve":

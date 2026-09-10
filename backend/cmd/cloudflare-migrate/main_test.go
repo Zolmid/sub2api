@@ -177,19 +177,6 @@ func emptyRestoreBundle(t *testing.T) []byte {
 	return encoded
 }
 
-func emptyRestoreBundle0018(t *testing.T) []byte {
-	t.Helper()
-	bundle, err := cloudflaremigration.ExportRestoreJSONL0018(bytes.NewReader(emptyRestoreSourceSnapshot0018(t)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := json.Marshal(bundle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return encoded
-}
-
 func TestExportCommandIsDeterministicAndRejectsMissingInventory(t *testing.T) {
 	directory := t.TempDir()
 	source := filepath.Join(directory, "source.jsonl")

@@ -2180,14 +2180,6 @@ func exportRestorePostgreSQLTable(ctx context.Context, tx *sql.Tx, schemaName, t
 	return count, accumulator.sum(), nil
 }
 
-func validateRestoreSourceHeader(header sourceHeader) error {
-	return validateRestoreSourceHeaderWith(header, RestoreSourceFormatVersion, RestoreMappingProfileVersion)
-}
-
-func validateRestoreSourceHeader0018(header sourceHeader) error {
-	return validateRestoreSourceHeaderWith(header, Restore0018SourceFormatVersion, Restore0018MappingProfileVersion)
-}
-
 func validateRestoreSourceHeaderWith(header sourceHeader, sourceFormatVersion, mappingProfileVersion string) error {
 	if header.Type != "source" || header.Format != sourceFormatVersion || header.MappingProfile != mappingProfileVersion || !header.Complete {
 		return errors.New("restore source must declare the supported format, mapping profile, and complete_inventory=true")
@@ -2321,10 +2313,6 @@ func exportRestoreJSONLWith(reader io.Reader, sourceFormatVersion, mappingProfil
 		return RestoreBundle{}, errors.New("restore source is empty, truncated, or missing snapshot_end")
 	}
 	return buildRestoreBundleWith(header, snapshotSHA, summaries, present, tables, canonicalize, migrations, operationalInitialization, formatVersion, targetSchemaVersion, mappingProfileVersion)
-}
-
-func buildRestoreBundle(header sourceHeader, snapshotSHA string, inventory []snapshotTableSummary, present map[string]bool, sourceRows map[string][]json.RawMessage) (RestoreBundle, error) {
-	return buildRestoreBundleWith(header, snapshotSHA, inventory, present, sourceRows, CanonicalizeRestore, CanonicalTargetMigrations, CanonicalOperationalInitialization, RestoreFormatVersion, RestoreTargetSchemaVersion, RestoreMappingProfileVersion)
 }
 
 func buildRestoreBundleWith(header sourceHeader, snapshotSHA string, inventory []snapshotTableSummary, present map[string]bool, sourceRows map[string][]json.RawMessage, canonicalize func(RestoreManifest) (RestoreManifest, error), migrations []MigrationFingerprint, operationalInitialization []OperationalInitialization, formatVersion, targetSchemaVersion, mappingProfileVersion string) (RestoreBundle, error) {

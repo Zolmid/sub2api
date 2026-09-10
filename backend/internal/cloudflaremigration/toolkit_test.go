@@ -1007,3 +1007,180 @@ func TestRestoreSubscriptionFieldMappingIsExact(t *testing.T) {
 		t.Fatal("unrepresentable subscription price precision was accepted")
 	}
 }
+
+func TestRestore0018NonemptySubscriptionsEndToEndAndFailClosed(t *testing.T) {
+	const adminID = int64(9007199254740993)
+	const memberID = "9007199254740994"
+	const planID = int64(9223372036854775806)
+	const subscriptionID = int64(9223372036854775805)
+
+	groupSource := func(id, name string) json.RawMessage {
+		var row map[string]any
+		if err := json.Unmarshal(testGroupRow(id, name), &row); err != nil {
+			t.Fatal(err)
+		}
+		row["subscription_type"] = "subscription"
+		row["rate_multiplier_bps"] = "10000"
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	memberSource := func() json.RawMessage {
+		var row map[string]any
+		if err := json.Unmarshal(safeSourceUserRow(t, ""), &row); err != nil {
+			t.Fatal(err)
+		}
+		row["id"] = memberID
+		row["role"] = "user"
+		row["email"] = "member@example.invalid"
+		row["username"] = "member"
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+
+	legacyPlan, err := json.Marshal(map[string]any{
+		"id": planID, "group_id": int64(11), "name": "monthly", "description": "full plan", "price": json.Number("12.34000000"),
+		"original_price": json.Number("20.00000000"), "currency": "USD", "validity_days": int64(30), "validity_unit": "day",
+		"features": "{}", "product_name": "Monthly", "for_sale": true, "sort_order": int64(1),
+		"created_at": "2026-09-09T00:00:00Z", "updated_at": "2026-09-09T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSource, err := TransformLegacyRow0017("subscription_plans", legacyPlan, CredentialTransformer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySubscription, err := json.Marshal(map[string]any{
+		"id": subscriptionID, "created_at": "2026-09-09T00:00:00Z", "updated_at": "2026-09-09T00:00:00Z", "deleted_at": nil,
+		"starts_at": "2026-09-09T00:00:00Z", "expires_at": "2026-10-09T00:00:00Z", "status": "active",
+		"daily_window_start": nil, "weekly_window_start": "2026-09-09T00:00:00Z", "monthly_window_start": nil,
+		"daily_usage_usd": json.Number("0"), "weekly_usage_usd": json.Number("1.25000000"), "monthly_usage_usd": json.Number("2"),
+		"assigned_at": "2026-09-09T00:00:00Z", "notes": nil, "group_id": int64(10), "user_id": adminID, "assigned_by": adminID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriptionSource, err := TransformLegacyRow0017("user_subscriptions", legacySubscription, CredentialTransformer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := map[string][]json.RawMessage{
+		"groups":             {groupSource("10", "subscriber-a"), groupSource("11", "subscriber-b")},
+		"users":              {safeSourceUserRow(t, ""), memberSource()},
+		"subscription_plans": {planSource},
+		"user_subscriptions": {subscriptionSource},
+	}
+	source := rewriteSourceHeaderForTest(t, snapshotJSONL(t, rows, nil), func(header *sourceHeader) {
+		header.Format = Restore0018SourceFormatVersion
+		header.MappingProfile = Restore0018MappingProfileVersion
+	})
+	restore, err := ExportRestoreJSONL0018(strings.NewReader(source))
+	if err != nil {
+		t.Fatalf("export nonempty 0018 snapshot: %v", err)
+	}
+	plan, err := BuildRestoreSQLPlan0018(restore.Manifest)
+	if err != nil {
+		t.Fatalf("plan nonempty 0018 restore: %v", err)
+	}
+	database := openCanonicalRestoreDatabase0018(t)
+	if _, err := database.Exec(plan.SQL); err != nil {
+		t.Fatalf("apply nonempty 0018 restore plan: %v", err)
+	}
+	var actualPlanID, planGroupID, priceE8, originalPriceE8 string
+	if err := database.QueryRow(`SELECT id, group_id, price_e8_usd, original_price_e8_usd FROM subscription_plans`).Scan(&actualPlanID, &planGroupID, &priceE8, &originalPriceE8); err != nil {
+		t.Fatal(err)
+	}
+	if actualPlanID != strconv.FormatInt(planID, 10) || planGroupID != "11" || priceE8 != "1234000000" || originalPriceE8 != "2000000000" {
+		t.Fatalf("subscription plan values changed: id=%s group=%s price=%s original=%s", actualPlanID, planGroupID, priceE8, originalPriceE8)
+	}
+	var actualSubscriptionID, userID, groupID, assignedBy, weeklyUsageE8, planReference string
+	if err := database.QueryRow(`SELECT id, user_id, group_id, assigned_by, weekly_usage_e8_usd, COALESCE(plan_id, '') FROM user_subscriptions`).Scan(&actualSubscriptionID, &userID, &groupID, &assignedBy, &weeklyUsageE8, &planReference); err != nil {
+		t.Fatal(err)
+	}
+	if actualSubscriptionID != strconv.FormatInt(subscriptionID, 10) || userID != strconv.FormatInt(adminID, 10) || groupID != "10" || assignedBy != strconv.FormatInt(adminID, 10) || weeklyUsageE8 != "125000000" || planReference != "" {
+		t.Fatalf("user subscription values changed: id=%s user=%s group=%s assigned_by=%s weekly=%s plan=%s", actualSubscriptionID, userID, groupID, assignedBy, weeklyUsageE8, planReference)
+	}
+
+	mutateSubscription := func(mutate func(map[string]any)) RestoreManifest {
+		manifest := restore.Manifest
+		manifest.Tables = append([]TableChunk(nil), restore.Manifest.Tables...)
+		for index := range manifest.Tables {
+			if manifest.Tables[index].Table != "user_subscriptions" {
+				continue
+			}
+			var row map[string]any
+			if err := json.Unmarshal(manifest.Tables[index].Rows[0], &row); err != nil {
+				t.Fatal(err)
+			}
+			mutate(row)
+			encoded, err := json.Marshal(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			chunks, err := NewRestoreTableChunks("user_subscriptions", []json.RawMessage{encoded})
+			if err != nil {
+				t.Fatal(err)
+			}
+			replaceChunk(manifest.Tables, chunks[0])
+			return manifest
+		}
+		t.Fatal("user_subscriptions chunk missing")
+		return RestoreManifest{}
+	}
+	if _, err := CanonicalizeRestore0018(mutateSubscription(func(row map[string]any) { row["plan_id"] = strconv.FormatInt(planID, 10) })); err == nil {
+		t.Fatal("mismatched subscription plan/group accepted")
+	}
+	if _, err := CanonicalizeRestore0018(mutateSubscription(func(row map[string]any) { row["assigned_by"] = memberID })); err == nil {
+		t.Fatal("non-admin subscription assigner accepted")
+	}
+	if _, err := CanonicalizeRestore0018(mutateSubscription(func(row map[string]any) { row["assigned_by"] = "9007199254740995" })); err == nil {
+		t.Fatal("missing subscription assigner accepted")
+	}
+	duplicateLive := restore.Manifest
+	duplicateLive.Tables = append([]TableChunk(nil), restore.Manifest.Tables...)
+	for index := range duplicateLive.Tables {
+		if duplicateLive.Tables[index].Table != "user_subscriptions" {
+			continue
+		}
+		var duplicate map[string]any
+		if err := json.Unmarshal(duplicateLive.Tables[index].Rows[0], &duplicate); err != nil {
+			t.Fatal(err)
+		}
+		duplicate["id"] = "9223372036854775804"
+		encoded, err := json.Marshal(duplicate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks, err := NewRestoreTableChunks("user_subscriptions", append(append([]json.RawMessage(nil), duplicateLive.Tables[index].Rows...), encoded))
+		if err != nil {
+			t.Fatal(err)
+		}
+		replaceChunk(duplicateLive.Tables, chunks[0])
+		break
+	}
+	if _, err := CanonicalizeRestore0018(duplicateLive); err == nil {
+		t.Fatal("duplicate live user/group subscription accepted")
+	}
+
+	for _, blockedTable := range []string{"settings", "payment_orders", "pending_auth_sessions"} {
+		blockedRows := make(map[string][]json.RawMessage, len(rows)+1)
+		for table, sourceRows := range rows {
+			blockedRows[table] = append([]json.RawMessage(nil), sourceRows...)
+		}
+		blockedRows[blockedTable] = []json.RawMessage{json.RawMessage(`{"id":"blocked"}`)}
+		blockedSource := rewriteSourceHeaderForTest(t, snapshotJSONL(t, blockedRows, nil), func(header *sourceHeader) {
+			header.Format = Restore0018SourceFormatVersion
+			header.MappingProfile = Restore0018MappingProfileVersion
+		})
+		if _, err := ExportRestoreJSONL0018(strings.NewReader(blockedSource)); err == nil {
+			t.Fatalf("nonempty blocked %s state was accepted", blockedTable)
+		}
+	}
+}

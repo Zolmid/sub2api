@@ -32,7 +32,6 @@ func TestSafeUpstreamURL(t *testing.T) {
 }
 
 func TestOpsUpstreamErrorEventKeepsExplicitProxySnapshotPerAttempt(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 
 	oldProxyID := int64(10060)
@@ -98,7 +97,6 @@ func TestOpsUpstreamErrorEventKeepsExplicitProxySnapshotPerAttempt(t *testing.T)
 }
 
 func TestOpsUpstreamProxyFieldAccessors(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	boundID := int64(7)
 	backupID := int64(8)
@@ -173,7 +171,6 @@ func TestOpsUpstreamProxyFieldAccessors(t *testing.T) {
 }
 
 func TestOpsUpstreamErrorEventRetryKeepsExplicitAttemptProxy(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	proxyID := int64(10060)
 	account := &Account{ProxyID: &proxyID, Proxy: &Proxy{ID: proxyID, Name: "retry-proxy"}}

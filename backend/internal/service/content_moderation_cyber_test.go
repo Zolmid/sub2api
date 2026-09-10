@@ -260,7 +260,10 @@ func TestRecordCyberPolicyEvent_RuntimeSnapshotRefreshFailureKeepsStaleScope(t *
 		SettingKeyRiskControlEnabled:      "true",
 		SettingKeyContentModerationConfig: `{"all_groups":true,"model_filter":{"type":"include","models":["gpt-5"]}}`,
 	}}
-	svc := NewContentModerationService(settingRepo, repo, nil, nil, nil, nil, nil, nil)
+	// Keep this test synchronous: the constructor starts workers only when both
+	// repositories are present, while this test exercises the direct record path.
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil, nil)
+	svc.repo = repo
 	svc.runtimeCacheTTL = time.Minute
 
 	_, err := svc.loadRuntimeSnapshot(context.Background())

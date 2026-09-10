@@ -211,7 +211,6 @@ func startPassthroughLifecycleServerWithHooks(
 }
 
 func TestPassthroughLifecycle_CyberTerminalEventsMarkBeforeAfterTurn(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
 		name        string
@@ -304,7 +303,6 @@ func TestPassthroughLifecycle_CyberTerminalEventsMarkBeforeAfterTurn(t *testing.
 }
 
 func TestPassthroughLifecycle_NonCyberFailureKeepsAccountSideEffects(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -350,7 +348,6 @@ func TestPassthroughLifecycle_NonCyberFailureKeepsAccountSideEffects(t *testing.
 }
 
 func TestPassthroughLifecycle_CyberSkipsFailureAccountSideEffects(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -380,7 +377,6 @@ func TestPassthroughLifecycle_CyberSkipsFailureAccountSideEffects(t *testing.T) 
 }
 
 func TestPassthroughLifecycle_CloseReasonTruncationPreservesUTF8(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -450,7 +446,6 @@ func requirePassthroughUpstreamWrite(t *testing.T, upstream *stagedPassthroughCo
 }
 
 func TestPassthroughLifecycle_ResponsesLiteFirstFramePinsParallelToolCalls(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -516,7 +511,6 @@ func TestOpenAIWSPassthroughTurnLifecycle_SerializesTerminalCommitAndNextTurn(t 
 }
 
 func TestPassthroughLifecycle_LeaseLossSendsRetryClose(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	upstream := newStagedPassthroughConn()
 	upstream.Send(`{"type":"response.created","response":{"id":"resp_lease","model":"gpt-5.1"}}`)
@@ -543,7 +537,6 @@ func TestPassthroughLifecycle_LeaseLossSendsRetryClose(t *testing.T) {
 }
 
 func TestPassthroughLifecycle_CompletedTurnStartsInterTurnIdle(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -569,7 +562,6 @@ func TestPassthroughLifecycle_CompletedTurnStartsInterTurnIdle(t *testing.T) {
 }
 
 func TestPassthroughLifecycle_ActiveTurnInactivityUsesReadTimeout(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -599,7 +591,6 @@ func TestPassthroughLifecycle_ActiveTurnInactivityUsesReadTimeout(t *testing.T) 
 }
 
 func TestPassthroughLifecycle_PreambleAllowsPromptClientCancel(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	cfg := passthroughLifecycleConfig()
@@ -631,7 +622,6 @@ func TestPassthroughLifecycle_PreambleAllowsPromptClientCancel(t *testing.T) {
 }
 
 func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	cfg := passthroughLifecycleConfig()
@@ -669,7 +659,6 @@ func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
 }
 
 func TestPassthroughLifecycle_ActiveTurnActivityRefreshesReadTimeout(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -710,7 +699,6 @@ func TestPassthroughLifecycle_ActiveTurnActivityRefreshesReadTimeout(t *testing.
 }
 
 func TestPassthroughLifecycle_TerminalSwitchesToInterTurnIdleTimeout(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	cfg := passthroughLifecycleConfig()
@@ -755,7 +743,6 @@ func TestPassthroughLifecycle_TerminalSwitchesToInterTurnIdleTimeout(t *testing.
 }
 
 func TestPassthroughLifecycle_FirstOutputTimeoutRemainsBounded(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -776,7 +763,6 @@ func TestPassthroughLifecycle_FirstOutputTimeoutRemainsBounded(t *testing.T) {
 }
 
 func TestPassthroughLifecycle_ResponseCreatedTimeoutClosesWithoutFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()
@@ -808,7 +794,6 @@ func TestPassthroughLifecycle_ResponseCreatedTimeoutClosesWithoutFailover(t *tes
 }
 
 func TestPassthroughLifecycle_SecondTurnTimeoutIsNotFailoverSafe(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 	upstream := newStagedPassthroughConn()

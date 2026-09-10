@@ -91,7 +91,6 @@ func (u *httpUpstreamRecorder) DoWithTLS(req *http.Request, proxyURL string, acc
 }
 
 func TestOpenAIGatewayService_ResponsesUnknownModelDoesNotFallbackToGPT54(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -134,7 +133,6 @@ func TestOpenAIGatewayService_ResponsesUnknownModelDoesNotFallbackToGPT54(t *tes
 }
 
 func TestOpenAIGatewayService_OAuthResponsesPromotesSystemMessageWithoutDuplication(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	const systemPrompt = "Unique system prefix for Responses token accounting."
 	const existingInstructions = "Existing instructions."
@@ -172,7 +170,6 @@ func TestOpenAIGatewayService_OAuthResponsesPromotesSystemMessageWithoutDuplicat
 }
 
 func TestOpenAIGatewayService_NativeResponsesBodyModificationPreservesHTMLChars(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	payloadText := strings.Repeat(`<tag>&value</tag>`, 128)
 	originalBody := []byte(fmt.Sprintf(`{"model":"gpt-5.5","stream":false,"max_output_tokens":100,"previous_response_id":"resp_prev","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}]}`, payloadText))
@@ -223,7 +220,6 @@ func TestOpenAIGatewayService_NativeResponsesBodyModificationPreservesHTMLChars(
 }
 
 func TestOpenAIGatewayService_OAuthMessagesBridgeDoesNotInjectDefaultInstructions(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -385,7 +381,6 @@ func captureStructuredLog(t *testing.T) (*inMemoryLogSink, func()) {
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_StreamKeepsToolNameAndBodyNormalized(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -475,7 +470,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamKeepsToolNameAndBodyNormali
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_GroupForceOpenAIFastInjectsMissingTier(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -510,7 +504,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_GroupForceOpenAIFastInjectsMissin
 // namespace 形态的 tool_choice、历史调用项上的 namespace 都原样转发，只清掉
 // 非调用项上的残留 namespace（Codex 协议里只有调用项会带该字段）。
 func TestOpenAIGatewayService_OAuthPassthrough_PreservesNamespaceRequest(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -577,7 +570,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_PreservesNamespaceRequest(t *test
 // 兼容开关打开时的旧行为：摊平请求、回程还原。默认路径见
 // TestOpenAIGatewayService_OAuthPassthrough_PreservesNamespaceRequest。
 func TestOpenAIGatewayService_OAuthPassthrough_FlattenEnabledNamespaceRequestAndStreamResponse(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -651,7 +643,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_FlattenEnabledNamespaceRequestAnd
 // 兼容开关打开时的旧行为；默认保留路径见
 // TestOpenAIGatewayService_OAuthPreservesCodexNamespaceTools。
 func TestOpenAIGatewayService_NativeOAuth_FlattenEnabledNamespaceRequestAndStreamResponse(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -695,7 +686,6 @@ func TestOpenAIGatewayService_NativeOAuth_FlattenEnabledNamespaceRequestAndStrea
 }
 
 func TestOpenAIGatewayService_NativeOAuth_NamespaceNonStreamingResponse(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -722,7 +712,6 @@ func TestOpenAIGatewayService_NativeOAuth_NamespaceNonStreamingResponse(t *testi
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_NamespaceNonStreamingResponse(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -748,7 +737,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_NamespaceNonStreamingResponse(t *
 
 // 摊平名冲突只在兼容开关打开时才可能发生：默认保留 namespace，不存在平名冲突。
 func TestOpenAIGatewayService_OAuthPassthrough_FlattenEnabledNamespaceCollisionReturnsBadRequest(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -783,7 +771,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_FlattenEnabledNamespaceCollisionR
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_CompactUsesJSONAndKeepsNonStreaming(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -842,7 +829,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_CompactUsesJSONAndKeepsNonStreami
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_UpstreamRequestIgnoresClientCancel(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -888,7 +874,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_UpstreamRequestIgnoresClientCance
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_CodexMissingInstructionsGetsDefault(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
@@ -937,7 +922,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_CodexMissingInstructionsGetsDefau
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_DisabledUsesLegacyTransform(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -982,7 +966,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_DisabledUsesLegacyTransform(t *te
 }
 
 func TestOpenAIGatewayService_OAuthLegacy_GroupForceOpenAIFastInjectsMissingTier(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -1016,7 +999,6 @@ func TestOpenAIGatewayService_OAuthLegacy_GroupForceOpenAIFastInjectsMissingTier
 }
 
 func TestOpenAIGatewayService_OAuthLegacy_GroupForceStillHonorsGlobalFilter(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -1049,7 +1031,6 @@ func TestOpenAIGatewayService_OAuthLegacy_GroupForceStillHonorsGlobalFilter(t *t
 }
 
 func TestOpenAIGatewayService_OAuthLegacy_UpstreamRequestIgnoresClientCancel(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1095,7 +1076,6 @@ func TestOpenAIGatewayService_OAuthLegacy_UpstreamRequestIgnoresClientCancel(t *
 }
 
 func TestOpenAIGatewayService_OAuthLegacy_CompositeCodexUAUsesCodexOriginator(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1141,7 +1121,6 @@ func TestOpenAIGatewayService_OAuthLegacy_CompositeCodexUAUsesCodexOriginator(t 
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_ResponseHeadersAllowXCodex(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1199,7 +1178,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_ResponseHeadersAllowXCodex(t *tes
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_UpstreamErrorIncludesPassthroughFlag(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1249,7 +1227,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_UpstreamErrorIncludesPassthroughF
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_RebuildsUpstreamErrors(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
 		name           string
@@ -1426,7 +1403,6 @@ func TestWriteOpenAIPassthroughErrorHeaders_StrictRetryAfter(t *testing.T) {
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_CompactErrorBeforeKeepaliveIsSingleJSON(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(nil))
@@ -1460,7 +1436,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_CompactErrorBeforeKeepaliveIsSin
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_CompactErrorAfterKeepaliveIsFailedSSE(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(nil))
@@ -1498,7 +1473,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_CompactErrorAfterKeepaliveIsFail
 }
 
 func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	originalBody := []byte(`{"model":"gpt-5.2","stream":false,"instructions":"local-test-instructions","input":[{"type":"text","text":"hi"}]}`)
 
 	newAccount := func(accountType string) *Account {
@@ -1684,7 +1658,6 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_Transient5xxTriggersFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	requestBody := []byte(`{"model":"gpt-5.2","stream":false,"input":"hello"}`)
 
 	for _, statusCode := range []int{
@@ -1753,7 +1726,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_Transient5xxTriggersFailover(t *
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_ContextWindow502DoesNotFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -1787,7 +1759,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_ContextWindow502DoesNotFailover(
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_PoolModeConfigured5xxRetriesSameAccount(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
@@ -1820,7 +1791,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_PoolModeConfigured5xxRetriesSame
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_PoolModeAuthErrorsTriggerFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	tests := []struct {
 		name        string
 		statusCode  int
@@ -1883,7 +1853,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_PoolModeAuthErrorsTriggerFailove
 }
 
 func TestOpenAIGatewayService_OpenAIPassthrough_CompactNetworkErrorsTriggerFailover(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
 		name           string
@@ -1950,7 +1919,6 @@ func TestOpenAIGatewayService_OpenAIPassthrough_CompactNetworkErrorsTriggerFailo
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_NonCodexUAFallbackToCodexUA(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -1996,7 +1964,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_NonCodexUAFallbackToCodexUA(t *te
 // originator 与 UA 首段天然配套，不会出现历史上 originator/UA 错配被上游 404 的形态
 // （issue #3901）。
 func TestOpenAIGatewayService_OAuthPassthrough_OfficialIdentityUnified(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	const tuiUA = "codex_vscode/0.140.2 (Mac OS X 14.0; arm64) vscode (codex_vscode; 0.140.2)"
 
@@ -2044,7 +2011,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_OfficialIdentityUnified(t *testin
 
 // 透传模式下真实 TUI 客户端的身份同样被统一：被优先降载的身份不会带到上游。
 func TestOpenAIGatewayService_OAuthPassthrough_CodexTuiIdentityUnified(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2087,7 +2053,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_CodexTuiIdentityUnified(t *testin
 }
 
 func TestOpenAIGatewayService_CodexFingerprintHTTPTransformedHeaderBodyParityAndDefaultCacheKey(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2147,7 +2112,6 @@ func TestOpenAIGatewayService_CodexFingerprintHTTPTransformedHeaderBodyParityAnd
 }
 
 func TestOpenAIGatewayService_CodexFingerprintHTTPRawPassthroughHeaderBodyParityAndDefaultCacheKey(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2209,7 +2173,6 @@ func TestOpenAIGatewayService_CodexFingerprintHTTPRawPassthroughHeaderBodyParity
 }
 
 func TestOpenAIGatewayService_CodexFingerprintCompactDoesNotRewriteBodyCacheKeyOrMetadata(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2253,7 +2216,6 @@ func TestOpenAIGatewayService_CodexFingerprintCompactDoesNotRewriteBodyCacheKeyO
 }
 
 func TestOpenAIGatewayService_CodexFingerprintMessagesBridgeDoesNotInjectBodyPromptCacheKey(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2293,7 +2255,6 @@ func TestOpenAIGatewayService_CodexFingerprintMessagesBridgeDoesNotInjectBodyPro
 }
 
 func TestOpenAIGatewayService_CodexCLIOnly_RejectsNonCodexClient(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2326,7 +2287,6 @@ func TestOpenAIGatewayService_CodexCLIOnly_RejectsNonCodexClient(t *testing.T) {
 }
 
 func TestOpenAIGatewayService_CodexCLIOnly_AllowOfficialClientFamilies(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	tests := []struct {
 		name       string
@@ -2389,7 +2349,6 @@ func TestOpenAIGatewayService_CodexCLIOnly_AllowOfficialClientFamilies(t *testin
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_StreamingSetsFirstTokenMs(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2441,7 +2400,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamingSetsFirstTokenMs(t *test
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_StreamClientDisconnectStillCollectsUsage(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2496,7 +2454,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamClientDisconnectStillCollec
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_PreservesBodyAndUsesResponsesEndpoint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2555,7 +2512,6 @@ func TestOpenAIGatewayService_APIKeyPassthrough_PreservesBodyAndUsesResponsesEnd
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_WarnOnTimeoutHeadersForStream(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	logSink, restore := captureStructuredLog(t)
 	defer restore()
 
@@ -2596,7 +2552,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_WarnOnTimeoutHeadersForStream(t *
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_InfoWhenStreamEndsWithoutDone(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	logSink, restore := captureStructuredLog(t)
 	defer restore()
 
@@ -2638,7 +2593,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_InfoWhenStreamEndsWithoutDone(t *
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_DefaultFiltersTimeoutHeaders(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -2684,7 +2638,6 @@ func TestOpenAIGatewayService_OAuthPassthrough_DefaultFiltersTimeoutHeaders(t *t
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_AllowTimeoutHeadersWhenConfigured(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)

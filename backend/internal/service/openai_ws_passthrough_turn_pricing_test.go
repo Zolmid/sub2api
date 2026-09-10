@@ -67,7 +67,6 @@ func startPassthroughHookRecordingServer(
 // handler 的 recordTurnStart 保存该时刻，AfterTurn 再用 currentOr(turnStart)
 // 作为计费 PricingAt；不触发 BeforeTurn 也意味着透传仍没有 turn 级利润复核。
 func TestPassthroughIngressReportsTurnStartedBeforeAfterTurnWithoutBeforeTurn(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 
@@ -149,7 +148,6 @@ func TestPassthroughIngressFreezesBinarySubsequentTurnBeforeRequestPolicy(t *tes
 
 func testPassthroughIngressFreezesSubsequentTurnBeforeRequestPolicy(t *testing.T, secondMessageType coderws.MessageType) {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
 

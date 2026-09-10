@@ -222,6 +222,28 @@ describe("auth sessions control plane", () => {
       .toEqual({ token_hashes: [] });
   });
 
+  it("revokes descendants when the Go lookup presents a consumed token", async () => {
+    const old = session(43, { family_id: "lookup-reuse-family", token_version: "1" });
+    const child = session(44, {
+      family_id: old.family_id,
+      token_version: old.token_version,
+      binding_hash: old.binding_hash,
+    });
+    await store(old);
+    expect((await invoke("/v1/auth-sessions/rotate", { old_token_hash: old.token_hash, ...child })).status)
+      .toBe(200);
+
+    const replayLookup = await invoke("/v1/auth-sessions/get", { token_hash: old.token_hash });
+    expect(replayLookup.status).toBe(409);
+    await expectCode(replayLookup, "AUTH_SESSION_REUSE");
+    expect(await (await invoke("/v1/auth-sessions/contains", {
+      family_id: child.family_id,
+      token_hash: child.token_hash,
+    })).json()).toEqual({ contains: false, code: "AUTH_SESSION_REUSE" });
+    expect(await (await invoke("/v1/auth-sessions/list-family", { family_id: old.family_id })).json())
+      .toEqual({ token_hashes: [] });
+  });
+
   it("returns complete user and family membership lists beyond the former boundary", async () => {
     const records = Array.from({ length: 513 }, (_, index) => session(1_000 + index, {
       user_id: "1001",

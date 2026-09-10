@@ -368,7 +368,13 @@ async function store(request: Request, db: D1Database): Promise<Response> {
 async function get(request: Request, db: D1Database): Promise<Response> {
   const body = readRecord(await readJson(request), ["token_hash"]);
   if (!body || !isHash(body.token_hash)) return error("INVALID_REQUEST");
-  const active = classify(await loadSession(db, body.token_hash), stamp());
+  const at = stamp();
+  const row = await loadSession(db, body.token_hash);
+  if (row?.status === "consumed" && row.family_revoked_at === null) {
+    await revokeFamily(db, row.family_id, "token_reuse", row.token_hash, null, at);
+    return failure("AUTH_SESSION_REUSE", 409);
+  }
+  const active = classify(row, at);
   if (!active.ok) return failure(active.code, active.status);
   const { status: _status, consumed_at: _consumed, replaced_by_token_hash: _replaced, revoked_at: _revoked, revoke_reason: _reason, family_revoked_at: _familyAt, family_revocation_reason: _familyReason, ...session } = active.row;
   return json({ session });

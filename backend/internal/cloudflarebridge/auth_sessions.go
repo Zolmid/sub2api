@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -15,9 +14,23 @@ import (
 var (
 	lowerSHA256HexPattern        = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	lowerSessionBindingHashRegex = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	authSessionFamilyIDPattern   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 )
 
+const authSessionTimestampLayout = "2006-01-02T15:04:05.000Z"
+
 type authSessionWire struct {
+	TokenHash    string `json:"token_hash"`
+	UserID       string `json:"user_id"`
+	TokenVersion string `json:"token_version"`
+	FamilyID     string `json:"family_id"`
+	BindingHash  string `json:"binding_hash"`
+	CreatedAt    string `json:"created_at"`
+	ExpiresAt    string `json:"expires_at"`
+}
+
+type authSessionRotateWire struct {
+	OldTokenHash string `json:"old_token_hash"`
 	TokenHash    string `json:"token_hash"`
 	UserID       string `json:"user_id"`
 	TokenVersion string `json:"token_version"`
@@ -71,7 +84,7 @@ func (c *HTTPControlPlane) DeleteUserRefreshTokens(ctx context.Context, userID i
 }
 
 func (c *HTTPControlPlane) DeleteTokenFamily(ctx context.Context, familyID string) error {
-	if !isLowerSHA256Hex(familyID) {
+	if !isAuthSessionFamilyID(familyID) {
 		return service.ErrRefreshTokenInvalid
 	}
 	return mapAuthSessionError(c.post(ctx, "/v1/auth-sessions/revoke-family", map[string]string{"family_id": familyID}, nil))
@@ -99,7 +112,7 @@ func (c *HTTPControlPlane) GetUserTokenHashes(ctx context.Context, userID int64)
 }
 
 func (c *HTTPControlPlane) GetFamilyTokenHashes(ctx context.Context, familyID string) ([]string, error) {
-	if !isLowerSHA256Hex(familyID) {
+	if !isAuthSessionFamilyID(familyID) {
 		return nil, service.ErrRefreshTokenInvalid
 	}
 	var out struct {
@@ -112,7 +125,7 @@ func (c *HTTPControlPlane) GetFamilyTokenHashes(ctx context.Context, familyID st
 }
 
 func (c *HTTPControlPlane) IsTokenInFamily(ctx context.Context, familyID string, tokenHash string) (bool, error) {
-	if !isLowerSHA256Hex(familyID) || !isLowerSHA256Hex(tokenHash) {
+	if !isAuthSessionFamilyID(familyID) || !isLowerSHA256Hex(tokenHash) {
 		return false, service.ErrRefreshTokenInvalid
 	}
 	var out struct {
@@ -132,22 +145,30 @@ func (c *HTTPControlPlane) RotateRefreshToken(ctx context.Context, oldHash, newH
 	if err != nil {
 		return err
 	}
-	return mapAuthSessionError(c.post(ctx, "/v1/auth-sessions/rotate", struct {
-		OldTokenHash string          `json:"old_token_hash"`
-		NewSession   authSessionWire `json:"new_session"`
-	}{OldTokenHash: oldHash, NewSession: wire}, nil))
+	return mapAuthSessionError(c.post(ctx, "/v1/auth-sessions/rotate", authSessionRotateWire{
+		OldTokenHash: oldHash,
+		TokenHash:    wire.TokenHash,
+		UserID:       wire.UserID,
+		TokenVersion: wire.TokenVersion,
+		FamilyID:     wire.FamilyID,
+		BindingHash:  wire.BindingHash,
+		CreatedAt:    wire.CreatedAt,
+		ExpiresAt:    wire.ExpiresAt,
+	}, nil))
 }
 
 func encodeAuthSession(tokenHash string, data *service.RefreshTokenData) (authSessionWire, error) {
 	if data == nil {
 		return authSessionWire{}, errors.New("refresh token data is required")
 	}
+	createdAt := data.CreatedAt.UTC().Truncate(time.Millisecond)
+	expiresAt := data.ExpiresAt.UTC().Truncate(time.Millisecond)
 	if !isLowerSHA256Hex(tokenHash) ||
 		data.UserID < 1 ||
 		data.TokenVersion < 0 ||
-		!isLowerSHA256Hex(data.FamilyID) ||
+		!isAuthSessionFamilyID(data.FamilyID) ||
 		!isAuthSessionBindingHash(data.BindingHash) ||
-		data.CreatedAt.IsZero() || data.ExpiresAt.IsZero() || !data.ExpiresAt.After(data.CreatedAt) {
+		createdAt.IsZero() || expiresAt.IsZero() || !expiresAt.After(createdAt) {
 		return authSessionWire{}, service.ErrRefreshTokenInvalid
 	}
 	return authSessionWire{
@@ -156,8 +177,8 @@ func encodeAuthSession(tokenHash string, data *service.RefreshTokenData) (authSe
 		TokenVersion: strconv.FormatInt(data.TokenVersion, 10),
 		FamilyID:     data.FamilyID,
 		BindingHash:  data.BindingHash,
-		CreatedAt:    data.CreatedAt.UTC().Format(time.RFC3339Nano),
-		ExpiresAt:    data.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		CreatedAt:    createdAt.Format(authSessionTimestampLayout),
+		ExpiresAt:    expiresAt.Format(authSessionTimestampLayout),
 	}, nil
 }
 
@@ -183,7 +204,7 @@ func decodeAuthSession(expectedHash string, wire authSessionWire) (*service.Refr
 	}
 	if wire.TokenHash != expectedHash ||
 		!isLowerSHA256Hex(wire.TokenHash) ||
-		!isLowerSHA256Hex(wire.FamilyID) ||
+		!isAuthSessionFamilyID(wire.FamilyID) ||
 		!isAuthSessionBindingHash(wire.BindingHash) ||
 		!expiresAt.After(createdAt) {
 		return nil, errors.New("invalid auth session response")
@@ -223,13 +244,13 @@ func mapAuthSessionError(err error) error {
 		return err
 	}
 	switch responseErr.Code {
-	case "REFRESH_TOKEN_NOT_FOUND":
+	case "AUTH_SESSION_NOT_FOUND":
 		return service.ErrRefreshTokenNotFound
-	case "REFRESH_TOKEN_EXPIRED":
+	case "AUTH_SESSION_EXPIRED":
 		return service.ErrRefreshTokenExpired
-	case "SESSION_REVOKED":
+	case "AUTH_SESSION_REVOKED":
 		return service.ErrTokenRevoked
-	case "REFRESH_TOKEN_REUSED", "REFRESH_TOKEN_CONFLICT":
+	case "AUTH_SESSION_REUSE", "AUTH_SESSION_CONFLICT":
 		return service.ErrRefreshTokenReused
 	case "AUTH_SESSION_UNAVAILABLE", "INVALID_REQUEST", "INTERNAL_ERROR":
 		return ErrControlPlaneUnavailable
@@ -239,16 +260,14 @@ func mapAuthSessionError(err error) error {
 }
 
 func requiredAuthSessionUTCTime(label, raw string) (time.Time, error) {
-	trimmed := strings.TrimSpace(raw)
-	parsed, err := time.Parse(time.RFC3339Nano, trimmed)
-	if err != nil || !strings.HasSuffix(trimmed, "Z") || parsed.Format(time.RFC3339Nano) != trimmed {
+	parsed, err := time.Parse(authSessionTimestampLayout, raw)
+	if err != nil || parsed.Format(authSessionTimestampLayout) != raw {
 		return time.Time{}, fmt.Errorf("invalid %s", label)
 	}
 	return parsed, nil
 }
 
 func parseCanonicalInt64(label, raw string) (int64, error) {
-	raw = strings.TrimSpace(raw)
 	if !isCanonicalInt64Decimal(raw) {
 		return 0, fmt.Errorf("invalid %s", label)
 	}
@@ -260,7 +279,6 @@ func parseCanonicalInt64(label, raw string) (int64, error) {
 }
 
 func isCanonicalInt64Decimal(value string) bool {
-	value = strings.TrimSpace(value)
 	if value == "" {
 		return false
 	}
@@ -287,6 +305,10 @@ func isLowerSHA256Hex(value string) bool {
 
 func isAuthSessionBindingHash(value string) bool {
 	return value == "" || lowerSessionBindingHashRegex.MatchString(value)
+}
+
+func isAuthSessionFamilyID(value string) bool {
+	return authSessionFamilyIDPattern.MatchString(value)
 }
 
 var _ service.RefreshTokenCache = (*HTTPControlPlane)(nil)

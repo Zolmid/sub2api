@@ -21,10 +21,12 @@ import (
 func TestHTTPControlPlaneAuthSessionsUseFixedContract(t *testing.T) {
 	tokenHash := strings.Repeat("a", 64)
 	newHash := strings.Repeat("b", 64)
-	familyID := strings.Repeat("c", 64)
+	familyID := "family.auth_01:test"
 	bindingHash := strings.Repeat("d", 32)
-	createdAt := time.Date(2026, 9, 10, 1, 2, 3, 456789, time.UTC)
+	createdAt := time.Date(2026, 9, 10, 1, 2, 3, 456789000, time.UTC)
 	expiresAt := createdAt.Add(30 * 24 * time.Hour)
+	wireCreatedAt := createdAt.Truncate(time.Millisecond)
+	wireExpiresAt := expiresAt.Truncate(time.Millisecond)
 	session := &service.RefreshTokenData{
 		UserID:       9007199254740993,
 		TokenVersion: 9223372036854775807,
@@ -52,7 +54,7 @@ func TestHTTPControlPlaneAuthSessionsUseFixedContract(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"session": map[string]string{
 				"token_hash": tokenHash, "user_id": "9007199254740993", "token_version": "9223372036854775807",
 				"family_id": familyID, "binding_hash": bindingHash,
-				"created_at": createdAt.Format(time.RFC3339Nano), "expires_at": expiresAt.Format(time.RFC3339Nano),
+				"created_at": wireCreatedAt.Format(authSessionTimestampLayout), "expires_at": wireExpiresAt.Format(authSessionTimestampLayout),
 			}})
 		case "/v1/auth-sessions/list-user", "/v1/auth-sessions/list-family":
 			_ = json.NewEncoder(w).Encode(map[string]any{"token_hashes": []string{tokenHash, newHash}})
@@ -73,8 +75,8 @@ func TestHTTPControlPlaneAuthSessionsUseFixedContract(t *testing.T) {
 	require.Equal(t, int64(9223372036854775807), got.TokenVersion)
 	require.Equal(t, familyID, got.FamilyID)
 	require.Equal(t, bindingHash, got.BindingHash)
-	require.Equal(t, createdAt, got.CreatedAt)
-	require.Equal(t, expiresAt, got.ExpiresAt)
+	require.Equal(t, wireCreatedAt, got.CreatedAt)
+	require.Equal(t, wireExpiresAt, got.ExpiresAt)
 	require.NoError(t, control.DeleteRefreshToken(context.Background(), tokenHash))
 	require.NoError(t, control.DeleteUserRefreshTokens(context.Background(), 9007199254740993))
 	require.NoError(t, control.DeleteTokenFamily(context.Background(), familyID))
@@ -97,8 +99,8 @@ func TestHTTPControlPlaneAuthSessionsUseFixedContract(t *testing.T) {
 		"token_version":"9223372036854775807",
 		"family_id":"`+familyID+`",
 		"binding_hash":"`+bindingHash+`",
-		"created_at":"`+createdAt.Format(time.RFC3339Nano)+`",
-		"expires_at":"`+expiresAt.Format(time.RFC3339Nano)+`"
+		"created_at":"`+wireCreatedAt.Format(authSessionTimestampLayout)+`",
+		"expires_at":"`+wireExpiresAt.Format(authSessionTimestampLayout)+`"
 	}`, observed[0].Body)
 	require.Equal(t, "/v1/auth-sessions/get", observed[1].Path)
 	require.JSONEq(t, `{"token_hash":"`+tokenHash+`"}`, observed[1].Body)
@@ -113,32 +115,35 @@ func TestHTTPControlPlaneAuthSessionsUseFixedContract(t *testing.T) {
 	require.Equal(t, "/v1/auth-sessions/contains", observed[7].Path)
 	require.JSONEq(t, `{"family_id":"`+familyID+`","token_hash":"`+tokenHash+`"}`, observed[7].Body)
 	require.Equal(t, "/v1/auth-sessions/rotate", observed[8].Path)
-	require.JSONEq(t, `{"old_token_hash":"`+tokenHash+`","new_session":{
+	require.JSONEq(t, `{"old_token_hash":"`+tokenHash+`",
 		"token_hash":"`+newHash+`",
 		"user_id":"9007199254740993",
 		"token_version":"9223372036854775807",
 		"family_id":"`+familyID+`",
 		"binding_hash":"`+bindingHash+`",
-		"created_at":"`+createdAt.Format(time.RFC3339Nano)+`",
-		"expires_at":"`+expiresAt.Format(time.RFC3339Nano)+`"
-	}}`, observed[8].Body)
+		"created_at":"`+wireCreatedAt.Format(authSessionTimestampLayout)+`",
+		"expires_at":"`+wireExpiresAt.Format(authSessionTimestampLayout)+`"
+	}`, observed[8].Body)
 }
 
 func TestHTTPControlPlaneAuthSessionsRejectMalformedResponses(t *testing.T) {
 	tokenHash := strings.Repeat("a", 64)
-	familyID := strings.Repeat("c", 64)
+	familyID := "family.response_01:test"
 	bindingHash := strings.Repeat("d", 32)
 	createdAt := time.Date(2026, 9, 10, 1, 2, 3, 0, time.UTC)
 	expiresAt := createdAt.Add(time.Hour)
 	tests := map[string]string{
-		"numeric token version": `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":9223372036854775807,"family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"unsafe id as number":   `{"session":{"token_hash":"` + tokenHash + `","user_id":9007199254740993,"token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"negative version":      `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"-1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"full binding hash":     `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + strings.Repeat("d", 64) + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"offset time":           `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"2026-09-10T09:02:03+08:00","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"mismatched hash":       `{"session":{"token_hash":"` + strings.Repeat("e", 64) + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}}`,
-		"unknown field":         `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `","extra":true}}`,
-		"trailing json":         `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(time.RFC3339Nano) + `","expires_at":"` + expiresAt.Format(time.RFC3339Nano) + `"}} {}`,
+		"numeric token version": `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":9223372036854775807,"family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"unsafe id as number":   `{"session":{"token_hash":"` + tokenHash + `","user_id":9007199254740993,"token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"negative version":      `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"-1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"padded token version":  `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":" 1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"full binding hash":     `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + strings.Repeat("d", 64) + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"invalid family":        `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"bad family","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"missing milliseconds":  `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"2026-09-10T01:02:03Z","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"offset time":           `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"2026-09-10T09:02:03+08:00","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"mismatched hash":       `{"session":{"token_hash":"` + strings.Repeat("e", 64) + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}}`,
+		"unknown field":         `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `","extra":true}}`,
+		"trailing json":         `{"session":{"token_hash":"` + tokenHash + `","user_id":"9007199254740993","token_version":"1","family_id":"` + familyID + `","binding_hash":"` + bindingHash + `","created_at":"` + createdAt.Format(authSessionTimestampLayout) + `","expires_at":"` + expiresAt.Format(authSessionTimestampLayout) + `"}} {}`,
 		"bad list":              `{"token_hashes":["` + tokenHash + `","` + tokenHash + `"]}`,
 		"bad contains":          `{"contains":true,"extra":true}`,
 	}
@@ -166,7 +171,7 @@ func TestHTTPControlPlaneAuthSessionsRejectMalformedResponses(t *testing.T) {
 
 func TestAuthSessionWireAcceptsZeroTokenVersionAndEmptyBinding(t *testing.T) {
 	tokenHash := strings.Repeat("a", 64)
-	familyID := strings.Repeat("c", 64)
+	familyID := "family.zero_01:test"
 	createdAt := time.Date(2026, 9, 10, 1, 2, 3, 0, time.UTC)
 	expiresAt := createdAt.Add(time.Hour)
 	session := &service.RefreshTokenData{
@@ -189,6 +194,12 @@ func TestAuthSessionWireAcceptsZeroTokenVersionAndEmptyBinding(t *testing.T) {
 	session.BindingHash = strings.Repeat("d", 64)
 	_, err = encodeAuthSession(tokenHash, session)
 	require.ErrorIs(t, err, service.ErrRefreshTokenInvalid)
+	session.BindingHash = ""
+	for _, familyID := range []string{"", "bad family", strings.Repeat("a", 129)} {
+		session.FamilyID = familyID
+		_, err = encodeAuthSession(tokenHash, session)
+		require.ErrorIs(t, err, service.ErrRefreshTokenInvalid)
+	}
 }
 
 func TestHTTPControlPlaneAuthSessionListsAreNotTruncated(t *testing.T) {
@@ -207,7 +218,7 @@ func TestHTTPControlPlaneAuthSessionListsAreNotTruncated(t *testing.T) {
 	got, err := control.GetUserTokenHashes(context.Background(), 1)
 	require.NoError(t, err)
 	require.Equal(t, tokenHashes, got)
-	got, err = control.GetFamilyTokenHashes(context.Background(), strings.Repeat("a", 64))
+	got, err = control.GetFamilyTokenHashes(context.Background(), "family.large_01:test")
 	require.NoError(t, err)
 	require.Equal(t, tokenHashes, got)
 }
@@ -217,11 +228,11 @@ func TestHTTPControlPlaneAuthSessionErrorMappingsAreBounded(t *testing.T) {
 		code string
 		want error
 	}{
-		{"REFRESH_TOKEN_NOT_FOUND", service.ErrRefreshTokenNotFound},
-		{"REFRESH_TOKEN_EXPIRED", service.ErrRefreshTokenExpired},
-		{"SESSION_REVOKED", service.ErrTokenRevoked},
-		{"REFRESH_TOKEN_REUSED", service.ErrRefreshTokenReused},
-		{"REFRESH_TOKEN_CONFLICT", service.ErrRefreshTokenReused},
+		{"AUTH_SESSION_NOT_FOUND", service.ErrRefreshTokenNotFound},
+		{"AUTH_SESSION_EXPIRED", service.ErrRefreshTokenExpired},
+		{"AUTH_SESSION_REVOKED", service.ErrTokenRevoked},
+		{"AUTH_SESSION_REUSE", service.ErrRefreshTokenReused},
+		{"AUTH_SESSION_CONFLICT", service.ErrRefreshTokenReused},
 		{"AUTH_SESSION_UNAVAILABLE", ErrControlPlaneUnavailable},
 		{"INVALID_REQUEST", ErrControlPlaneUnavailable},
 		{"INTERNAL_ERROR", ErrControlPlaneUnavailable},

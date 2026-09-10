@@ -1035,7 +1035,7 @@ func (s *AuthService) touchUserLogin(ctx context.Context, userID int64) {
 	if s == nil || s.entClient == nil || userID <= 0 {
 		return
 	}
-	now := time.Now().UTC()
+	now := time.Now()
 	if err := s.entClient.User.UpdateOneID(userID).
 		SetLastLoginAt(now).
 		SetLastActiveAt(now).
@@ -1837,6 +1837,7 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 	}
 
 	tokenHash := hashToken(refreshToken)
+	rotator, hasAtomicRotator := s.refreshTokenCache.(RefreshTokenRotator)
 
 	// 获取Token数据
 	data, err := s.refreshTokenCache.GetRefreshToken(ctx, tokenHash)
@@ -1844,7 +1845,24 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 		if errors.Is(err, ErrRefreshTokenNotFound) {
 			// Token不存在，可能是已被使用（Token轮转）或已过期
 			logger.LegacyPrintf("service.auth", "[Auth] Refresh token not found, possible reuse attack")
-			return nil, ErrRefreshTokenReused
+			if hasAtomicRotator {
+				return nil, ErrRefreshTokenReused
+			}
+			// Preserve the legacy Redis-backed contract, where an absent token
+			// cannot be distinguished from an invalid or expired token.
+			return nil, ErrRefreshTokenInvalid
+		}
+		if hasAtomicRotator {
+			switch {
+			case errors.Is(err, ErrRefreshTokenReused):
+				return nil, ErrRefreshTokenReused
+			case errors.Is(err, ErrRefreshTokenExpired):
+				return nil, ErrRefreshTokenExpired
+			case errors.Is(err, ErrTokenRevoked):
+				return nil, ErrTokenRevoked
+			case errors.Is(err, ErrRefreshTokenInvalid):
+				return nil, ErrRefreshTokenInvalid
+			}
 		}
 		logger.LegacyPrintf("service.auth", "[Auth] Error getting refresh token: %v", err)
 		return nil, ErrServiceUnavailable
@@ -1893,7 +1911,7 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 		}
 	}
 
-	if rotator, ok := s.refreshTokenCache.(RefreshTokenRotator); ok {
+	if hasAtomicRotator {
 		newRefresh, err := s.prepareRefreshToken(ctx, user, data.FamilyID)
 		if err != nil {
 			return nil, err

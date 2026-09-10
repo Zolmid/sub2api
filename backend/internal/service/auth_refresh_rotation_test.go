@@ -18,6 +18,7 @@ type atomicRefreshTokenCacheStub struct {
 	rotations         int
 	rotatedOldVersion int64
 	rotatedNewVersion int64
+	getErr            error
 }
 
 func newAtomicRefreshTokenCacheStub() *atomicRefreshTokenCacheStub {
@@ -35,12 +36,50 @@ func (s *atomicRefreshTokenCacheStub) StoreRefreshToken(_ context.Context, token
 func (s *atomicRefreshTokenCacheStub) GetRefreshToken(_ context.Context, tokenHash string) (*RefreshTokenData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	data := s.sessions[tokenHash]
 	if data == nil {
 		return nil, ErrRefreshTokenNotFound
 	}
 	copy := *data
 	return &copy, nil
+}
+
+func TestAuthServiceRefreshTokenPairPreservesLegacyMissingTokenContract(t *testing.T) {
+	svc := NewAuthService(nil, nil, nil, &refreshTokenCacheStub{}, &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret", ExpireHour: 1, AccessTokenExpireMinutes: 15, RefreshTokenExpireDays: 30},
+	}, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	_, err := svc.RefreshTokenPair(context.Background(), refreshTokenPrefix+"missing")
+	require.ErrorIs(t, err, ErrRefreshTokenInvalid)
+}
+
+func TestAuthServiceRefreshTokenPairMapsAtomicLookupOutcomes(t *testing.T) {
+	tests := []struct {
+		name string
+		got  error
+		want error
+	}{
+		{name: "not found is reuse", got: ErrRefreshTokenNotFound, want: ErrRefreshTokenReused},
+		{name: "explicit reuse", got: ErrRefreshTokenReused, want: ErrRefreshTokenReused},
+		{name: "expired", got: ErrRefreshTokenExpired, want: ErrRefreshTokenExpired},
+		{name: "revoked", got: ErrTokenRevoked, want: ErrTokenRevoked},
+		{name: "invalid", got: ErrRefreshTokenInvalid, want: ErrRefreshTokenInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := newAtomicRefreshTokenCacheStub()
+			cache.getErr = tt.got
+			svc := NewAuthService(nil, nil, nil, cache, &config.Config{
+				JWT: config.JWTConfig{Secret: "test-secret", ExpireHour: 1, AccessTokenExpireMinutes: 15, RefreshTokenExpireDays: 30},
+			}, nil, nil, nil, nil, nil, nil, nil, nil)
+
+			_, err := svc.RefreshTokenPair(context.Background(), refreshTokenPrefix+"lookup")
+			require.ErrorIs(t, err, tt.want)
+		})
+	}
 }
 
 func (s *atomicRefreshTokenCacheStub) DeleteRefreshToken(_ context.Context, tokenHash string) error {

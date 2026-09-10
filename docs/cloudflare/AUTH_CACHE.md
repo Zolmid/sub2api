@@ -1,8 +1,8 @@
 # Authentication Cache Runtime
 
-`deploy/cloudflare/src/auth-cache-runtime.ts` is a D1-authoritative foundation for a
-future Worker auth integration. It is not wired into the shared Worker entry
-points yet and this document does not describe a production deployment.
+`deploy/cloudflare/src/auth-cache-runtime.ts` is the D1-authoritative
+entitlement/revision gate for the private Worker `POST /v1/auth/resolve` path.
+It does not add a public endpoint or describe a production deployment.
 
 The runtime accepts a presented credential only long enough to compute a
 SHA-256 digest. Raw credentials are never stored in L1 cache, migration rows,
@@ -27,6 +27,15 @@ The runtime hashes the probe-shaped part of the full row and compares it with
 the initial probe fingerprint. A mismatch causes a bounded re-probe and retry,
 so a mutation between probe and full load cannot authorize stale state. Cache
 hits are also rechecked against a fresh probe before authorization.
+
+The control plane passes the presented API key only to `resolve()` for this
+transient hash operation. On success it fetches the legacy Go response fields
+by the returned API-key ID, preserving the exact response shape. That D1 row
+must still match the authorization's credential digest and key/user/group IDs,
+key expiry, allowed groups, and public-group restriction, and it must
+independently pass the existing active/deleted/positive-balance checks. A
+changed or malformed row therefore fails closed rather than being authorized
+from a cached projection.
 
 ## Authorization Semantics
 
@@ -97,6 +106,9 @@ release, or publication authority decision reads the runtime clock once.
 
 ## Deployment Boundary
 
-This slice adds schema, runtime code, tests, and documentation only. It does
-not modify shared Worker entry points, generated types, Wrangler config,
-Cloudflare resources, Worker secrets, or upstream network calls.
+The runtime is held only in an isolate-local `WeakMap` keyed by the D1 binding.
+It is an optimization, never cross-isolate authority: each resolve, including a
+warm L1 hit, performs the minimal D1 revision probe. The auth-cache outbox is
+not consumed by this live path and remains pending for a real cross-isolate
+delivery consumer. Clearing one isolate's L1 never marks an outbox row
+published.

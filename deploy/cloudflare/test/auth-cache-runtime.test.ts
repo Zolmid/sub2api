@@ -193,6 +193,27 @@ describe("auth cache runtime", () => {
     expect(y.r.diagnosticMinimalProbeCount).toBe(2);
   });
 
+  it("keeps independent isolate-local caches subordinate to D1 revisions", async () => {
+    const first = runtime();
+    const second = runtime();
+    await expect(first.r.resolve({ credential: fixtureKey })).resolves.toMatchObject({ ok: true });
+    await expect(second.r.resolve({ credential: fixtureKey })).resolves.toMatchObject({ ok: true });
+
+    await db.prepare("UPDATE groups SET status='disabled', updated_at=? WHERE id='2001'")
+      .bind(at)
+      .run();
+    await expect(first.r.resolve({ credential: fixtureKey })).resolves.toEqual({
+      ok: false,
+      code: "AUTH_NOT_FOUND",
+    });
+    await expect(second.r.resolve({ credential: fixtureKey })).resolves.toEqual({
+      ok: false,
+      code: "AUTH_NOT_FOUND",
+    });
+    expect(first.r.diagnosticMinimalProbeCount).toBeGreaterThan(1);
+    expect(second.r.diagnosticMinimalProbeCount).toBeGreaterThan(1);
+  });
+
   it("preserves standard public, restricted, exclusive, and subscription semantics", async () => {
     const { r } = runtime();
 

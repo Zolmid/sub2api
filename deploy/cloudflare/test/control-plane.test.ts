@@ -209,18 +209,20 @@ describe("D1-backed private control plane", () => {
   it("resolves only active users and never stores the raw API key", async () => {
     const response = await call("/v1/auth/resolve", { key: "fixture-test-key" });
     expect(response.status).toBe(200);
-    const body = await response.json<{
-      api_key: { id: string; user_id: string; group_id: string };
-      user: { id: string; balance_positive: boolean };
-      group: { id: string };
-    }>();
-    expect(body.api_key).toMatchObject({
-      id: "3001",
-      user_id: "1001",
-      group_id: "2001",
+    expect(await response.json()).toEqual({
+      api_key: {
+        id: "3001", user_id: "1001", name: "fixture active", status: "active", group_id: "2001",
+        ip_whitelist: [], ip_blacklist: [], expires_at: null,
+      },
+      user: {
+        id: "1001", status: "active", role: "user", concurrency: 1, balance_positive: true,
+        allowed_group_ids: ["2001"], restrict_public_groups: false,
+      },
+      group: {
+        id: "2001", name: "fixture-group", platform: "openai", status: "active",
+        is_exclusive: false, subscription_type: "standard",
+      },
     });
-    expect(body.user).toMatchObject({ id: "1001", balance_positive: true });
-    expect(body.group.id).toBe("2001");
 
     const stored = await env.DB.prepare(
       "SELECT key_hash FROM api_keys WHERE id='3001'",
@@ -232,6 +234,60 @@ describe("D1-backed private control plane", () => {
       (await call("/v1/auth/resolve", { key: "fixture-disabled-key" })).status,
     ).toBe(404);
     expect((await call("/v1/auth/resolve", { key: "unknown" })).status).toBe(404);
+  });
+
+  it("linearizes warm resolves through D1 for standard, exclusive, and subscription groups", async () => {
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET allowed_group_ids_json='[]', restrict_public_groups=1 WHERE id='1001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+
+    await env.DB.prepare("UPDATE users SET allowed_group_ids_json='[\"2001\"]' WHERE id='1001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(200);
+    await env.DB.prepare("UPDATE groups SET is_exclusive=1 WHERE id='2001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(200);
+    await env.DB.prepare("UPDATE users SET allowed_group_ids_json='[]' WHERE id='1001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+
+    await env.DB.batch([
+      env.DB.prepare("UPDATE groups SET is_exclusive=0, subscription_type='subscription' WHERE id='2001'"),
+      env.DB.prepare("UPDATE users SET allowed_group_ids_json='[\"2001\"]', restrict_public_groups=0 WHERE id='1001'"),
+    ]);
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+    await env.DB.prepare(
+      `INSERT INTO user_subscriptions(id,user_id,group_id,starts_at,expires_at,status,assigned_at,created_at,updated_at,deleted_at)
+       VALUES('9001','1001','2001','2026-01-01T00:00:00.000Z','2028-01-01T00:00:00.000Z','active','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z',NULL)`,
+    ).run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(200);
+    await env.DB.prepare("UPDATE user_subscriptions SET status='suspended', version=version+1 WHERE id='9001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+    await env.DB.prepare("UPDATE user_subscriptions SET status='active', expires_at='2026-01-02T00:00:00.000Z', version=version+1 WHERE id='9001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+    await env.DB.prepare("UPDATE user_subscriptions SET expires_at='2028-01-01T00:00:00.000Z', deleted_at='2026-09-06T00:00:00.000Z', version=version+1 WHERE id='9001'").run();
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+  });
+
+  it.each([
+    ["rotated API key", "UPDATE api_keys SET key_hash='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' WHERE id='3001'"],
+    ["revoked API key", "UPDATE api_keys SET status='disabled' WHERE id='3001'"],
+    ["disabled user", "UPDATE users SET status='disabled' WHERE id='1001'"],
+    ["deleted user", "UPDATE users SET deleted_at='2026-09-06T00:00:00.000Z' WHERE id='1001'"],
+    ["disabled group", "UPDATE groups SET status='disabled' WHERE id='2001'"],
+    ["deleted group", "UPDATE groups SET deleted_at='2026-09-06T00:00:00.000Z' WHERE id='2001'"],
+  ])("fails closed on a warm cache after %s", async (_label, mutation) => {
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(200);
+    await env.DB.exec(mutation);
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
+  });
+
+  it("does not authorize malformed auth-cache rows or D1 storage failures", async () => {
+    const unavailable = overrideEnv({
+      DB: { prepare: () => { throw new Error("injected D1 failure"); } } as unknown as D1Database,
+    });
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" }, unavailable)).status).toBe(503);
+    const malformed = overrideEnv({
+      DB: { prepare: () => ({ bind: () => ({ first: async () => ({ credential_digest: "not-a-digest" }) }) }) } as unknown as D1Database,
+    });
+    expect((await call("/v1/auth/resolve", { key: "fixture-test-key" }, malformed)).status).toBe(503);
   });
 
   it("keeps API-key last-used metadata monotonic", async () => {
@@ -423,7 +479,7 @@ describe("D1-backed private control plane", () => {
     const fallback = await admit("request-priority-deleted");
     expect(fallback.account.id).toBe("4001");
     await release(fallback);
-    await env.DB.prepare("UPDATE api_keys SET deleted_at='now' WHERE id='3001'").run();
+    await env.DB.prepare("UPDATE api_keys SET deleted_at='2026-09-06T00:00:00.000Z' WHERE id='3001'").run();
     expect((await call("/v1/auth/resolve", { key: "fixture-test-key" })).status).toBe(404);
   });
 

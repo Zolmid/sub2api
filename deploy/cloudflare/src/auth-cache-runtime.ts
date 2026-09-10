@@ -10,6 +10,7 @@ const BAD_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-
 const MAX_ATTEMPTS = 32;
 
 export type AuthCacheAuthorization = Readonly<{
+  credential_digest: string;
   api_key_id: string;
   user_id: string;
   group_id: string;
@@ -827,6 +828,7 @@ export class AuthCacheRuntime {
       ok: true,
       code: "OK",
       authorization: {
+        credential_digest: proof.credential_digest,
         api_key_id: proof.key_id,
         user_id: proof.user_id,
         group_id: proof.group_id,

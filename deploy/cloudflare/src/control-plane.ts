@@ -44,12 +44,30 @@ import {
   readJson,
   sha256,
 } from "./contracts";
+import {
+  AuthCacheRuntime,
+  type AuthCacheAuthorization,
+} from "./auth-cache-runtime";
 
 const PUBLISH_TIMEOUT_MS = 2_000;
 const MAX_OUTBOX_ATTEMPTS = 10;
 const OUTBOX_DRAIN_LIMIT = 25;
 const ADMISSION_RECOVERY_LIMIT = 25;
 const ADMISSION_RECOVERY_AGE_MS = 15 * 60_000;
+
+// Worker globals are isolate-local only. Bind a cache runtime to the current
+// D1 binding so tests and future isolate instances never share authority or
+// request data; AuthCacheRuntime itself probes D1 before every cache hit.
+const authCacheRuntimes = new WeakMap<D1Database, AuthCacheRuntime>();
+
+function authCacheRuntime(db: D1Database): AuthCacheRuntime {
+  let runtime = authCacheRuntimes.get(db);
+  if (!runtime) {
+    runtime = new AuthCacheRuntime(db);
+    authCacheRuntimes.set(db, runtime);
+  }
+  return runtime;
+}
 
 type RuntimeEnv = Omit<
   Env,
@@ -66,6 +84,7 @@ type Alias = {
 };
 
 type AuthRow = {
+  key_hash: string;
   key_id: string;
   key_user_id: string;
   group_id: string | null;
@@ -229,6 +248,7 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
 async function fetchAuthRowByHash(hash: string, env: Env): Promise<AuthRow | null> {
   return env.DB.prepare(
     `SELECT
+       k.key_hash,
        k.id key_id,
        k.user_id key_user_id,
        k.group_id,
@@ -262,6 +282,7 @@ async function fetchAuthRowByHash(hash: string, env: Env): Promise<AuthRow | nul
 async function fetchAuthRowByID(keyID: string, env: Env): Promise<AuthRow | null> {
   return env.DB.prepare(
     `SELECT
+       k.key_hash,
        k.id key_id,
        k.user_id key_user_id,
        k.group_id,
@@ -346,19 +367,59 @@ function permittedAuth(
   );
 }
 
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function matchesResolvedAuthorization(
+  row: AuthRow,
+  authorization: AuthCacheAuthorization,
+  allowedGroups: readonly string[],
+): boolean {
+  return (
+    row.key_hash === authorization.credential_digest &&
+    row.key_id === authorization.api_key_id &&
+    row.key_user_id === authorization.user_id &&
+    row.user_id === authorization.user_id &&
+    row.group_id === authorization.group_id &&
+    row.expires_at === authorization.expires_at &&
+    sameStringList(allowedGroups, authorization.allowed_group_ids) &&
+    (row.restrict_public_groups === 1) === authorization.restrict_public_groups
+  );
+}
+
 async function resolveAPIKey(request: Request, env: Env): Promise<Response> {
   const body = await readJson<{ key?: unknown }>(request);
   if (!body || !isBoundedString(body.key, 8_192)) {
     return error("API_KEY_NOT_FOUND", 404);
   }
 
-  const row = await fetchAuthRowByHash(await sha256(body.key), env);
+  // The runtime receives the raw key only to hash it transiently. Its minimal
+  // D1 probe is the entitlement/revision linearization point; no raw key is
+  // stored, logged, or used as a cache key here.
+  const resolution = await authCacheRuntime(env.DB).resolve({ credential: body.key });
+  if (!resolution.ok) {
+    return resolution.code === "AUTH_UNAVAILABLE"
+      ? error("CONTROL_PLANE_UNAVAILABLE", 503)
+      : error("API_KEY_NOT_FOUND", 404);
+  }
+
+  // Fetch response-only fields by the authorized ID, then reject a changed
+  // identity, entitlement snapshot, status, expiry, or balance. This keeps
+  // the Go-facing payload intact without authorizing from a stale projection.
+  const row = await fetchAuthRowByID(resolution.authorization.api_key_id, env);
   if (!row || !permittedAuth(row)) return error("API_KEY_NOT_FOUND", 404);
 
   const whitelist = parseStringArray(row.ip_whitelist_json);
   const blacklist = parseStringArray(row.ip_blacklist_json);
   const allowedGroups = parseStringArray(row.allowed_group_ids_json, true);
-  if (!whitelist || !blacklist || !allowedGroups || row.group_id === null) {
+  if (
+    !whitelist ||
+    !blacklist ||
+    !allowedGroups ||
+    row.group_id === null ||
+    !matchesResolvedAuthorization(row, resolution.authorization, allowedGroups)
+  ) {
     return error("API_KEY_NOT_FOUND", 404);
   }
 

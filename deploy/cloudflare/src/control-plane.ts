@@ -13,6 +13,10 @@ import {
 import type { SchedulerAccount } from "./scheduler-policy";
 import { isTOTPControlPath, totpControlPlane } from "./totp-control";
 import {
+  authSessionsControlPlane,
+  isAuthSessionsPath,
+} from "./auth-sessions";
+import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
   MAX_CONTROL_BODY_BYTES,
@@ -139,6 +143,9 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
   try {
     if (isTOTPControlPath(url.pathname)) {
       return await totpControlPlane(request, env, url.pathname);
+    }
+    if (isAuthSessionsPath(url.pathname)) {
+      return await authSessionsControlPlane(request, env, url.pathname);
     }
     switch (url.pathname) {
       case "/v1/auth/resolve":

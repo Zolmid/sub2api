@@ -46,6 +46,10 @@ async function resetFixture(): Promise<void> {
       DELETE FROM email_delivery_jobs;
       DELETE FROM email_challenges;
       DELETE FROM email_runtime_batch_guards;
+      DELETE FROM auth_session_rotation_witnesses;
+      DELETE FROM auth_session_audit_events;
+      DELETE FROM auth_session_family_revocations;
+      DELETE FROM auth_sessions;
       DELETE FROM payment_idempotency_witnesses;
       DELETE FROM payment_provider_event_dedup;
       DELETE FROM payment_ledger_transactions;

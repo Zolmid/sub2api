@@ -387,7 +387,10 @@ export class AccountLeaseDO extends DurableObject<Env> {
   }
 
   private async inspect(data: Record<string, unknown>): Promise<Response> {
-    if (!this.isValidAccount(data.account_id)) return error("INVALID_REQUEST");
+    if (
+      !this.isValidAccount(data.account_id) ||
+      (data.request_id !== undefined && !this.isValidOpaque(data.request_id))
+    ) return error("INVALID_REQUEST");
     const now = Date.now();
     const result = this.ctx.storage.transactionSync(() => {
       this.cleanup(now);
@@ -402,9 +405,16 @@ export class AccountLeaseDO extends DurableObject<Env> {
       const inFlight = this.ctx.storage.sql
         .exec<{ count: number }>("SELECT count(*) count FROM leases")
         .one().count;
+      const replayInFlight = typeof data.request_id === "string" && this.ctx.storage.sql
+        .exec<{ found: number }>(
+          "SELECT 1 found FROM leases WHERE request_id=?",
+          data.request_id,
+        )
+        .toArray()[0]?.found === 1;
       return {
         account_id: data.account_id,
         in_flight: inFlight,
+        replay_in_flight: replayInFlight,
         concurrency_evidence: "confirmed",
         observed_at_ms: now,
         health: this.observationWire(byKind.get("health_bps"), now),

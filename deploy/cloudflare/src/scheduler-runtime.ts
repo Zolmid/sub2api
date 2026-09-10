@@ -112,6 +112,7 @@ type DOEvidence = {
 type AccountInspect = {
   account_id: string;
   in_flight: number;
+  replay_in_flight: boolean;
   concurrency_evidence: "confirmed";
   observed_at_ms: number;
   health: DOEvidence;
@@ -309,13 +310,21 @@ function validDOEvidence(value: unknown): value is DOEvidence {
   );
 }
 
-async function inspectAccount(env: SchedulerRuntimeEnv, accountId: string): Promise<AccountInspect | null> {
-  const response = await post(accountStub(env, accountId), "/inspect", { account_id: accountId });
+async function inspectAccount(
+  env: SchedulerRuntimeEnv,
+  accountId: string,
+  requestId: string | undefined,
+): Promise<AccountInspect | null> {
+  const response = await post(accountStub(env, accountId), "/inspect", {
+    account_id: accountId,
+    ...(requestId === undefined ? {} : { request_id: requestId }),
+  });
   if (!response.ok) return null;
   const value = await responseRecord(response);
   if (
     !value || value.account_id !== accountId || !Number.isSafeInteger(value.in_flight) ||
-    Number(value.in_flight) < 0 || value.concurrency_evidence !== "confirmed" ||
+    Number(value.in_flight) < 0 || typeof value.replay_in_flight !== "boolean" ||
+    value.concurrency_evidence !== "confirmed" ||
     !isTimestamp(value.observed_at_ms) || !validDOEvidence(value.health) ||
     !validDOEvidence(value.cooldown) || !validDOEvidence(value.temporary_unschedulable)
   ) {
@@ -430,7 +439,7 @@ export async function buildSchedulerSnapshot(
     provenance: AccountSchedulerProvenance;
   }> => {
     const [live, accountRate] = await Promise.all([
-      inspectAccount(env, row.account_id),
+      inspectAccount(env, row.account_id, input.stickinessKey),
       loadLimit(env, "account", row.account_id, input.nowMs),
     ]);
     const capabilities = parseCapabilities(row.capabilities_json);
@@ -489,7 +498,12 @@ export async function buildSchedulerSnapshot(
       groups: confirmed([input.requiredGroup]),
       capabilities: capabilityEvidence,
       accountConcurrencyLimit: confirmed(row.max_concurrency),
-      accountConcurrencyInFlight: liveFresh ? confirmed(live!.in_flight) : unknown(),
+      // A retry can arrive after its lease is durable but before D1 billing is
+      // visible. Count that exact request's existing lease as reusable; its
+      // semantic identity is still enforced by the acquire/rate/billing steps.
+      accountConcurrencyInFlight: liveFresh
+        ? confirmed(Math.max(0, live!.in_flight - (live!.replay_in_flight ? 1 : 0)))
+        : unknown(),
       accountRpmLimit: accountRate.limit,
       accountRpmUsed: accountRate.used,
       userRpmLimit: userRate.limit,

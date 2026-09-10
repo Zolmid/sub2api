@@ -62,16 +62,24 @@ async function seedExpiredSubscriptions(count: number): Promise<void> {
 }
 
 describe("subscription expiry background job", () => {
-  it("deduplicates duplicate scheduled events into one durable job and outbox intent", async () => {
+  it("publishes one scheduled bucket immediately and deduplicates its duplicate", async () => {
     const controller = createScheduledController({
       scheduledTime: new Date(BUCKET),
       cron: "*/2 * * * *",
     });
-    for (let index = 0; index < 2; index += 1) {
-      const ctx = createExecutionContext();
-      await worker.scheduled(controller, env, ctx);
-      await waitOnExecutionContext(ctx);
-    }
+    const first = createExecutionContext();
+    await worker.scheduled(controller, env, first);
+    await waitOnExecutionContext(first);
+    expect(await db.prepare(`SELECT count(*) AS count FROM background_jobs
+      WHERE route=?`).bind(SUBSCRIPTION_EXPIRY_JOB_ROUTE).first<{ count: number }>()).toEqual({ count: 1 });
+    expect(await db.prepare(`SELECT count(*) AS count FROM background_job_outbox o
+      JOIN background_jobs j ON j.job_id=o.job_id
+      WHERE j.route=? AND o.state='published'`).bind(SUBSCRIPTION_EXPIRY_JOB_ROUTE)
+      .first<{ count: number }>()).toEqual({ count: 1 });
+
+    const duplicate = createExecutionContext();
+    await worker.scheduled(controller, env, duplicate);
+    await waitOnExecutionContext(duplicate);
     expect(await db.prepare(`SELECT count(*) AS count FROM background_jobs
       WHERE route=?`).bind(SUBSCRIPTION_EXPIRY_JOB_ROUTE).first<{ count: number }>()).toEqual({ count: 1 });
     expect(await db.prepare(`SELECT count(*) AS count FROM background_job_outbox o

@@ -465,12 +465,16 @@ const worker = {
     const expiryMaintenance = Number.isSafeInteger(controller.scheduledTime)
       ? enqueueSubscriptionExpiryMaintenance(env.DB, controller.scheduledTime)
       : Promise.resolve();
+    // The new deterministic intent must be durable before this invocation
+    // scans the job outbox, otherwise hashing can let the drain miss it.
+    const drainBackgroundJobs = expiryMaintenance.then(() =>
+      drainBackgroundJobOutbox(env)
+    );
     ctx.waitUntil(Promise.all([
       drainOutbox(env),
       recoverStaleAdmissions(env),
-      drainBackgroundJobOutbox(env),
+      drainBackgroundJobs,
       recoverExpiredBackgroundJobs(env.DB),
-      expiryMaintenance,
     ]).then(() => undefined));
   },
 };

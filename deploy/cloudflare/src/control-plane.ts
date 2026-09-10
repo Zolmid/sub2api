@@ -245,40 +245,6 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
   }
 }
 
-async function fetchAuthRowByHash(hash: string, env: Env): Promise<AuthRow | null> {
-  return env.DB.prepare(
-    `SELECT
-       k.key_hash,
-       k.id key_id,
-       k.user_id key_user_id,
-       k.group_id,
-       k.name key_name,
-       k.status key_status,
-       k.ip_whitelist_json,
-       k.ip_blacklist_json,
-       k.expires_at,
-       u.id user_id,
-       u.status user_status,
-       u.role,
-       u.concurrency,
-       u.balance_e8_usd,
-       u.allowed_group_ids_json,
-       u.restrict_public_groups,
-       g.name group_name,
-       g.platform,
-       g.status group_status,
-       g.is_exclusive,
-       g.subscription_type
-     FROM api_keys k
-     JOIN users u ON u.id=k.user_id
-     LEFT JOIN groups g ON g.id=k.group_id
-     WHERE k.key_hash=? AND k.deleted_at IS NULL AND u.deleted_at IS NULL
-       AND g.deleted_at IS NULL`,
-  )
-    .bind(hash)
-    .first<AuthRow>();
-}
-
 async function fetchAuthRowByID(keyID: string, env: Env): Promise<AuthRow | null> {
   return env.DB.prepare(
     `SELECT

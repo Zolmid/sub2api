@@ -32,14 +32,46 @@ are rejected before they can enter the canonical model. It does not claim lossle
 reasoning, citations, cache controls, structured-output schemas, audio/video,
 multi-candidate Gemini output, or non-text tool-result media.
 
+## Cloudflare bridge Gemini scope
+
+Cloudflare mode exposes only these exact native Gemini routes:
+
+| Route | Query contract | Client response |
+| --- | --- | --- |
+| `POST /v1beta/models/{model}:generateContent` | no query parameters | buffered Gemini JSON |
+| `POST /v1beta/models/{model}:streamGenerateContent` | exactly `alt=sse` | `text/event-stream` Gemini `data:` frames |
+
+The route validates the safe model path segment and strict Gemini body through
+the codec before Worker admission. It uses the existing API-key middleware,
+Worker admission/start/renew/complete/release lifecycle, Worker-supplied model
+mapping, cancellation propagation, upstream allowlist/redaction boundary, and
+confirmed-usage settlement. It uses the admitted OpenAI API-key Responses
+capability as the execution capability; because the Worker does not prefilter
+that capability yet, a mismatch releases the exact lease before an upstream
+attempt and never locally selects another account.
+
+The bridge adapts only the codec's representable text/function-declaration
+request subset to the existing OpenAI Responses vertical slice. It rejects
+Gemini media references, model function-call parts, stop sequences, and
+upstream function-call output rather than silently dropping unsupported
+semantics. The Responses upstream is requested as SSE even for Gemini
+`generateContent`, then buffered into one Gemini JSON response; missing usage
+remains unknown and is omitted, never converted to zero.
+
+Local unit/contract evidence covers route/query validation, API-key and
+admission rejection, mapped model dispatch, capability lease release,
+non-stream and SSE framing, unknown usage, cancellation, and redacted upstream
+failures. This is not composed Container/Worker evidence, a real upstream
+request, remote Cloudflare-resource verification, or production acceptance.
+
 ## Remaining integration matrix
 
 | Work item | Status | Acceptance needed |
 | --- | --- | --- |
-| Container HTTP route selection and request limits | not integrated | route tests for all four paths |
-| Upstream dispatch and streaming reader wiring | not integrated | real container integration tests with cancellation/backpressure |
-| Worker control-plane / usage ledger | not integrated | confirmed usage propagation and failure-state tests |
-| Auth, rate limits, model routing, observability | not integrated | gateway policy and redaction tests |
+| Gemini route selection, body limit middleware, and strict query/body validation | local unit coverage | composed Container routing acceptance |
+| Gemini Responses dispatch and stream-to-Gemini framing | local unit coverage | real upstream cancellation/backpressure acceptance |
+| Worker control-plane / usage ledger | bridge lifecycle unit coverage | composed Worker/Container confirmation and reconciliation evidence |
+| Auth, rate limits, model routing, observability | bridge API-key/admission/redaction unit coverage | gateway policy and remote observability acceptance |
 | Production deployment | not attempted | explicit deployment approval and live protocol acceptance |
 
 ## Cloudflare bridge embeddings scope

@@ -1104,6 +1104,223 @@ func TestCloudflareHandlerEmbeddingsLeaseLossCancelsUpstreamAndSettlesOnce(t *te
 	require.Zero(t, control.releaseCount)
 }
 
+func TestCloudflareGeminiGenerateContentUsesMappedResponsesLifecycle(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	upstream := &fakeHTTPUpstream{contentType: "text/event-stream", responseBody: openAIResponsesSSE("resp_gemini", "mock-upstream-model", "hello from responses", 7, 3)}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1beta/models/client-gemini:generateContent", "sk-cloudflare-unit-test", `{"systemInstruction":{"parts":[{"text":"be brief"}]},"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	require.Equal(t, "hello from responses", gjson.Get(res.Body.String(), "candidates.0.content.parts.0.text").String())
+	require.Equal(t, float64(7), gjson.Get(res.Body.String(), "usageMetadata.promptTokenCount").Float())
+	upstream.mu.Lock()
+	require.Equal(t, "https://mock.upstream/v1/responses", upstream.requestURL)
+	require.Equal(t, "mock-upstream-model", gjson.GetBytes(upstream.body, "model").String())
+	require.True(t, gjson.GetBytes(upstream.body, "stream").Bool())
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.completion)
+	require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	require.Equal(t, "7", control.completion.InputTokens)
+	require.Equal(t, "3", control.completion.OutputTokens)
+	require.Equal(t, "client-gemini", control.completion.Model)
+	require.Equal(t, "mock-upstream-model", control.completion.UpstreamModel)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareGeminiRejectsInvalidRoutesAndRequestsBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		apiKey string
+		body   string
+	}{
+		{name: "authentication", path: "/v1beta/models/gemini:generateContent", apiKey: "wrong", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
+		{name: "unknown action", path: "/v1beta/models/gemini:countTokens", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
+		{name: "stream without sse", path: "/v1beta/models/gemini:streamGenerateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
+		{name: "generate query", path: "/v1beta/models/gemini:generateContent?alt=sse", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
+		{name: "inline data", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"AA"}}]}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			upstream := &fakeHTTPUpstream{}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+			res := serveGatewayRequest(t, handler, tt.path, tt.apiKey, tt.body)
+			if tt.name == "authentication" {
+				require.Equal(t, http.StatusUnauthorized, res.Code, res.Body.String())
+			} else {
+				require.Equal(t, http.StatusBadRequest, res.Code, res.Body.String())
+			}
+			upstream.mu.Lock()
+			require.Zero(t, upstream.networkCalls)
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			require.Zero(t, control.admitCount)
+			control.mu.Unlock()
+		})
+	}
+
+	t.Run("body limit", func(t *testing.T) {
+		control := testControlPlane()
+		upstream := &fakeHTTPUpstream{}
+		runtime := testRuntimeConfig(t)
+		runtime.Application.Gateway.TextMaxBodySize = 8
+		handler, err := NewHandler(runtime, control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"too large"}]}]}`)
+		require.Equal(t, http.StatusRequestEntityTooLarge, res.Code, res.Body.String())
+		upstream.mu.Lock()
+		require.Zero(t, upstream.networkCalls)
+		upstream.mu.Unlock()
+	})
+}
+
+func TestCloudflareGeminiAdmissionCapabilityAndUsageFailureBehavior(t *testing.T) {
+	t.Run("admission rejection", func(t *testing.T) {
+		control := testControlPlane()
+		control.admitErr = ErrAdmissionRejected
+		upstream := &fakeHTTPUpstream{}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusTooManyRequests, res.Code, res.Body.String())
+		require.Equal(t, "ACCOUNT_CONCURRENCY_EXHAUSTED", gjson.Get(res.Body.String(), "error.status").String())
+	})
+
+	t.Run("unsupported admitted account releases lease", func(t *testing.T) {
+		control := testControlPlane()
+		upstream := &fakeHTTPUpstream{}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.Equal(t, 1, control.releaseCount)
+		require.Zero(t, control.startCount)
+	})
+
+	t.Run("unknown usage remains unknown", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		upstream := &fakeHTTPUpstream{contentType: "text/event-stream", responseBody: strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_unknown","object":"response","status":"in_progress","model":"mock-upstream-model","output":[]}}`,
+			`data: {"type":"response.completed","response":{"id":"resp_unknown","object":"response","status":"completed","model":"mock-upstream-model","output":[{"type":"message","id":"msg_unknown","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}}`,
+			"data: [DONE]",
+			"",
+		}, "\n\n")}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+		require.False(t, gjson.Get(res.Body.String(), "usageMetadata").Exists())
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.Equal(t, UsageUnknown, control.completion.UsageState)
+	})
+
+	t.Run("upstream failures are redacted", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		upstream := &fakeHTTPUpstream{responseStatus: http.StatusBadGateway, responseBody: `{"error":{"message":"Bearer secret-should-not-leak"}}`}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+		require.NotContains(t, res.Body.String(), "secret-should-not-leak")
+	})
+
+	t.Run("completion failure releases exactly once", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		control.completionErr = errors.New("injected completion failure")
+		upstream := &fakeHTTPUpstream{contentType: "text/event-stream", responseBody: openAIResponsesSSE("resp_complete", "mock-upstream-model", "ok", 1, 1)}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:generateContent", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.Equal(t, 1, control.releaseCount)
+	})
+}
+
+func TestCloudflareGeminiStreamFramingCancellationAndLeaseLoss(t *testing.T) {
+	t.Run("stream framing", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		upstream := &fakeHTTPUpstream{contentType: "text/event-stream", responseBody: openAIResponsesSSE("resp_stream_gemini", "mock-upstream-model", "fragmented", 4, 2)}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:streamGenerateContent?alt=sse", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+		require.Equal(t, "text/event-stream", res.Header().Get("Content-Type"))
+		require.Contains(t, res.Body.String(), `data: {"candidates"`)
+		require.Contains(t, res.Body.String(), `"promptTokenCount":4`)
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	})
+
+	t.Run("client cancellation settles once", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		upstream := &cancellableHTTPUpstream{started: make(chan struct{})}
+		handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini:streamGenerateContent?alt=sse", strings.NewReader(`{"contents":[{"parts":[{"text":"x"}]}]}`)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() { handler.ServeHTTP(res, req); close(done) }()
+		select {
+		case <-upstream.started:
+		case <-time.After(time.Second):
+			t.Fatal("upstream did not start")
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not cancel")
+		}
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.NotNil(t, control.completion)
+		require.Equal(t, OutcomeFailed, control.completion.Outcome)
+		require.Zero(t, control.releaseCount)
+	})
+
+	t.Run("lease loss cancels upstream and settles once", func(t *testing.T) {
+		control := testControlPlane()
+		control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+		control.leaseExpiry = time.Now().Add(100 * time.Millisecond)
+		control.renewErr = errors.New("injected renewal failure")
+		runtime := testRuntimeConfig(t)
+		runtime.LeaseTTLSeconds = 3
+		handler, err := NewHandler(runtime, control, blockingHTTPUpstream{})
+		require.NoError(t, err)
+		res := serveGatewayRequest(t, handler, "/v1beta/models/gemini:streamGenerateContent?alt=sse", "sk-cloudflare-unit-test", `{"contents":[{"parts":[{"text":"x"}]}]}`)
+		require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		require.GreaterOrEqual(t, control.renewCount, 1)
+		require.NotNil(t, control.completion)
+		require.Equal(t, OutcomeFailed, control.completion.Outcome)
+		require.Zero(t, control.releaseCount)
+	})
+}
+
 func TestCloudflareHandlerNewProtocolsStreamAndPersistUsage(t *testing.T) {
 	tests := []struct {
 		name       string

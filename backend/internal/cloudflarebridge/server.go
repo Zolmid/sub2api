@@ -26,6 +26,7 @@ var ErrLeaseLost = errors.New("cloudflare account lease lost")
 type gatewayHandler struct {
 	control         ControlPlane
 	forwarder       *service.OpenAIGatewayService
+	geminiForwarder *geminiGatewayForwarder
 	leaseTTLSeconds int
 }
 
@@ -36,6 +37,7 @@ const (
 	gatewayProtocolResponses
 	gatewayProtocolMessages
 	gatewayProtocolEmbeddings
+	gatewayProtocolGemini
 )
 
 // deferredResponseWriter keeps a non-streaming upstream response private until
@@ -192,6 +194,7 @@ func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	handler := &gatewayHandler{
 		control:         control,
 		forwarder:       forwarder,
+		geminiForwarder: newGeminiGatewayForwarder(forwarder),
 		leaseTTLSeconds: runtime.LeaseTTLSeconds,
 	}
 
@@ -266,6 +269,11 @@ func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	gateway.POST("/responses", handler.responses)
 	gateway.POST("/messages", handler.messages)
 	gateway.POST("/embeddings", handler.embeddings)
+	gemini := router.Group("/v1beta")
+	gemini.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))
+	gemini.Use(middleware.ClientRequestID())
+	gemini.Use(gin.HandlerFunc(apiKeyAuthMiddleware))
+	gemini.POST("/models/:modelAction", handler.gemini)
 	embeddingsAlias := router.Group("")
 	embeddingsAlias.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))
 	embeddingsAlias.Use(middleware.ClientRequestID())
@@ -316,6 +324,10 @@ func (h *gatewayHandler) embeddings(c *gin.Context) {
 	h.serveGateway(c, gatewayProtocolEmbeddings)
 }
 
+func (h *gatewayHandler) gemini(c *gin.Context) {
+	h.serveGateway(c, gatewayProtocolGemini)
+}
+
 func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) {
 	apiKey, ok := middleware.GetAPIKeyFromContext(c)
 	if !ok || apiKey == nil || apiKey.GroupID == nil {
@@ -325,24 +337,42 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeGatewayProtocolError(c, protocol, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "Request body exceeds the configured limit")
+			return
+		}
 		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "Failed to read request body")
 		return
 	}
-	parsed, err := service.ParseGatewayRequest(service.NewRequestBodyRef(body), protocol.parserName())
-	if err != nil {
-		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "Failed to parse request body")
-		return
+	model := ""
+	stream := false
+	outputEffort := ""
+	if protocol == gatewayProtocolGemini {
+		parsed, err := parseGeminiGatewayRequest(c, body)
+		if err != nil {
+			writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+			return
+		}
+		model, stream = parsed.model, parsed.stream
+	} else {
+		parsed, err := service.ParseGatewayRequest(service.NewRequestBodyRef(body), protocol.parserName())
+		if err != nil {
+			writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "Failed to parse request body")
+			return
+		}
+		body = parsed.Body.Bytes()
+		model, stream, outputEffort = parsed.Model, parsed.Stream, parsed.OutputEffort
+		if strings.TrimSpace(model) == "" {
+			writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "model is required")
+			return
+		}
 	}
-	body = parsed.Body.Bytes()
-	if strings.TrimSpace(parsed.Model) == "" {
-		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "model is required")
-		return
-	}
-	if protocol == gatewayProtocolEmbeddings && parsed.Stream {
+	if protocol == gatewayProtocolEmbeddings && stream {
 		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "streaming is not supported for embeddings")
 		return
 	}
-	if protocol != gatewayProtocolMessages {
+	if protocol != gatewayProtocolMessages && protocol != gatewayProtocolGemini {
 		if _, err := service.ValidateOpenAIServiceTierField(body); err != nil {
 			writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 			return
@@ -354,7 +384,7 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 		RequestID:       requestID,
 		APIKeyID:        strconv.FormatInt(apiKey.ID, 10),
 		GroupID:         strconv.FormatInt(*apiKey.GroupID, 10),
-		Model:           parsed.Model,
+		Model:           model,
 		LeaseTTLSeconds: h.leaseTTLSeconds,
 	})
 	if err != nil {
@@ -393,7 +423,7 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 			RequestID: requestID, APIKeyID: strconv.FormatInt(apiKey.ID, 10),
 			AccountID: strconv.FormatInt(admission.Account.ID, 10),
 			LeaseID:   admission.Lease.ID, LeaseEpoch: admission.Lease.Epoch,
-			Model: parsed.Model, UpstreamModel: admission.UpstreamModel,
+			Model: model, UpstreamModel: admission.UpstreamModel,
 		})
 		if err == nil {
 			markerStarted.Store(true)
@@ -425,11 +455,11 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 	startedAt := time.Now()
 	originalWriter := c.Writer
 	var deferred *deferredResponseWriter
-	if !parsed.Stream {
+	if !stream {
 		deferred = newDeferredResponseWriter(originalWriter)
 		c.Writer = deferred
 	}
-	result, forwardErr := h.forward(protocol, requestCtx, c, admission.Account, body, parsed.Model, admission.UpstreamModel)
+	result, forwardErr := h.forward(protocol, requestCtx, c, admission.Account, body, model, admission.UpstreamModel)
 	outcome := OutcomeSucceeded
 	usageState := UsageUnknown
 	completion := CompletionRequest{
@@ -451,7 +481,7 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 		CacheCreation5mTokens: "0",
 		CacheCreation1hTokens: "0",
 		CacheReadTokens:       "0",
-		Model:                 parsed.Model,
+		Model:                 model,
 		UpstreamModel:         admission.UpstreamModel,
 		DurationMillis:        strconv.FormatInt(time.Since(startedAt).Milliseconds(), 10),
 	}
@@ -470,8 +500,8 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 		}
 		if result.ReasoningEffort != nil {
 			completion.ReasoningEffort = *result.ReasoningEffort
-		} else if protocol == gatewayProtocolMessages && strings.TrimSpace(parsed.OutputEffort) != "" {
-			completion.ReasoningEffort = strings.TrimSpace(parsed.OutputEffort)
+		} else if protocol == gatewayProtocolMessages && strings.TrimSpace(outputEffort) != "" {
+			completion.ReasoningEffort = strings.TrimSpace(outputEffort)
 		}
 		if strings.TrimSpace(result.UpstreamModel) != "" {
 			completion.UpstreamModel = result.UpstreamModel
@@ -530,6 +560,8 @@ func (p gatewayProtocol) parserName() string {
 		return service.PlatformAnthropic
 	case gatewayProtocolEmbeddings:
 		return "embeddings"
+	case gatewayProtocolGemini:
+		return "gemini"
 	default:
 		return "chat_completions"
 	}
@@ -542,7 +574,10 @@ func (p gatewayProtocol) supportsAdmittedAccount(account *service.Account) bool 
 	if p == gatewayProtocolEmbeddings {
 		return account.IsActive() && account.SupportsOpenAIEndpointCapability(service.OpenAIEndpointCapabilityEmbeddings)
 	}
-	return true
+	if p == gatewayProtocolGemini {
+		return account.IsActive() && account.SupportsOpenAIEndpointCapability(service.OpenAIEndpointCapabilityResponses)
+	}
+	return account.IsActive()
 }
 
 func (h *gatewayHandler) releaseAdmissionLease(requestID string, lease Lease) {
@@ -575,12 +610,18 @@ func (h *gatewayHandler) forward(
 		return h.forwarder.ForwardCloudflareMessages(ctx, c, account, body, requestedModel, mappedModel)
 	case gatewayProtocolEmbeddings:
 		return h.forwarder.ForwardCloudflareEmbeddings(ctx, c, account, body, requestedModel, mappedModel)
+	case gatewayProtocolGemini:
+		return h.geminiForwarder.Forward(ctx, c, account, body, requestedModel, mappedModel)
 	default:
 		return h.forwarder.ForwardAsChatCompletions(ctx, c, account, body, "", mappedModel)
 	}
 }
 
 func writeGatewayProtocolError(c *gin.Context, protocol gatewayProtocol, status int, code, message string) {
+	if protocol == gatewayProtocolGemini {
+		c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": status, "status": code, "message": message}})
+		return
+	}
 	if protocol == gatewayProtocolMessages {
 		errorType := "api_error"
 		switch status {

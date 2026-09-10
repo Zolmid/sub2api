@@ -1,6 +1,39 @@
 # Cloudflare migration status
 
-Updated: 2026-09-09. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
+Updated: 2026-09-10. Baseline: `ab99d56e9626e6cd731592dae8553c9758a0efa2`.
+
+## 2026-09-10 verified integration checkpoint
+
+- Fork branch `codex/cloudflare-native` at `62bb448e4` has one tree-equivalent
+  integration of the previously local migration work. GitHub Actions runs
+  `34480545960` (CI), `34480545943` (Cloudflare native CI), and `34480545820`
+  (Security Scan) all completed successfully. This is repository CI evidence,
+  not a Cloudflare deployment or real-upstream acceptance result.
+- The credential-free Cloudflare aggregate now exercises the Worker type
+  contract, TypeScript, workerd, fresh and repeated D1 migrations, the focused
+  Go bridge race/vet gates, and the traditional cancellation regression. An
+  independent clean-tree run passed 24 Worker test files / 377 tests. Backend
+  unit and integration tags, full golangci-lint v2.13, and the Node 20 / pnpm 9
+  frontend lint, typecheck, and 13-file / 168-test critical suite also passed.
+- Request admission now uses durable user/key rate-limit state, multi-account
+  scheduler policy, recoverable account leases, exact E8 reservation and
+  settlement, durable usage outbox publication, and post-commit scheduler
+  cleanup recovery. The Go gateway routes the existing `/v1/chat/completions`,
+  `/v1/responses`, and `/v1/messages` paths through that common lifecycle.
+  Unknown usage remains explicit and a committed billing outcome is not
+  converted into a retryable gateway failure merely because lease cleanup
+  needs scheduled recovery.
+- Canonical offline migration and restore validation covers migrations 0001
+  through 0017, including subscription, OAuth-refresh, auth-cache, encrypted
+  settings, payment, and email schema/runtime foundations. Those foundations
+  are not automatically complete features: subscription management/admission,
+  provider OAuth calls, cache/settings entrypoint integration, payment webhook
+  verification, email-provider delivery, and concrete background-job executor
+  wiring remain open until their public/private routes and failure tests pass.
+- No Cloudflare account resource, DNS record, paid Container, Queue, real
+  provider credential, production ledger, or R2 bucket was created or changed.
+  Remote deployment, real-upstream calls, and any object-storage addition stay
+  behind their explicit authorization boundary.
 
 ## Completed and locally evidenced
 

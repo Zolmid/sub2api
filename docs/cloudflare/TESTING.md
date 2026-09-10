@@ -39,7 +39,35 @@ This file separates source-level tests, local Cloudflare runtime evidence,
 remote Cloudflare evidence, and real-upstream evidence. A passing lower layer
 must not be reported as a passing higher layer.
 
-Verified date: 2026-09-09. Commands below are run from the locked checkout.
+Verified date: 2026-09-10. Commands below are run from a clean checkout unless
+the row explicitly describes an older composed-runtime checkpoint.
+
+## 2026-09-10 clean integration and GitHub Actions
+
+The tree published as fork commit `62bb448e4` passed all three push workflows:
+
+- `CI` run `34480545960`: shell deployment checks, Go unit and integration
+  tags, Node 20 / pnpm 9 frontend lint/typecheck/critical Vitest, and
+  golangci-lint v2.13.
+- `Cloudflare native CI` run `34480545943`: Node 22 / pnpm 11.19.0 Worker
+  install and the checked-in `ci:local` aggregate.
+- `Security Scan` run `34480545820`: Go vulnerability scan and the checked-in
+  frontend production-audit exception gate.
+
+Before push, an isolated tree containing only committed source plus the exact
+candidate changes passed `go test -tags=unit ./...`,
+`go test -tags=integration ./...`, full golangci-lint, focused bridge/service
+race and vet checks, Worker generated-type validation, `tsc --noEmit`, 24
+Worker files / 377 tests, and fresh then repeated D1 application through
+`0017_email_runtime.sql`. A separate `node:20-bookworm` run with pnpm 9.15.9
+passed frontend lint, typecheck, and 13 files / 168 critical tests. The six
+shell commands from `.github/workflows/backend-ci.yml` passed in an isolated
+tracked worktree.
+
+These results supersede lower historical test counts only for the integrated
+tree. They do not turn foundation-only modules into wired features and do not
+constitute remote Cloudflare, paid-resource, production, browser, or real-
+provider acceptance.
 
 ## Current stage C management increments
 

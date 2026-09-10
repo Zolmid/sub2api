@@ -28,6 +28,10 @@ import {
   drainBackgroundJobOutbox,
   recoverExpiredBackgroundJobs,
 } from "./job-worker";
+import {
+  JOB_EXECUTION_PRIVATE_PATH,
+  createGatewayJobExecutors,
+} from "./job-executors";
 
 const USAGE_QUEUE_NAMES = new Set([
   "sub2api-usage",
@@ -378,7 +382,10 @@ const worker = {
     env: Env,
   ): Promise<void> {
     if (batch.queue === BACKGROUND_JOB_QUEUE_NAME) {
-      await consumeJobQueueBatch(batch, { db: env.DB });
+      await consumeJobQueueBatch(batch, {
+        db: env.DB,
+        executors: createGatewayJobExecutors(env),
+      });
       return;
     }
     if (!USAGE_QUEUE_NAMES.has(batch.queue)) {
@@ -418,6 +425,14 @@ export async function routeIngress(
     return error("NOT_FOUND", 404);
   }
   const url = new URL(request.url);
+  if (
+    url.pathname === JOB_EXECUTION_PRIVATE_PATH ||
+    url.pathname.startsWith(`${JOB_EXECUTION_PRIVATE_PATH}/`)
+  ) {
+    // This path is reserved for Worker-to-Container job RPC. Public ingress
+    // must fail closed before fixture headers or Container routing are honored.
+    return error("NOT_FOUND", 404);
+  }
   if (request.method === "GET" && url.pathname === "/ready") {
     try {
       await validateActivePricing(env);

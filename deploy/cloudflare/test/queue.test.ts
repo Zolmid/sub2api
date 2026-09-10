@@ -226,6 +226,47 @@ describe("usage Queue consumer", () => {
     expect((await getQueueResult(batch, createExecutionContext())).explicitAcks).toHaveLength(0);
   });
 
+  it("does not consume background jobs from a near-match Queue name", async () => {
+    const suffix = crypto.randomUUID();
+    const created = await createAndEnqueueJob(env.DB, {
+      jobId: `queue-near-match-${suffix}`,
+      operationId: `queue-near-match-create-${suffix}`,
+      route: "unregistered.v1",
+      jobType: "queue-near-match",
+      idempotencyKey: `queue-near-match-idem-${suffix}`,
+      payloadCodec: "json",
+      payloadBody: "{}",
+      payloadDigest: `sha256:${suffix}`,
+      maxAttempts: 1,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      nowMs: 1_000,
+      actor: "queue-near-match-test",
+    });
+    if (!created.job) throw new Error("background job was not created");
+    const batch = createMessageBatch<QueueEnvelope>(
+      "sub2api-background-jobs-local",
+      [{
+        id: `near-match-${suffix}`,
+        timestamp: new Date(),
+        attempts: 1,
+        body: {
+          v: 1,
+          jobId: created.job.jobId,
+          route: "unregistered.v1",
+          jobVersion: 1,
+        },
+      }],
+    );
+
+    await expect(worker.queue(batch, env)).rejects.toThrow("UNEXPECTED_QUEUE");
+    expect((await getQueueResult(batch, createExecutionContext())).explicitAcks).toHaveLength(0);
+    expect(await getJob(env.DB, created.job.jobId)).toMatchObject({
+      status: "queued",
+      attemptCount: 0,
+    });
+  });
+
   it("keeps usage handling isolated when the Worker also receives a background-job Queue batch", async () => {
     const suffix = crypto.randomUUID();
     const created = await createAndEnqueueJob(env.DB, {

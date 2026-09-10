@@ -32,6 +32,64 @@ return exactly one of: success (with an opaque result digest), retryable
 failure, permanent failure, or manual review. Executors receive the payload
 only after a valid running lease is established and must not log it.
 
+Production Worker execution now uses a non-empty exact registry for the
+current migration responsibilities:
+
+- `oauth-refresh.v1`
+- `email-delivery.v1`
+- `payment-reconciliation.v1`
+- `subscription-expiry-maintenance.v1`
+
+These names are versioned constants, not prefixes. Any other route remains
+`manual_review` with `unknown_route` evidence. Registered routes dispatch to
+the gateway Container on the private path
+`/internal/cloudflare/jobs/execute`. Public Worker ingress returns 404 for that
+path and its descendants, before fixture or routing headers are honored, so an
+external caller cannot reach the job RPC by path or header forgery.
+
+The Worker sends a bounded JSON RPC envelope:
+
+```json
+{
+  "v": 1,
+  "method": "sub2api.cloudflare.jobs.execute",
+  "params": {
+    "job": {
+      "id": "opaque job id",
+      "version": 4,
+      "route": "oauth-refresh.v1",
+      "type": "oauth-refresh",
+      "idempotencyKey": "opaque idempotency key"
+    },
+    "payload": {
+      "codec": "json",
+      "body": "{}",
+      "digest": "sha256:..."
+    }
+  }
+}
+```
+
+The Worker rejects payload bodies above 256 KiB before Container dispatch and
+never stores the payload body in transition evidence. Container responses are
+accepted only when they are 200 responses whose JSON body is no larger than 8
+KiB and exactly matches one of these shapes:
+
+- `{ "v": 1, "kind": "succeeded", "resultDigest": "..." }`
+- `{ "v": 1, "kind": "retryable_failure", "errorCode": "..." }`
+- `{ "v": 1, "kind": "permanent_failure", "errorCode": "..." }`
+- `{ "v": 1, "kind": "manual_review", "reasonCode": "...", "evidenceRef": "..." }`
+
+Malformed, oversized, non-JSON, network-failed, non-200, or otherwise
+ambiguous Container outcomes fail closed to `manual_review`. Only an explicit,
+validated `retryable_failure` response from the private Go endpoint may enter
+the retry path.
+
+This is still infrastructure only. The recognized routes are not end-to-end
+complete until the Go gateway implements the private endpoint above and maps
+each route's provider/payment/email/subscription behavior into the response
+contract without logging or returning secret payload material.
+
 Do not retry `manual_review` or `dead_letter` records by modifying them. Use
 the existing audited replay API with a new job ID, idempotency key, replay key,
 actor, reason, and evidence that the prior effect did not occur.

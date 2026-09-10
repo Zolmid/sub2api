@@ -8,6 +8,7 @@ import {
   selectContainerName,
   routeIngress,
 } from "../src/index";
+import { JOB_EXECUTION_PRIVATE_PATH } from "../src/job-executors";
 
 describe("container egress registration", () => {
   it("registers handlers through the Containers SDK static setters", () => {
@@ -94,6 +95,37 @@ describe("edge readiness", () => {
     await env.DB.prepare("DELETE FROM pricing_active_version").run();
     const unavailable = await routeIngress(new Request("https://example.test/ready"), env, forward);
     expect(unavailable.status).toBe(503);
+    expect(forwarded).toBe(0);
+  });
+
+  it("denies public ingress to the private job execution path and prefix", async () => {
+    let forwarded = 0;
+    const forward = async () => {
+      forwarded += 1;
+      return new Response("unexpected");
+    };
+
+    const exact = await routeIngress(
+      new Request(`https://example.test${JOB_EXECUTION_PRIVATE_PATH}`, {
+        method: "POST",
+        headers: {
+          "X-Sub2API-Container-Id": "forged",
+          "X-Sub2API-Bridge-Version": "forged",
+        },
+      }),
+      env,
+      forward,
+    );
+    const child = await routeIngress(
+      new Request(`https://example.test${JOB_EXECUTION_PRIVATE_PATH}/extra`, {
+        method: "POST",
+      }),
+      env,
+      forward,
+    );
+
+    expect(exact.status).toBe(404);
+    expect(child.status).toBe(404);
     expect(forwarded).toBe(0);
   });
 });

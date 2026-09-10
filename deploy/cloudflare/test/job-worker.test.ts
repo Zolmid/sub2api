@@ -14,6 +14,12 @@ import {
   type JobExecutor,
   type JobExecutorMap,
 } from "../src/job-worker";
+import {
+  BACKGROUND_JOB_ROUTES,
+  MAX_JOB_EXECUTION_PAYLOAD_BYTES,
+  MAX_JOB_EXECUTION_RESPONSE_BYTES,
+  createGatewayJobExecutors,
+} from "../src/job-executors";
 
 const db = env.DB;
 const NOW = 1_000;
@@ -77,6 +83,109 @@ const success: JobExecutor = async ({ payloadBody }) => {
 };
 
 describe("background job Queue worker", () => {
+  it("exposes a non-empty exact production executor registry", () => {
+    const executors = createGatewayJobExecutors(env, async () =>
+      Response.json({ v: 1, kind: "succeeded", resultDigest: "sha256:unused" })
+    );
+    expect(Object.keys(executors).sort()).toEqual([
+      BACKGROUND_JOB_ROUTES.EMAIL_DELIVERY_V1,
+      BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
+      BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
+      BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1,
+    ].sort());
+    expect(executors["maintenance.v1"]).toBeUndefined();
+    expect(executors["oauth-refresh.v1.extra"]).toBeUndefined();
+  });
+
+  it("dispatches registered jobs with a strict bounded Container RPC envelope", async () => {
+    const created = await create({
+      route: BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
+      jobType: "oauth-refresh",
+      idempotencyKey: "oauth-refresh-idempotency",
+      payloadBody: JSON.stringify({ account_id: "42", secret: "private-in-d1-only" }),
+      payloadDigest: "sha256:oauth-refresh-payload",
+    });
+    const delivery = message("delivery-registered-dispatch", created.envelope);
+    const seen: unknown[] = [];
+    const executors = createGatewayJobExecutors(env, async (request) => {
+      expect(request.method).toBe("POST");
+      expect(new URL(request.url).pathname).toBe("/internal/cloudflare/jobs/execute");
+      expect(request.headers.get("content-type")).toBe("application/json");
+      seen.push(await request.json());
+      return Response.json({
+        v: 1,
+        kind: "succeeded",
+        resultDigest: "sha256:container-result",
+      });
+    });
+
+    await deliver([delivery], executors);
+
+    expect(delivery.calls).toEqual(["ack"]);
+    expect(seen).toEqual([{
+      v: 1,
+      method: "sub2api.cloudflare.jobs.execute",
+      params: {
+        job: {
+          id: created.input.jobId,
+          version: 4,
+          route: BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
+          type: "oauth-refresh",
+          idempotencyKey: "oauth-refresh-idempotency",
+        },
+        payload: {
+          codec: "json",
+          body: JSON.stringify({ account_id: "42", secret: "private-in-d1-only" }),
+          digest: "sha256:oauth-refresh-payload",
+        },
+      },
+    }]);
+    expect(await getJob(db, created.input.jobId)).toMatchObject({
+      status: "succeeded",
+      resultDigest: "sha256:container-result",
+    });
+  });
+
+  it("maps every explicit Container outcome and only retries validated retryable failures", async () => {
+    const outcomes = [
+      {
+        route: BACKGROUND_JOB_ROUTES.OAUTH_REFRESH_V1,
+        body: { v: 1, kind: "succeeded", resultDigest: "sha256:oauth-result" },
+        expected: { status: "succeeded", resultDigest: "sha256:oauth-result" },
+      },
+      {
+        route: BACKGROUND_JOB_ROUTES.EMAIL_DELIVERY_V1,
+        body: { v: 1, kind: "retryable_failure", errorCode: "provider_busy" },
+        expected: { status: "retry_wait", errorCode: "provider_busy" },
+      },
+      {
+        route: BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
+        body: { v: 1, kind: "permanent_failure", errorCode: "invalid_reconciliation" },
+        expected: { status: "failed", errorCode: "invalid_reconciliation" },
+      },
+      {
+        route: BACKGROUND_JOB_ROUTES.SUBSCRIPTION_EXPIRY_MAINTENANCE_V1,
+        body: {
+          v: 1,
+          kind: "manual_review",
+          reasonCode: "operator_required",
+          evidenceRef: "container:subscription-maintenance",
+        },
+        expected: { status: "manual_review", errorCode: "operator_required" },
+      },
+    ] as const;
+
+    for (const outcome of outcomes) {
+      const created = await create({ route: outcome.route });
+      const delivery = message(`delivery-${outcome.route}`, created.envelope);
+      await deliver([delivery], createGatewayJobExecutors(env, async () =>
+        Response.json(outcome.body)
+      ));
+      expect(delivery.calls).toEqual(["ack"]);
+      expect(await getJob(db, created.input.jobId)).toMatchObject(outcome.expected);
+    }
+  });
+
   it("runs a claimed job once and acknowledges delayed duplicate delivery", async () => {
     const created = await create();
     const first = message("delivery-first", created.envelope);
@@ -146,6 +255,96 @@ describe("background job Queue worker", () => {
         WHERE job_id=? AND event_type='manual_review'`).bind(created.input.jobId)
         .first<{ reason_code: string; evidence_ref: string }>(),
     ).toEqual({ reason_code: "unknown_route", evidence_ref: "route:unregistered.v1" });
+  });
+
+  it.each([
+    {
+      name: "invalid shape",
+      dispatch: async () => Response.json({
+        v: 1,
+        kind: "succeeded",
+        resultDigest: "sha256:bad-extra",
+        extra: true,
+      }),
+      reasonCode: "container_response_invalid",
+    },
+    {
+      name: "oversized body",
+      dispatch: async () => new Response("x".repeat(MAX_JOB_EXECUTION_RESPONSE_BYTES + 1)),
+      reasonCode: "container_response_too_large",
+    },
+    {
+      name: "non-json body",
+      dispatch: async () => new Response("not json"),
+      reasonCode: "container_response_non_json",
+    },
+    {
+      name: "network failure",
+      dispatch: async () => {
+        throw new Error("transport lost with private-in-d1-only");
+      },
+      reasonCode: "container_dispatch_failed",
+    },
+    {
+      name: "ambiguous 5xx",
+      dispatch: async () =>
+        Response.json(
+          { v: 1, kind: "retryable_failure", errorCode: "provider_busy" },
+          { status: 503 },
+        ),
+      reasonCode: "container_http_status",
+    },
+  ])("fails closed to manual review on $name Container responses", async ({ dispatch, reasonCode }) => {
+    const created = await create({
+      route: BACKGROUND_JOB_ROUTES.EMAIL_DELIVERY_V1,
+      payloadBody: JSON.stringify({ token: "private-in-d1-only" }),
+    });
+    const delivery = message(`delivery-fail-closed-${reasonCode}-${crypto.randomUUID()}`, created.envelope);
+
+    await deliver([delivery], createGatewayJobExecutors(env, dispatch));
+
+    expect(delivery.calls).toEqual(["ack"]);
+    expect(await getJob(db, created.input.jobId)).toMatchObject({
+      status: "manual_review",
+      errorCode: reasonCode,
+    });
+    const transition = await db.prepare(`SELECT reason_code,evidence_ref
+      FROM background_job_transitions WHERE job_id=? AND event_type='manual_review'
+      ORDER BY created_at_ms DESC LIMIT 1`).bind(created.input.jobId)
+      .first<{ reason_code: string; evidence_ref: string }>();
+    expect(transition?.reason_code).toBe(reasonCode);
+    expect(JSON.stringify(transition)).not.toContain("private-in-d1-only");
+  });
+
+  it("rejects oversized payloads before Container dispatch without leaking the body", async () => {
+    const payloadBody = JSON.stringify({
+      token: "private-in-d1-only",
+      blob: "x".repeat(MAX_JOB_EXECUTION_PAYLOAD_BYTES),
+    });
+    const created = await create({
+      route: BACKGROUND_JOB_ROUTES.PAYMENT_RECONCILIATION_V1,
+      payloadBody,
+    });
+    const delivery = message("delivery-oversized-payload", created.envelope);
+    let dispatches = 0;
+
+    await deliver([delivery], createGatewayJobExecutors(env, async () => {
+      dispatches += 1;
+      return Response.json({ v: 1, kind: "succeeded", resultDigest: "sha256:unexpected" });
+    }));
+
+    expect(dispatches).toBe(0);
+    expect(delivery.calls).toEqual(["ack"]);
+    expect(await getJob(db, created.input.jobId)).toMatchObject({
+      status: "manual_review",
+      errorCode: "payload_too_large",
+    });
+    const transition = await db.prepare(`SELECT reason_code,evidence_ref
+      FROM background_job_transitions WHERE job_id=? AND event_type='manual_review'
+      ORDER BY created_at_ms DESC LIMIT 1`).bind(created.input.jobId)
+      .first<{ reason_code: string; evidence_ref: string }>();
+    expect(JSON.stringify(transition)).not.toContain("private-in-d1-only");
+    expect(JSON.stringify(transition)).not.toContain("xxxxx");
   });
 
   it("retries ambiguous executor infrastructure errors without executing a duplicate", async () => {

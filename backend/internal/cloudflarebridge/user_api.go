@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
@@ -212,20 +213,22 @@ type cloudflareUserAPIHandler struct {
 	authUsers     *AuthUserRepository
 	apiKeyService *service.APIKeyService
 	totp          TOTPControlPlane
+	settings      *service.SettingService
 }
 
-func newCloudflareUserAPIHandler(authService *service.AuthService, authUsers *AuthUserRepository, apiKeyService *service.APIKeyService, totp TOTPControlPlane) *cloudflareUserAPIHandler {
-	return &cloudflareUserAPIHandler{authService: authService, authUsers: authUsers, apiKeyService: apiKeyService, totp: totp}
+func newCloudflareUserAPIHandler(authService *service.AuthService, authUsers *AuthUserRepository, apiKeyService *service.APIKeyService, totp TOTPControlPlane, settings *service.SettingService) *cloudflareUserAPIHandler {
+	return &cloudflareUserAPIHandler{authService: authService, authUsers: authUsers, apiKeyService: apiKeyService, totp: totp, settings: settings}
 }
 
 // GetPublicSettingsForInjection lets the embedded frontend use exactly the
 // same deterministic configuration exposed by /api/v1/settings/public.
-func (h *cloudflareUserAPIHandler) GetPublicSettingsForInjection(context.Context) (any, error) {
-	return cloudflarePublicSettings(), nil
+func (h *cloudflareUserAPIHandler) GetPublicSettingsForInjection(ctx context.Context) (any, error) {
+	return cloudflarePublicSettings(h.isBackendModeEnabled(ctx)), nil
 }
 
-func cloudflarePublicSettings() dto.PublicSettings {
+func cloudflarePublicSettings(backendModeEnabled bool) dto.PublicSettings {
 	return dto.PublicSettings{
+		BackendModeEnabled:                   backendModeEnabled,
 		RegistrationEmailSuffixWhitelist:     []string{},
 		LoginAgreementDocuments:              []dto.LoginAgreementDocument{},
 		SiteName:                             "Sub2API",
@@ -246,7 +249,25 @@ func cloudflarePublicSettings() dto.PublicSettings {
 }
 
 func (h *cloudflareUserAPIHandler) PublicSettings(c *gin.Context) {
-	response.Success(c, cloudflarePublicSettings())
+	response.Success(c, cloudflarePublicSettings(h.isBackendModeEnabled(c.Request.Context())))
+}
+
+// isBackendModeEnabled intentionally consults only the feature flag. Its
+// SettingService method fails safe to false on an unavailable/malformed Worker
+// response, so public settings cannot claim backend mode is active on outage
+// and no unrelated (potentially secret) settings are fetched for this overlay.
+func (h *cloudflareUserAPIHandler) isBackendModeEnabled(ctx context.Context) bool {
+	return h != nil && h.settings != nil && h.settings.IsBackendModeEnabled(ctx)
+}
+
+func (h *cloudflareUserAPIHandler) ensureBackendModeAllowsUser(ctx context.Context, user *service.User) error {
+	if user == nil {
+		return service.ErrUserNotFound
+	}
+	if !h.isBackendModeEnabled(ctx) || user.IsAdmin() {
+		return nil
+	}
+	return infraerrors.Forbidden("BACKEND_MODE_ADMIN_ONLY", "Backend mode is active. Only admin login is allowed.")
 }
 
 func decodeCloudflareJSON(c *gin.Context, target any) error {
@@ -281,6 +302,10 @@ func (h *cloudflareUserAPIHandler) Login(c *gin.Context) {
 	}
 	_, user, err := h.authService.Login(c.Request.Context(), request.Email, request.Password)
 	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := h.ensureBackendModeAllowsUser(c.Request.Context(), user); err != nil {
 		response.ErrorFrom(c, err)
 		return
 	}
@@ -343,6 +368,10 @@ func (h *cloudflareUserAPIHandler) Login2FA(c *gin.Context) {
 		response.ErrorFrom(c, errCloudflareTOTPLoginExpired)
 		return
 	}
+	if err := h.ensureBackendModeAllowsUser(c.Request.Context(), user); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 	pair, err := h.authService.GenerateTokenPair(c.Request.Context(), user, "")
 	if err != nil {
 		response.ErrorFrom(c, errCloudflareTOTPUnavailable)
@@ -367,6 +396,10 @@ func (h *cloudflareUserAPIHandler) RefreshToken(c *gin.Context) {
 	result, err := h.authService.RefreshTokenPair(c.Request.Context(), request.RefreshToken)
 	if err != nil {
 		response.ErrorFrom(c, err)
+		return
+	}
+	if h.isBackendModeEnabled(c.Request.Context()) && result.UserRole != service.RoleAdmin {
+		response.ErrorFrom(c, infraerrors.Forbidden("BACKEND_MODE_ADMIN_ONLY", "Backend mode is active. Only admin login is allowed."))
 		return
 	}
 	response.Success(c, cloudflareAuthResponse{

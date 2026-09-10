@@ -84,8 +84,22 @@ closed. The fingerprint key is a stable identity key for opaque scopes,
 setting IDs, and witnesses; changing it is not ordinary data-key rotation and
 requires a separate migration/continuity design.
 
-Go bridge wiring and remote Worker-secret creation/deployment are separate
-integration work. This adapter performs none of those operations.
+The Cloudflare Go composition root constructs this adapter only when it is
+given the real `*HTTPControlPlane`; it then supplies one `SettingService` to
+auth token issuance, JWT/admin validation, backend-mode guards, and the public
+settings overlay. It never falls back to PostgreSQL, Redis, or an in-memory
+production repository. Package-local bridge tests use an explicit injected
+repository seam for fake control planes.
+
+Only `backend_mode_enabled` is overlaid onto the otherwise fixed Cloudflare
+public-settings payload (including frontend injection). Its existing
+`SettingService` semantics are fail-safe: a missing, malformed, or unavailable
+Worker value reads as `false`. Therefore a control-plane outage neither claims
+backend mode is enabled nor exposes Worker errors, setting values, or secrets.
+Session-binding settings use the same service and the root installs
+`SessionBindingContext` before all auth handlers, so newly issued access and
+refresh tokens, refresh rotation, and JWT validation share one IP/User-Agent
+fingerprint.
 
 ## Use and key material
 

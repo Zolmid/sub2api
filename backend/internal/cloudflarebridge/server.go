@@ -91,6 +91,45 @@ func (w *deferredResponseWriter) commit() error {
 }
 
 func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream) (http.Handler, error) {
+	settingsRepository, err := cloudflareSettingsRepository(control)
+	if err != nil {
+		return nil, err
+	}
+	return newHandler(runtime, control, upstream, settingsRepository)
+}
+
+// cloudflareSettingsRepository selects the production-only Worker adapter.
+//
+// The bridge must not fall back to the traditional PostgreSQL/Redis settings
+// stack: that would make auth decisions depend on a different authority than
+// the Worker-backed session store. Package-local tests can inject a deterministic
+// repository through cloudflareSettingsRepositoryProvider; production callers
+// can only reach the HTTPControlPlane branch.
+func cloudflareSettingsRepository(control ControlPlane) (service.SettingRepository, error) {
+	if httpControl, ok := control.(*HTTPControlPlane); ok {
+		if httpControl == nil {
+			return nil, errors.New("cloudflare HTTP settings control plane is required")
+		}
+		return NewSettingsRepository(httpControl), nil
+	}
+	provider, ok := control.(cloudflareSettingsRepositoryProvider)
+	if !ok {
+		return nil, errors.New("cloudflare settings repository is required")
+	}
+	repository := provider.cloudflareSettingsRepository()
+	if repository == nil {
+		return nil, errors.New("cloudflare settings repository is required")
+	}
+	return repository, nil
+}
+
+// cloudflareSettingsRepositoryProvider is deliberately package-private. It is
+// an explicit test seam for fake ControlPlanes, not a production fallback.
+type cloudflareSettingsRepositoryProvider interface {
+	cloudflareSettingsRepository() service.SettingRepository
+}
+
+func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream, settingsRepository service.SettingRepository) (http.Handler, error) {
 	if runtime == nil || runtime.Application == nil {
 		return nil, errors.New("cloudflare runtime config is required")
 	}
@@ -103,6 +142,9 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	if runtime.LeaseTTLSeconds < 3 {
 		return nil, errors.New("lease TTL must be at least three seconds")
 	}
+	if settingsRepository == nil {
+		return nil, errors.New("cloudflare settings repository is required")
+	}
 
 	gin.SetMode(runtime.Application.Server.Mode)
 	router := gin.New()
@@ -111,6 +153,9 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	if err := router.SetTrustedProxies(nil); err != nil {
 		return nil, fmt.Errorf("disable trusted proxies: %w", err)
 	}
+	// Keep token issuance and JWT/refresh validation on one bounded client
+	// fingerprint, matching the traditional composition root.
+	router.Use(middleware.SessionBindingContext(runtime.Application))
 
 	apiKeyRepo := NewAPIKeyRepository(control)
 	authUserRepo := NewAuthUserRepository(control)
@@ -123,17 +168,18 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 		return nil, errors.New("cloudflare auth session control plane is required")
 	}
 	groupReader := NewManagedGroupReader(control)
+	settingService := service.NewSettingService(settingsRepository, runtime.Application)
 	apiKeyService := service.NewAPIKeyService(apiKeyRepo, authUserRepo, groupReader, emptySubscriptionReader{}, nil, nil, runtime.Application)
 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, nil, runtime.Application)
-	userAuthService := service.NewAuthService(nil, authUserRepo, nil, authSessionCache, runtime.Application, nil, nil, nil, nil, nil, nil, nil, nil)
-	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService, totpControl)
+	userAuthService := service.NewAuthService(nil, authUserRepo, nil, authSessionCache, runtime.Application, settingService, nil, nil, nil, nil, nil, nil, nil)
+	userAPIHandler := newCloudflareUserAPIHandler(userAuthService, authUserRepo, apiKeyService, totpControl, settingService)
 	totpAPIHandler, err := newCloudflareTOTPHandler(control, authUserRepo)
 	if err != nil {
 		return nil, fmt.Errorf("initialize cloudflare totp handler: %w", err)
 	}
 	adminAPIHandler := newCloudflareAdminAPIHandler(control)
-	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil, nil)
-	adminAuthMiddleware := middleware.NewAdminAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, nil)
+	jwtAuthMiddleware := middleware.NewJWTAuthMiddlewareWithReader(userAuthService, authUserRepo, nil, settingService, nil)
+	adminAuthMiddleware := middleware.NewAdminAuthMiddlewareWithReader(userAuthService, authUserRepo, settingService, nil)
 	forwarder := service.NewCloudflareVerticalSliceOpenAIGatewayService(runtime.Application, upstream)
 	handler := &gatewayHandler{
 		control:         control,
@@ -159,6 +205,7 @@ func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	v1.POST("/auth/logout", userAPIHandler.Logout)
 	authenticated := v1.Group("")
 	authenticated.Use(gin.HandlerFunc(jwtAuthMiddleware))
+	authenticated.Use(middleware.BackendModeUserGuard(settingService))
 	keys := authenticated.Group("/keys")
 	keys.GET("", userAPIHandler.ListAPIKeys)
 	keys.GET("/:id", userAPIHandler.GetAPIKey)

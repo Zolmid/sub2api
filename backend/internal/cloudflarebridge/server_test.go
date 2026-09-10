@@ -43,10 +43,103 @@ type fakeControlPlane struct {
 	sessions       map[string]*service.RefreshTokenData
 	userSessions   map[int64]map[string]struct{}
 	familySessions map[string]map[string]struct{}
+	settings       *cloudflareSettingsRepositoryStub
+}
+
+// cloudflareSettingsRepositoryStub is the explicit, deterministic settings
+// seam used by fake ControlPlane tests. Production NewHandler cannot reach it.
+type cloudflareSettingsRepositoryStub struct {
+	mu     sync.Mutex
+	values map[string]string
+	err    error
+}
+
+func newCloudflareSettingsRepositoryStub(values map[string]string) *cloudflareSettingsRepositoryStub {
+	copy := make(map[string]string, len(values))
+	for key, value := range values {
+		copy[key] = value
+	}
+	return &cloudflareSettingsRepositoryStub{values: copy}
+}
+
+func (r *cloudflareSettingsRepositoryStub) Get(_ context.Context, key string) (*service.Setting, error) {
+	value, err := r.GetValue(context.Background(), key)
+	if err != nil {
+		return nil, err
+	}
+	return &service.Setting{Key: key, Value: value}, nil
+}
+
+func (r *cloudflareSettingsRepositoryStub) GetValue(_ context.Context, key string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return "", r.err
+	}
+	value, ok := r.values[key]
+	if !ok {
+		return "", service.ErrSettingNotFound
+	}
+	return value, nil
+}
+
+func (r *cloudflareSettingsRepositoryStub) Set(_ context.Context, key, value string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.values[key] = value
+	return nil
+}
+
+func (r *cloudflareSettingsRepositoryStub) GetMultiple(_ context.Context, keys []string) (map[string]string, error) {
+	result := make(map[string]string)
+	for _, key := range keys {
+		value, err := r.GetValue(context.Background(), key)
+		if err == nil {
+			result[key] = value
+		}
+	}
+	return result, nil
+}
+
+func (r *cloudflareSettingsRepositoryStub) SetMultiple(_ context.Context, values map[string]string) error {
+	for key, value := range values {
+		if err := r.Set(context.Background(), key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *cloudflareSettingsRepositoryStub) GetAll(context.Context) (map[string]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make(map[string]string, len(r.values))
+	for key, value := range r.values {
+		result[key] = value
+	}
+	return result, r.err
+}
+
+func (r *cloudflareSettingsRepositoryStub) Delete(_ context.Context, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.values, key)
+	return nil
+}
+
+func (f *fakeControlPlane) cloudflareSettingsRepository() service.SettingRepository {
+	return f.settings
 }
 
 type noAuthSessionControlPlane struct {
 	disabledTOTPControlPlane
+}
+
+func (noAuthSessionControlPlane) cloudflareSettingsRepository() service.SettingRepository {
+	return newCloudflareSettingsRepositoryStub(map[string]string{
+		service.SettingKeyBackendModeEnabled:    "false",
+		service.SettingKeySessionBindingEnabled: "false",
+	})
 }
 
 func (noAuthSessionControlPlane) ResolveAPIKey(context.Context, string) (*service.APIKey, error) {
@@ -434,6 +527,10 @@ func testControlPlane() *fakeControlPlane {
 		Concurrency: 2,
 	}
 	return &fakeControlPlane{
+		settings: newCloudflareSettingsRepositoryStub(map[string]string{
+			service.SettingKeyBackendModeEnabled:    "false",
+			service.SettingKeySessionBindingEnabled: "false",
+		}),
 		key: &service.APIKey{
 			ID:      4001,
 			UserID:  user.ID,

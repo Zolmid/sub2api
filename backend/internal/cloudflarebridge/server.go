@@ -92,11 +92,18 @@ func (w *deferredResponseWriter) commit() error {
 }
 
 func NewHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream) (http.Handler, error) {
+	return NewHandlerWithJobExecutionRegistry(runtime, control, upstream, defaultJobExecutionRegistry())
+}
+
+// NewHandlerWithJobExecutionRegistry provides the narrow composition seam for
+// future internal route adapters. NewHandler remains deterministic and only
+// supplies the built-in manual-review adapters.
+func NewHandlerWithJobExecutionRegistry(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream, jobExecutors JobExecutionRegistry) (http.Handler, error) {
 	settingsRepository, err := cloudflareSettingsRepository(control)
 	if err != nil {
 		return nil, err
 	}
-	return newHandler(runtime, control, upstream, settingsRepository)
+	return newHandler(runtime, control, upstream, settingsRepository, jobExecutors)
 }
 
 // cloudflareSettingsRepository selects the production-only Worker adapter.
@@ -130,7 +137,7 @@ type cloudflareSettingsRepositoryProvider interface {
 	cloudflareSettingsRepository() service.SettingRepository
 }
 
-func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream, settingsRepository service.SettingRepository) (http.Handler, error) {
+func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.HTTPUpstream, settingsRepository service.SettingRepository, jobExecutors JobExecutionRegistry) (http.Handler, error) {
 	if runtime == nil || runtime.Application == nil {
 		return nil, errors.New("cloudflare runtime config is required")
 	}
@@ -197,6 +204,10 @@ func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 			"data": gin.H{"needs_setup": false, "step": "completed"},
 		})
 	})
+	// This private Container RPC is deliberately registered as one exact route.
+	// Its handler repeats the authority and path checks because Container-facing
+	// routing must not make an externally forwarded request trusted.
+	router.POST(jobExecutionPrivatePath, gin.WrapH(newJobExecutionHandler(jobExecutors)))
 
 	v1 := router.Group("/api/v1")
 	v1.GET("/settings/public", userAPIHandler.PublicSettings)

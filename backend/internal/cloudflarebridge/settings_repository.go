@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -142,6 +143,9 @@ func (r *SettingsRepository) GetValue(ctx context.Context, key string) (string, 
 }
 
 func (r *SettingsRepository) Set(ctx context.Context, key, value string) error {
+	if !validSettingsKey(key) || !validSettingsValue(value) {
+		return errors.New("invalid settings set input")
+	}
 	requestID, err := r.nextRequestID()
 	if err != nil {
 		return err
@@ -179,6 +183,14 @@ func (r *SettingsRepository) GetMultiple(ctx context.Context, keys []string) (ma
 func (r *SettingsRepository) SetMultiple(ctx context.Context, settings map[string]string) error {
 	if len(settings) == 0 {
 		return nil
+	}
+	if len(settings) > 16 {
+		return errors.New("invalid settings set-multiple input: too many settings")
+	}
+	for key, value := range settings {
+		if !validSettingsKey(key) || !validSettingsValue(value) {
+			return errors.New("invalid settings set-multiple input")
+		}
 	}
 	requestID, err := r.nextRequestID()
 	if err != nil {
@@ -219,6 +231,9 @@ func (r *SettingsRepository) GetAll(ctx context.Context) (map[string]string, err
 }
 
 func (r *SettingsRepository) Delete(ctx context.Context, key string) error {
+	if !validSettingsKey(key) {
+		return errors.New("invalid settings delete input")
+	}
 	requestID, err := r.nextRequestID()
 	if err != nil {
 		return err
@@ -263,7 +278,7 @@ func (r *SettingsRepository) nextRequestID() (string, error) {
 
 func mapSettingsReadError(err error) error {
 	var responseErr *controlPlaneResponseError
-	if errors.As(err, &responseErr) && responseErr.Code == "NOT_FOUND" {
+	if errors.As(err, &responseErr) && responseErr.Code == "SETTING_NOT_FOUND" {
 		return service.ErrSettingNotFound
 	}
 	return err
@@ -294,7 +309,7 @@ func validSettingsKey(value string) bool {
 }
 
 func validSettingsValue(value string) bool {
-	return len(value) <= settingsMaxValueBytes && !strings.ContainsRune(value, '\x00')
+	return utf8.ValidString(value) && len(value) <= settingsMaxValueBytes && !strings.ContainsRune(value, '\x00')
 }
 
 func validSettingsVersion(value string) bool {

@@ -75,6 +75,10 @@ describe("private settings control plane", () => {
     expect(getValueResponse.status).toBe(200);
     expect(await getValueResponse.json()).toBe("encrypted value");
 
+    const missingValueResponse = await call("/v1/private/settings/get-value", { key: "missing" }, target);
+    expect(missingValueResponse.status).toBe(404);
+    expect(await errorCode(missingValueResponse)).toBe("SETTING_NOT_FOUND");
+
     const getMultipleResponse = await call("/v1/private/settings/get-multiple", { keys: ["alpha", "missing"] }, target);
     expect(getMultipleResponse.status).toBe(200);
     expect(await getMultipleResponse.json()).toEqual({ alpha: "encrypted value" });

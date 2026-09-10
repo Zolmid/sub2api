@@ -40,7 +40,10 @@ responses preserve the runtime result rather than exposing envelope fields or
 secret material.
 
 Malformed or oversized JSON and runtime `INVALID_INPUT` are `400`. A missing
-setting is returned as JSON `null` by `get`, while `get-value` reports `404`.
+setting is returned as JSON `null` by `get`, while `get-value` reports
+`404 SETTING_NOT_FOUND`. The endpoint-specific code prevents an absent or
+version-skewed private route's generic `404 NOT_FOUND` from being mistaken for
+an absent setting by the Go repository.
 `CAS_MISMATCH`, `IDEMPOTENCY_COLLISION`, and
 `VERSION_EXHAUSTED` are `409`. Corruption, idempotency-witness corruption, D1
 errors, secret configuration errors, and unexpected failures return only

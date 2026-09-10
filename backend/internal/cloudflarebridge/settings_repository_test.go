@@ -103,7 +103,7 @@ func TestSettingsRepository_GetValue(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		repository := newSettingsTestRepository(t, func(writer http.ResponseWriter, request *http.Request) {
 			writer.WriteHeader(http.StatusNotFound)
-			_, _ = writer.Write([]byte(`{"error":{"code":"NOT_FOUND","message":"setting missing"}}`))
+			_, _ = writer.Write([]byte(`{"error":{"code":"SETTING_NOT_FOUND","message":"setting missing"}}`))
 		})
 		_, err := repository.GetValue(context.Background(), "missing")
 		if !errors.Is(err, service.ErrSettingNotFound) {
@@ -213,7 +213,7 @@ func TestSettingsRepository_DeleteNotFoundAndContextCancellation(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		repository := newSettingsTestRepository(t, func(writer http.ResponseWriter, request *http.Request) {
 			writer.WriteHeader(http.StatusNotFound)
-			_, _ = writer.Write([]byte(`{"error":{"code":"NOT_FOUND","message":"missing"}}`))
+			_, _ = writer.Write([]byte(`{"error":{"code":"SETTING_NOT_FOUND","message":"missing"}}`))
 		})
 		if err := repository.Delete(context.Background(), "missing"); !errors.Is(err, service.ErrSettingNotFound) {
 			t.Fatalf("err=%v", err)
@@ -232,6 +232,14 @@ func TestSettingsRepository_DeleteNotFoundAndContextCancellation(t *testing.T) {
 }
 
 func TestSettingsRepository_RejectsMalformedMutationAndMapResponses(t *testing.T) {
+	t.Run("invalid UTF-8 input is not rewritten by JSON encoding", func(t *testing.T) {
+		repository := newSettingsTestRepository(t, func(http.ResponseWriter, *http.Request) {
+			t.Fatal("invalid input must not reach the control plane")
+		})
+		if err := repository.Set(context.Background(), "alpha", string([]byte{0xff})); err == nil {
+			t.Fatal("expected invalid UTF-8 input error")
+		}
+	})
 	t.Run("trailing mutation response", func(t *testing.T) {
 		repository := newSettingsTestRepository(t, func(writer http.ResponseWriter, request *http.Request) {
 			_, _ = writer.Write([]byte(`{"key":"alpha","version":"1","deleted":false,"replayed":false} {}`))

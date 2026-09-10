@@ -249,6 +249,7 @@ export async function settingsControlPlane(request: Request, env: Env, path: str
   } catch (caught) {
     if (caught instanceof SettingsRuntimeError) {
       const status = statusFor(caught);
+      if (caught.code === "NOT_FOUND") return error("SETTING_NOT_FOUND", status);
       return status === 503 ? error("SETTINGS_UNAVAILABLE", status) : error(caught.code, status);
     }
     return error("SETTINGS_UNAVAILABLE", 503);

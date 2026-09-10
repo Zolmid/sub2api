@@ -98,34 +98,69 @@ describe("edge readiness", () => {
     expect(forwarded).toBe(0);
   });
 
-  it("denies public ingress to the private job execution path and prefix", async () => {
+  it("fails closed for normalized forms of the reserved internal namespace", async () => {
     let forwarded = 0;
     const forward = async () => {
       forwarded += 1;
       return new Response("unexpected");
     };
 
-    const exact = await routeIngress(
-      new Request(`https://example.test${JOB_EXECUTION_PRIVATE_PATH}`, {
-        method: "POST",
-        headers: {
-          "X-Sub2API-Container-Id": "forged",
-          "X-Sub2API-Bridge-Version": "forged",
-        },
-      }),
-      env,
-      forward,
-    );
-    const child = await routeIngress(
-      new Request(`https://example.test${JOB_EXECUTION_PRIVATE_PATH}/extra`, {
-        method: "POST",
-      }),
-      env,
-      forward,
-    );
+    const hostilePaths = [
+      JOB_EXECUTION_PRIVATE_PATH,
+      `${JOB_EXECUTION_PRIVATE_PATH}/extra`,
+      "/internal/cloudflare/",
+      "/internal%2fcloudflare/jobs/execute",
+      "/internal%252Fcloudflare%252Fjobs%252Fexecute",
+      "/internal%5ccloudflare%5cjobs%5cexecute",
+      "//internal///cloudflare//jobs/execute",
+      "/INTERNAL/CLOUDFLARE/jobs/execute",
+      "/internal/%2e/cloudflare/jobs/execute",
+      "/internal/cloudflare/%2e%2e/cloudflare/jobs/execute",
+    ];
 
-    expect(exact.status).toBe(404);
-    expect(child.status).toBe(404);
+    for (const path of hostilePaths) {
+      const response = await routeIngress(
+        new Request(`https://example.test${path}`, {
+          method: "POST",
+          headers: {
+            "X-Sub2API-Fixture-Container": "gateway-a",
+            "X-Sub2API-Container-Id": "forged",
+            "X-Sub2API-Bridge-Version": "forged",
+          },
+        }),
+        env,
+        forward,
+      );
+      expect(response.status, path).toBe(404);
+    }
     expect(forwarded).toBe(0);
+  });
+
+  it("keeps unrelated internal-looking and public API paths routable", async () => {
+    const forwardedPaths: string[] = [];
+    const forward = async (request: Request) => {
+      forwardedPaths.push(new URL(request.url).pathname);
+      return new Response(null, { status: 204 });
+    };
+
+    for (const path of [
+      "/internality/cloudflare",
+      "/internal/cloudflared/jobs/execute",
+      "/api/v1/models",
+      "/v1/chat/completions",
+    ]) {
+      const response = await routeIngress(
+        new Request(`https://example.test${path}`),
+        env,
+        forward,
+      );
+      expect(response.status, path).toBe(204);
+    }
+    expect(forwardedPaths).toEqual([
+      "/internality/cloudflare",
+      "/internal/cloudflared/jobs/execute",
+      "/api/v1/models",
+      "/v1/chat/completions",
+    ]);
   });
 });

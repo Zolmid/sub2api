@@ -79,6 +79,44 @@ const RESERVED_INGRESS_HEADERS = [
 ];
 const AUTH_LOGIN_PATH = "/api/v1/auth/login";
 const AUTH_LOGIN_ADMISSION_KEY_BYTES = 32;
+const RESERVED_INTERNAL_INGRESS_NAMESPACE = "/internal/cloudflare";
+
+function normalizeIngressPathForNamespace(pathname: string): string {
+  // Decode only the syntax characters that can change path segmentation. Do
+  // this to a fixed point so double-encoded separators cannot bypass the
+  // public boundary, while leaving unrelated percent-encoded data untouched.
+  let decoded = pathname;
+  for (;;) {
+    const next = decoded.replace(/%25|%2e|%2f|%5c/gi, (encoded) => {
+      switch (encoded.toLowerCase()) {
+        case "%25": return "%";
+        case "%2e": return ".";
+        case "%2f": return "/";
+        case "%5c": return "\\";
+        default: return encoded;
+      }
+    });
+    if (next === decoded) break;
+    decoded = next;
+  }
+
+  const segments: string[] = [];
+  for (const segment of decoded.replace(/\\/g, "/").split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment.toLowerCase());
+  }
+  return `/${segments.join("/")}`;
+}
+
+function isReservedInternalIngressPath(pathname: string): boolean {
+  const normalized = normalizeIngressPathForNamespace(pathname);
+  return normalized === RESERVED_INTERNAL_INGRESS_NAMESPACE ||
+    normalized.startsWith(`${RESERVED_INTERNAL_INGRESS_NAMESPACE}/`);
+}
 
 export type ContainerForwarder = (
   request: Request,
@@ -425,12 +463,11 @@ export async function routeIngress(
     return error("NOT_FOUND", 404);
   }
   const url = new URL(request.url);
-  if (
-    url.pathname === JOB_EXECUTION_PRIVATE_PATH ||
-    url.pathname.startsWith(`${JOB_EXECUTION_PRIVATE_PATH}/`)
-  ) {
-    // This path is reserved for Worker-to-Container job RPC. Public ingress
-    // must fail closed before fixture headers or Container routing are honored.
+  if (isReservedInternalIngressPath(url.pathname)) {
+    // The complete /internal/cloudflare namespace is reserved for
+    // Worker-to-Container RPC. Public ingress must fail closed before fixture
+    // headers or Container routing are honored, including path forms that a
+    // downstream HTTP stack could normalize into this namespace.
     return error("NOT_FOUND", 404);
   }
   if (request.method === "GET" && url.pathname === "/ready") {

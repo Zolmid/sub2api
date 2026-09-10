@@ -43,9 +43,13 @@ current migration responsibilities:
 These names are versioned constants, not prefixes. Any other route remains
 `manual_review` with `unknown_route` evidence. Registered routes dispatch to
 the gateway Container on the private path
-`/internal/cloudflare/jobs/execute`. Public Worker ingress returns 404 for that
-path and its descendants, before fixture or routing headers are honored, so an
-external caller cannot reach the job RPC by path or header forgery.
+`/internal/cloudflare/jobs/execute`. The entire `/internal/cloudflare`
+namespace is reserved: public Worker ingress returns 404 for that path or any
+descendant before fixture or routing headers are honored. The boundary applies
+after normalizing repeated separators, dot segments, backslashes, case, and
+single or nested percent encodings of `%`, `.`, `/`, and `\\`; an external
+caller therefore cannot reach the job RPC by path or header forgery. This does
+not reserve unrelated public paths such as `/internality`, `/api/v1`, or `/v1`.
 
 The Worker sends a bounded JSON RPC envelope:
 

@@ -32,6 +32,7 @@ import {
   JOB_EXECUTION_PRIVATE_PATH,
   createGatewayJobExecutors,
 } from "./job-executors";
+import { emailControlPlane } from "./email-control";
 
 const USAGE_QUEUE_NAMES = new Set([
   "sub2api-usage",
@@ -340,7 +341,7 @@ Sub2APIContainer.outboundByHost = {
   ): Promise<Response> => {
     const headers = new Headers(request.headers);
     headers.set("X-Sub2API-Container-Id", ctx.containerId);
-    return controlPlane(new Request(request, { headers }), env);
+    return routePrivateControlPlane(new Request(request, { headers }), env);
   },
   "mock.upstream": async (request: Request, env: Env): Promise<Response> => {
     const runtime = env as unknown as ContainerRuntimeEnv;
@@ -408,6 +409,17 @@ Sub2APIContainer.outboundByHost = {
     });
   },
 };
+
+/** Dispatches Container-originated private RPC without creating public ingress. */
+export async function routePrivateControlPlane(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  // Email delivery remains a D1-authoritative private protocol. Handle its
+  // narrow namespace before the legacy control-plane switch, without adding
+  // any public Worker route or provider/network side effect.
+  return (await emailControlPlane(request, env)) ?? controlPlane(request, env);
+}
 
 // Requests have already passed the SDK allow-host gate. Returning fetch
 // preserves request and response streams for authorized real upstreams.

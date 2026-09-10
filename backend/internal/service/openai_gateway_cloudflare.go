@@ -4,12 +4,14 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // NewCloudflareVerticalSliceOpenAIGatewayService composes the existing OpenAI
@@ -57,7 +59,7 @@ func (s *OpenAIGatewayService) ForwardCloudflareResponses(
 	requestedModel string,
 	mappedModel string,
 ) (*OpenAIForwardResult, error) {
-	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
+	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, false, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
 		return s.Forward(observedCtx, c, mappedAccount, body)
 	})
 }
@@ -72,8 +74,25 @@ func (s *OpenAIGatewayService) ForwardCloudflareMessages(
 	requestedModel string,
 	mappedModel string,
 ) (*OpenAIForwardResult, error) {
-	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
+	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, false, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
 		return s.ForwardAsAnthropic(observedCtx, c, mappedAccount, body, "", mappedModel)
+	})
+}
+
+// ForwardCloudflareEmbeddings reuses the existing OpenAI embeddings forwarder
+// while making the Worker's per-request model mapping authoritative. Unlike
+// converted protocols, embeddings has a raw JSON response, so confirm usage
+// only after the raw upstream usage object is structurally valid.
+func (s *OpenAIGatewayService) ForwardCloudflareEmbeddings(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	requestedModel string,
+	mappedModel string,
+) (*OpenAIForwardResult, error) {
+	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, true, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
+		return s.ForwardEmbeddings(observedCtx, c, mappedAccount, body, mappedModel)
 	})
 }
 
@@ -82,12 +101,13 @@ func (s *OpenAIGatewayService) forwardCloudflareObserved(
 	account *Account,
 	requestedModel string,
 	mappedModel string,
+	validateEmbeddingsUsage bool,
 	forward func(context.Context, *Account) (*OpenAIForwardResult, error),
 ) (*OpenAIForwardResult, error) {
-	observation := &cloudflareUsageObservation{}
+	observation := &cloudflareUsageObservation{validateEmbeddingsUsage: validateEmbeddingsUsage}
 	observedCtx := context.WithValue(ctx, cloudflareUsageObservationKey{}, observation)
 	result, err := forward(observedCtx, cloudflareAccountWithMappedModel(account, requestedModel, mappedModel))
-	if result != nil && observation.present.Load() {
+	if result != nil && observation.UsagePresent() {
 		result.UsagePresent = true
 	}
 	return result, err
@@ -119,7 +139,49 @@ func cloudflareAccountWithMappedModel(account *Account, requestedModel, mappedMo
 type cloudflareUsageObservationKey struct{}
 
 type cloudflareUsageObservation struct {
-	present atomic.Bool
+	present                 atomic.Bool
+	validateEmbeddingsUsage bool
+	scanner                 cloudflareUsageKeyScanner
+}
+
+func (o *cloudflareUsageObservation) Write(data []byte) bool {
+	if o == nil {
+		return false
+	}
+	if o.validateEmbeddingsUsage {
+		return o.scanner.WriteEmbeddings(data)
+	}
+	return o.scanner.Write(data)
+}
+
+func (o *cloudflareUsageObservation) UsagePresent() bool {
+	if o == nil {
+		return false
+	}
+	return o.present.Load()
+}
+
+func hasValidCloudflareEmbeddingsUsageObject(usage gjson.Result) bool {
+	if !usage.Exists() || !usage.IsObject() {
+		return false
+	}
+
+	found := false
+	for _, key := range [...]string{"prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens"} {
+		value := usage.Get(key)
+		if !value.Exists() {
+			continue
+		}
+		found = true
+		if value.Type != gjson.Number {
+			return false
+		}
+		count, err := strconv.ParseInt(value.Raw, 10, 64)
+		if err != nil || count < 0 {
+			return false
+		}
+	}
+	return found
 }
 
 // cloudflareUsageObservingUpstream observes the upstream wire representation,
@@ -154,12 +216,11 @@ func wrapCloudflareUsageResponse(req *http.Request, resp *http.Response) *http.R
 type cloudflareUsageObservingBody struct {
 	io.ReadCloser
 	observation *cloudflareUsageObservation
-	scanner     cloudflareUsageKeyScanner
 }
 
 func (b *cloudflareUsageObservingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if n > 0 && !b.observation.present.Load() && b.scanner.Write(p[:n]) {
+	if n > 0 && (b.observation.validateEmbeddingsUsage || !b.observation.present.Load()) && b.observation.Write(p[:n]) {
 		b.observation.present.Store(true)
 	}
 	return n, err
@@ -181,10 +242,84 @@ type cloudflareUsageKeyScanner struct {
 	objectDepth    int
 	objectParents  [16]string
 	usageDepth     int
+	embeddings     bool
+	capture        cloudflareEmbeddingsUsageCapture
+}
+
+// cloudflareEmbeddingsUsageCapture keeps only the raw top-level usage object,
+// never the embedding vector payload. The cap is deliberately far below the
+// existing upstream response limit; an oversized usage object is unconfirmed.
+const cloudflareEmbeddingsUsageCaptureMaxBytes = 64 << 10
+
+type cloudflareEmbeddingsUsageCapture struct {
+	active    bool
+	completed bool
+	overflow  bool
+	inString  bool
+	escaped   bool
+	depth     int
+	body      []byte
+}
+
+func (c *cloudflareEmbeddingsUsageCapture) Start(ch byte) {
+	c.active = true
+	c.Write(ch)
+}
+
+func (c *cloudflareEmbeddingsUsageCapture) Write(ch byte) bool {
+	if !c.active {
+		return false
+	}
+	if len(c.body) >= cloudflareEmbeddingsUsageCaptureMaxBytes {
+		c.overflow = true
+		c.active = false
+		c.completed = true
+		return false
+	}
+	c.body = append(c.body, ch)
+	if c.inString {
+		if c.escaped {
+			c.escaped = false
+			return false
+		}
+		if ch == '\\' {
+			c.escaped = true
+			return false
+		}
+		if ch == '"' {
+			c.inString = false
+		}
+		return false
+	}
+	switch ch {
+	case '"':
+		c.inString = true
+	case '{':
+		c.depth++
+	case '}':
+		c.depth--
+		if c.depth == 0 {
+			c.active = false
+			c.completed = true
+			return !c.overflow && gjson.ValidBytes(c.body) && hasValidCloudflareEmbeddingsUsageObject(gjson.ParseBytes(c.body))
+		}
+	}
+	return false
+}
+
+func (s *cloudflareUsageKeyScanner) WriteEmbeddings(data []byte) bool {
+	s.embeddings = true
+	return s.Write(data)
 }
 
 func (s *cloudflareUsageKeyScanner) Write(data []byte) bool {
 	for _, ch := range data {
+		if s.embeddings && s.capture.active {
+			if s.capture.Write(ch) {
+				return true
+			}
+			continue
+		}
 		if s.inString {
 			if s.escaped {
 				s.escaped = false
@@ -219,7 +354,7 @@ func (s *cloudflareUsageKeyScanner) Write(data []byte) bool {
 			}
 			s.waitingColon = false
 			if ch == ':' {
-				if s.usageDepth > 0 && s.objectDepth == s.usageDepth &&
+				if !s.embeddings && s.usageDepth > 0 && s.objectDepth == s.usageDepth &&
 					isCloudflareUsageTokenKey(s.pendingKey) {
 					return true
 				}
@@ -236,7 +371,11 @@ func (s *cloudflareUsageKeyScanner) Write(data []byte) bool {
 			s.waitingValue = false
 			s.pendingKey = ""
 			if ch == '{' {
+				captureUsage := s.embeddings && !s.capture.completed && key == "usage" && s.objectDepth == 1
 				s.openObject(key)
+				if captureUsage {
+					s.capture.Start(ch)
+				}
 				continue
 			}
 		}

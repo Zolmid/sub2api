@@ -35,6 +35,7 @@ const (
 	gatewayProtocolChatCompletions gatewayProtocol = iota
 	gatewayProtocolResponses
 	gatewayProtocolMessages
+	gatewayProtocolEmbeddings
 )
 
 // deferredResponseWriter keeps a non-streaming upstream response private until
@@ -253,6 +254,12 @@ func newHandler(runtime *RuntimeConfig, control ControlPlane, upstream service.H
 	gateway.POST("/chat/completions", handler.chatCompletions)
 	gateway.POST("/responses", handler.responses)
 	gateway.POST("/messages", handler.messages)
+	gateway.POST("/embeddings", handler.embeddings)
+	embeddingsAlias := router.Group("")
+	embeddingsAlias.Use(middleware.RequestBodyLimit(runtime.Application.Gateway.TextMaxBodySize))
+	embeddingsAlias.Use(middleware.ClientRequestID())
+	embeddingsAlias.Use(gin.HandlerFunc(apiKeyAuthMiddleware))
+	embeddingsAlias.POST("/embeddings", handler.embeddings)
 
 	// The embedded middleware deliberately bypasses API and gateway paths, then
 	// serves static assets and SPA fallbacks. The non-embed build remains useful
@@ -294,6 +301,10 @@ func (h *gatewayHandler) messages(c *gin.Context) {
 	h.serveGateway(c, gatewayProtocolMessages)
 }
 
+func (h *gatewayHandler) embeddings(c *gin.Context) {
+	h.serveGateway(c, gatewayProtocolEmbeddings)
+}
+
 func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) {
 	apiKey, ok := middleware.GetAPIKeyFromContext(c)
 	if !ok || apiKey == nil || apiKey.GroupID == nil {
@@ -314,6 +325,10 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 	body = parsed.Body.Bytes()
 	if strings.TrimSpace(parsed.Model) == "" {
 		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "model is required")
+		return
+	}
+	if protocol == gatewayProtocolEmbeddings && parsed.Stream {
+		writeGatewayProtocolError(c, protocol, http.StatusBadRequest, "INVALID_REQUEST", "streaming is not supported for embeddings")
 		return
 	}
 	if protocol != gatewayProtocolMessages {
@@ -347,22 +362,14 @@ func (h *gatewayHandler) serveGateway(c *gin.Context, protocol gatewayProtocol) 
 		return
 	}
 	if admission == nil || admission.Account == nil {
+		if admission != nil {
+			h.releaseAdmissionLease(requestID, admission.Lease)
+		}
 		writeGatewayProtocolError(c, protocol, http.StatusServiceUnavailable, "ADMISSION_INVALID", "Account admission returned no account")
 		return
 	}
-	if admission.Account.Platform != service.PlatformOpenAI || admission.Account.Type != service.AccountTypeAPIKey {
-		lease := admission.Lease
-		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if releaseErr := h.control.Release(releaseCtx, ReleaseRequest{
-			RequestID: lease.RequestID,
-			AccountID: lease.AccountID,
-			LeaseID:   lease.ID,
-			Owner:     lease.Owner,
-			Epoch:     lease.Epoch,
-		}); releaseErr != nil {
-			slog.Error("cloudflare unsupported reservation release failed", "request_id", requestID, "account_id", lease.AccountID, "error", releaseErr)
-		}
-		cancel()
+	if !protocol.supportsAdmittedAccount(admission.Account) {
+		h.releaseAdmissionLease(requestID, admission.Lease)
 		writeGatewayProtocolError(c, protocol, http.StatusServiceUnavailable, "ADMISSION_INVALID", "Admitted account is not a supported OpenAI API-key account")
 		return
 	}
@@ -510,8 +517,34 @@ func (p gatewayProtocol) parserName() string {
 		return "responses"
 	case gatewayProtocolMessages:
 		return service.PlatformAnthropic
+	case gatewayProtocolEmbeddings:
+		return "embeddings"
 	default:
 		return "chat_completions"
+	}
+}
+
+func (p gatewayProtocol) supportsAdmittedAccount(account *service.Account) bool {
+	if account == nil || account.Platform != service.PlatformOpenAI || account.Type != service.AccountTypeAPIKey {
+		return false
+	}
+	if p == gatewayProtocolEmbeddings {
+		return account.IsActive() && account.SupportsOpenAIEndpointCapability(service.OpenAIEndpointCapabilityEmbeddings)
+	}
+	return true
+}
+
+func (h *gatewayHandler) releaseAdmissionLease(requestID string, lease Lease) {
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.control.Release(releaseCtx, ReleaseRequest{
+		RequestID: lease.RequestID,
+		AccountID: lease.AccountID,
+		LeaseID:   lease.ID,
+		Owner:     lease.Owner,
+		Epoch:     lease.Epoch,
+	}); err != nil {
+		slog.Error("cloudflare unsupported reservation release failed", "request_id", requestID, "account_id", lease.AccountID, "error", err)
 	}
 }
 
@@ -529,6 +562,8 @@ func (h *gatewayHandler) forward(
 		return h.forwarder.ForwardCloudflareResponses(ctx, c, account, body, requestedModel, mappedModel)
 	case gatewayProtocolMessages:
 		return h.forwarder.ForwardCloudflareMessages(ctx, c, account, body, requestedModel, mappedModel)
+	case gatewayProtocolEmbeddings:
+		return h.forwarder.ForwardCloudflareEmbeddings(ctx, c, account, body, requestedModel, mappedModel)
 	default:
 		return h.forwarder.ForwardAsChatCompletions(ctx, c, account, body, "", mappedModel)
 	}
@@ -549,6 +584,26 @@ func writeGatewayProtocolError(c *gin.Context, protocol gatewayProtocol, status 
 		}
 		c.AbortWithStatusJSON(status, gin.H{
 			"type": "error",
+			"error": gin.H{
+				"type":    errorType,
+				"message": message,
+			},
+		})
+		return
+	}
+	if protocol == gatewayProtocolEmbeddings {
+		errorType := "api_error"
+		switch status {
+		case http.StatusBadRequest:
+			errorType = "invalid_request_error"
+		case http.StatusUnauthorized:
+			errorType = "authentication_error"
+		case http.StatusForbidden, http.StatusPaymentRequired:
+			errorType = "permission_error"
+		case http.StatusTooManyRequests:
+			errorType = "rate_limit_error"
+		}
+		c.AbortWithStatusJSON(status, gin.H{
 			"error": gin.H{
 				"type":    errorType,
 				"message": message,

@@ -42,6 +42,21 @@ multi-candidate Gemini output, or non-text tool-result media.
 | Auth, rate limits, model routing, observability | not integrated | gateway policy and redaction tests |
 | Production deployment | not attempted | explicit deployment approval and live protocol acceptance |
 
+## Cloudflare bridge embeddings scope
+
+Cloudflare mode exposes the baseline non-streaming OpenAI embeddings contract
+at both `POST /v1/embeddings` and `POST /embeddings`. Both aliases use the
+same API-key middleware, Worker admission, lease, upstream start marker, and
+completion/release lifecycle as the existing bridge gateway routes.
+
+The Worker scheduler does not yet prefilter accounts by endpoint capability.
+The bridge therefore rechecks an admitted account for the active OpenAI API-key
+embeddings capability before any upstream request; a mismatch releases the
+exact reservation and does not issue completion or upstream traffic. It does
+not select or retry a later capable account. Adding that behavior requires a
+Worker scheduler/admission-contract change and is outside this bounded route
+slice.
+
 The bounded SSE parser accepts fragmented readers, CRLF, comments, persistent
 IDs, valid numeric retry directives, multiple data lines, and a final line
 without a newline. It enforces physical-line, event-body, and event-count

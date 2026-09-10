@@ -407,6 +407,8 @@ type fakeHTTPUpstream struct {
 	requestContext context.Context
 	responseBody   string
 	contentType    string
+	responseStatus int
+	responseErr    error
 	networkCalls   int
 	beforeNetwork  func()
 }
@@ -423,6 +425,29 @@ func (blockingHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*ht
 
 func (b blockingHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return b.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
+type cancellableHTTPUpstream struct {
+	started chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func (u *cancellableHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		return nil, err
+	}
+	u.mu.Lock()
+	u.calls++
+	u.mu.Unlock()
+	u.once.Do(func() { close(u.started) })
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func (u *cancellableHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
 type delayedSSEHTTPUpstream struct {
@@ -478,15 +503,23 @@ func (f *fakeHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*htt
 	f.requestContext = req.Context()
 	responseBody := f.responseBody
 	contentType := f.contentType
+	responseStatus := f.responseStatus
+	responseErr := f.responseErr
 	f.mu.Unlock()
+	if responseErr != nil {
+		return nil, responseErr
+	}
 	if responseBody == "" {
 		responseBody = `{"id":"chatcmpl_cf","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`
 	}
 	if contentType == "" {
 		contentType = "application/json"
 	}
+	if responseStatus == 0 {
+		responseStatus = http.StatusOK
+	}
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: responseStatus,
 		Header: http.Header{
 			"Content-Type": []string{contentType},
 			"X-Request-Id": []string{"upstream-unit-test"},
@@ -710,6 +743,364 @@ func TestCloudflareHandlerMessagesNonStreamUsesMappedModelAndLifecycle(t *testin
 	require.Equal(t, UsageConfirmed, control.completion.UsageState)
 	require.Equal(t, "high", control.completion.ReasoningEffort)
 	require.Equal(t, "upstream-unit-test", control.completion.UpstreamID)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerEmbeddingsNonStreamUsesMappedModelAndLifecycle(t *testing.T) {
+	control := testControlPlane()
+	responseBody := `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]},{"object":"embedding","index":1,"embedding":[0.3,0.4]}],"model":"mock-upstream-model","usage":{"prompt_tokens":13,"total_tokens":13}}`
+	upstream := &fakeHTTPUpstream{responseBody: responseBody}
+	startBeforeNetwork := false
+	upstream.beforeNetwork = func() {
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		startBeforeNetwork = control.startCount == 1
+	}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"client-embedding-model","input":["hello","world"],"encoding_format":"float","dimensions":256}`)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	require.JSONEq(t, responseBody, res.Body.String())
+	require.True(t, startBeforeNetwork)
+	upstream.mu.Lock()
+	require.Equal(t, 1, upstream.networkCalls)
+	require.Equal(t, "https://mock.upstream/v1/embeddings", upstream.requestURL)
+	require.JSONEq(t, `{"model":"mock-upstream-model","input":["hello","world"],"encoding_format":"float","dimensions":256}`, string(upstream.body))
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.completion)
+	require.Equal(t, OutcomeSucceeded, control.completion.Outcome)
+	require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	require.Equal(t, "13", control.completion.InputTokens)
+	require.Equal(t, "0", control.completion.OutputTokens)
+	require.Equal(t, "client-embedding-model", control.completion.Model)
+	require.Equal(t, "mock-upstream-model", control.completion.UpstreamModel)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerEmbeddingsAliasesShareLifecycle(t *testing.T) {
+	for _, path := range []string{"/v1/embeddings", "/embeddings"} {
+		t.Run(path, func(t *testing.T) {
+			control := testControlPlane()
+			upstream := &fakeHTTPUpstream{responseBody: `{"object":"list","data":[],"usage":{"prompt_tokens":1,"total_tokens":1}}`}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, path, "sk-cloudflare-unit-test", `{"model":"client-embedding-model","input":"hello"}`)
+
+			require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+			upstream.mu.Lock()
+			require.Equal(t, 1, upstream.networkCalls)
+			require.Equal(t, "https://mock.upstream/v1/embeddings", upstream.requestURL)
+			require.Equal(t, "mock-upstream-model", gjson.GetBytes(upstream.body, "model").String())
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, 1, control.admitCount)
+			require.Equal(t, 1, control.startCount)
+			require.NotNil(t, control.completion)
+			require.Equal(t, OutcomeSucceeded, control.completion.Outcome)
+			require.Equal(t, UsageConfirmed, control.completion.UsageState)
+			require.Zero(t, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareHandlerEmbeddingsUsagePresence(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseBody  string
+		expectedState string
+		expectedInput string
+	}{
+		{
+			name:          "nonzero usage",
+			responseBody:  `{"object":"list","data":[],"usage":{"prompt_tokens":7,"total_tokens":7}}`,
+			expectedState: UsageConfirmed,
+			expectedInput: "7",
+		},
+		{
+			name:          "explicit all-zero usage",
+			responseBody:  `{"object":"list","data":[],"usage":{"prompt_tokens":0,"total_tokens":0}}`,
+			expectedState: UsageConfirmed,
+			expectedInput: "0",
+		},
+		{
+			name:          "missing usage",
+			responseBody:  `{"object":"list","data":[]}`,
+			expectedState: UsageUnknown,
+			expectedInput: "0",
+		},
+		{
+			name:          "malformed usage values",
+			responseBody:  `{"object":"list","data":[],"usage":{"prompt_tokens":"zero","total_tokens":0}}`,
+			expectedState: UsageUnknown,
+			expectedInput: "0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			upstream := &fakeHTTPUpstream{responseBody: tt.responseBody}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"client-embedding-model","input":"hello"}`)
+
+			require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.NotNil(t, control.completion)
+			require.Equal(t, tt.expectedState, control.completion.UsageState)
+			require.Equal(t, tt.expectedInput, control.completion.InputTokens)
+			require.Equal(t, "0", control.completion.OutputTokens)
+		})
+	}
+}
+
+func TestCloudflareHandlerEmbeddingsRejectsBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiKey     string
+		body       string
+		admitErr   error
+		wantAdmits int
+		wantStatus int
+	}{
+		{name: "authentication", apiKey: "wrong-key", body: `{"model":"test-model","input":"hello"}`, wantStatus: http.StatusUnauthorized},
+		{name: "admission", apiKey: "sk-cloudflare-unit-test", body: `{"model":"test-model","input":"hello"}`, admitErr: ErrAdmissionRejected, wantAdmits: 1, wantStatus: http.StatusTooManyRequests},
+		{name: "missing model", apiKey: "sk-cloudflare-unit-test", body: `{"input":"hello"}`, wantStatus: http.StatusBadRequest},
+		{name: "invalid model", apiKey: "sk-cloudflare-unit-test", body: `{"model":7,"input":"hello"}`, wantStatus: http.StatusBadRequest},
+		{name: "streaming", apiKey: "sk-cloudflare-unit-test", body: `{"model":"test-model","input":"hello","stream":true}`, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			control.admitErr = tt.admitErr
+			upstream := &fakeHTTPUpstream{}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, "/v1/embeddings", tt.apiKey, tt.body)
+
+			require.Equal(t, tt.wantStatus, res.Code, res.Body.String())
+			upstream.mu.Lock()
+			require.Zero(t, upstream.networkCalls)
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, tt.wantAdmits, control.admitCount)
+			require.Zero(t, control.startCount)
+			require.Nil(t, control.completion)
+			require.Zero(t, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareHandlerEmbeddingsRejectsUnsupportedAdmissionAndReleasesLease(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*service.Account)
+	}{
+		{
+			name: "capability",
+			mutate: func(account *service.Account) {
+				account.Credentials["openai_capabilities"] = []any{"chat_completions"}
+			},
+		},
+		{
+			name: "inactive",
+			mutate: func(account *service.Account) {
+				account.Status = service.StatusDisabled
+			},
+		},
+		{
+			name: "wrong platform",
+			mutate: func(account *service.Account) {
+				account.Platform = service.PlatformAnthropic
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			tt.mutate(control.account)
+			upstream := &fakeHTTPUpstream{}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello"}`)
+
+			require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+			upstream.mu.Lock()
+			require.Zero(t, upstream.networkCalls)
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, 1, control.admitCount)
+			require.Zero(t, control.startCount)
+			require.Nil(t, control.completion)
+			require.Equal(t, 1, control.releaseCount)
+			require.NotNil(t, control.release)
+			require.Equal(t, "lease-unit-test", control.release.LeaseID)
+			require.Equal(t, "3001", control.release.AccountID)
+		})
+	}
+}
+
+func TestCloudflareHandlerEmbeddingsReleasesCorruptAdmissionBeforeUpstream(t *testing.T) {
+	control := testControlPlane()
+	control.account = nil
+	upstream := &fakeHTTPUpstream{}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello"}`)
+
+	require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+	upstream.mu.Lock()
+	require.Zero(t, upstream.networkCalls)
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Zero(t, control.startCount)
+	require.Nil(t, control.completion)
+	require.Equal(t, 1, control.releaseCount)
+	require.NotNil(t, control.release)
+	require.Equal(t, "lease-unit-test", control.release.LeaseID)
+	require.Equal(t, "3001", control.release.AccountID)
+}
+
+func TestCloudflareHandlerEmbeddingsUpstreamFailureDoesNotRetry(t *testing.T) {
+	tests := []struct {
+		name           string
+		responseStatus int
+		responseErr    error
+	}{
+		{name: "rate limited", responseStatus: http.StatusTooManyRequests},
+		{name: "server error", responseStatus: http.StatusBadGateway},
+		{name: "transport error", responseErr: errors.New("injected transport error")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			upstream := &fakeHTTPUpstream{
+				responseStatus: tt.responseStatus,
+				responseErr:    tt.responseErr,
+				responseBody:   `{"error":{"message":"injected upstream error"}}`,
+			}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello"}`)
+
+			require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+			upstream.mu.Lock()
+			require.Equal(t, 1, upstream.networkCalls)
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, 1, control.startCount)
+			require.NotNil(t, control.completion)
+			require.Equal(t, OutcomeFailed, control.completion.Outcome)
+			require.Zero(t, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareHandlerEmbeddingsCompletionFailureHidesBufferedResponse(t *testing.T) {
+	control := testControlPlane()
+	control.completionErr = errors.New("injected completion failure")
+	upstream := &fakeHTTPUpstream{responseBody: `{"object":"list","data":[],"usage":{"prompt_tokens":1,"total_tokens":1}}`}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello"}`)
+
+	require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+	require.Equal(t, "api_error", gjson.Get(res.Body.String(), "error.type").String())
+	require.Equal(t, "Billing settlement could not be committed", gjson.Get(res.Body.String(), "error.message").String())
+	require.NotContains(t, res.Body.String(), `"object":"list"`)
+	upstream.mu.Lock()
+	require.Equal(t, 1, upstream.networkCalls)
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.NotNil(t, control.completion)
+	require.Equal(t, 1, control.releaseCount)
+}
+
+func TestCloudflareHandlerEmbeddingsClientCancellationSettlesWithoutRetry(t *testing.T) {
+	control := testControlPlane()
+	upstream := &cancellableHTTPUpstream{started: make(chan struct{})}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"test-model","input":"hello"}`)).WithContext(requestCtx)
+	req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(res, req)
+		close(done)
+	}()
+
+	select {
+	case <-upstream.started:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not observe client cancellation")
+	}
+
+	require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+	upstream.mu.Lock()
+	require.Equal(t, 1, upstream.calls)
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.completion)
+	require.Equal(t, OutcomeFailed, control.completion.Outcome)
+	require.Zero(t, control.releaseCount, "a started request is settled by completion, not a second release")
+}
+
+func TestCloudflareHandlerEmbeddingsLeaseLossCancelsUpstreamAndSettlesOnce(t *testing.T) {
+	control := testControlPlane()
+	control.leaseExpiry = time.Now().Add(100 * time.Millisecond)
+	control.renewErr = errors.New("injected renewal failure")
+	runtime := testRuntimeConfig(t)
+	runtime.LeaseTTLSeconds = 3
+	handler, err := NewHandler(runtime, control, blockingHTTPUpstream{})
+	require.NoError(t, err)
+
+	started := time.Now()
+	res := serveGatewayRequest(t, handler, "/v1/embeddings", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello"}`)
+
+	require.Less(t, time.Since(started), 2500*time.Millisecond)
+	require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+	require.Equal(t, "upstream_error", gjson.Get(res.Body.String(), "error.type").String())
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.GreaterOrEqual(t, control.renewCount, 1)
+	require.NotNil(t, control.completion)
+	require.Equal(t, OutcomeFailed, control.completion.Outcome)
+	require.Equal(t, UsageUnknown, control.completion.UsageState)
 	require.Zero(t, control.releaseCount)
 }
 

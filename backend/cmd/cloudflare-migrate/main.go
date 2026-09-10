@@ -34,7 +34,7 @@ func writeFormat(writer io.Writer, format string, values ...any) {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		writeLine(stderr, "usage: cloudflare-migrate <snapshot-postgres|export|plan|snapshot-postgres-0017|export-0017|plan-0017|upgrade-0017|remote-plan> [flags]")
+		writeLine(stderr, "usage: cloudflare-migrate <snapshot-postgres|export|plan|snapshot-postgres-0017|export-0017|plan-0017|upgrade-0017|snapshot-postgres-0018|export-0018|plan-0018|upgrade-0018|remote-plan> [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -42,16 +42,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runSnapshotPostgreSQL(args[1:], stdout, stderr)
 	case "snapshot-postgres-0017":
 		return runSnapshotPostgreSQL0017(args[1:], stdout, stderr)
+	case "snapshot-postgres-0018":
+		return runSnapshotPostgreSQL0018(args[1:], stdout, stderr)
 	case "export":
 		return runExport(args[1:], stdin, stdout, stderr)
 	case "export-0017":
 		return runExport0017(args[1:], stdout, stderr)
+	case "export-0018":
+		return runExport0018(args[1:], stdout, stderr)
 	case "plan":
 		return runPlan(args[1:], stdout, stderr)
 	case "plan-0017":
 		return runPlan0017(args[1:], stdout, stderr)
+	case "plan-0018":
+		return runPlan0018(args[1:], stdout, stderr)
 	case "upgrade-0017":
 		return runUpgrade0017(args[1:], stdout, stderr)
+	case "upgrade-0018":
+		return runUpgrade0018(args[1:], stdout, stderr)
 	case "remote-plan":
 		return runRemotePlan(args[1:], stdout, stderr)
 	default:
@@ -66,6 +74,10 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 
 func runSnapshotPostgreSQL0017(args []string, stdout, stderr io.Writer) int {
 	return runSnapshotPostgreSQLWith(args, stdout, stderr, "snapshot-postgres-0017", true, cloudflaremigration.ExportPostgreSQLRestoreSnapshot)
+}
+
+func runSnapshotPostgreSQL0018(args []string, stdout, stderr io.Writer) int {
+	return runSnapshotPostgreSQLWith(args, stdout, stderr, "snapshot-postgres-0018", true, cloudflaremigration.ExportPostgreSQLRestoreSnapshot0018)
 }
 
 func runSnapshotPostgreSQLWith(args []string, stdout, stderr io.Writer, command string, refuseOverwrite bool, exporter func(context.Context, *sql.DB, io.Writer, cloudflaremigration.PostgreSQLSnapshotOptions) error) int {
@@ -161,10 +173,18 @@ func runSnapshotPostgreSQLWith(args []string, stdout, stderr io.Writer, command 
 }
 
 func runExport0017(args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("export-0017", flag.ContinueOnError)
+	return runRestoreExportWith(args, stdout, stderr, "export-0017", "0001-0017", cloudflaremigration.ExportRestoreJSONL, cloudflaremigration.BuildRestoreSQLPlan)
+}
+
+func runExport0018(args []string, stdout, stderr io.Writer) int {
+	return runRestoreExportWith(args, stdout, stderr, "export-0018", "0001-0018", cloudflaremigration.ExportRestoreJSONL0018, cloudflaremigration.BuildRestoreSQLPlan0018)
+}
+
+func runRestoreExportWith(args []string, stdout, stderr io.Writer, command, label string, exporter func(io.Reader) (cloudflaremigration.RestoreBundle, error), planner func(cloudflaremigration.RestoreManifest) (cloudflaremigration.SQLPlan, error)) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	output := flags.String("out", "", "absolute private 0001-0017 restore bundle output path")
-	source := flags.String("source-jsonl", "", "absolute path to a complete 0001-0017 offline PostgreSQL JSONL export")
+	output := flags.String("out", "", "absolute private "+label+" restore bundle output path")
+	source := flags.String("source-jsonl", "", "absolute path to a complete "+label+" offline PostgreSQL JSONL export")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -183,7 +203,7 @@ func runExport0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "open offline source failed")
 		return 1
 	}
-	bundle, exportErr := cloudflaremigration.ExportRestoreJSONL(input)
+	bundle, exportErr := exporter(input)
 	closeErr := input.Close()
 	if exportErr != nil || closeErr != nil {
 		writeLine(stderr, "offline PostgreSQL restore export rejected")
@@ -194,7 +214,7 @@ func runExport0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "encode private restore bundle failed or exceeded size bound")
 		return 1
 	}
-	plan, err := cloudflaremigration.BuildRestoreSQLPlan(bundle.Manifest)
+	plan, err := planner(bundle.Manifest)
 	if err != nil {
 		writeLine(stderr, "exported restore bundle failed final validation")
 		return 1
@@ -203,7 +223,7 @@ func runExport0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "write private restore bundle failed")
 		return 1
 	}
-	writeFormat(stdout, "exported %d classified source tables for canonical 0001-0017 with %d warning(s); bundle sha256 %s\n", len(bundle.Manifest.Coverage), len(bundle.Manifest.Warnings), plan.BundleDigest)
+	writeFormat(stdout, "exported %d classified source tables for canonical %s with %d warning(s); bundle sha256 %s\n", len(bundle.Manifest.Coverage), label, len(bundle.Manifest.Warnings), plan.BundleDigest)
 	return 0
 }
 
@@ -364,10 +384,18 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 }
 
 func runPlan0017(args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("plan-0017", flag.ContinueOnError)
+	return runRestorePlanWith(args, stdout, stderr, "plan-0017", "0001-0017", cloudflaremigration.ExportRestoreJSONL, cloudflaremigration.CanonicalizeRestore, cloudflaremigration.BuildRestoreSQLPlan)
+}
+
+func runPlan0018(args []string, stdout, stderr io.Writer) int {
+	return runRestorePlanWith(args, stdout, stderr, "plan-0018", "0001-0018", cloudflaremigration.ExportRestoreJSONL0018, cloudflaremigration.CanonicalizeRestore0018, cloudflaremigration.BuildRestoreSQLPlan0018)
+}
+
+func runRestorePlanWith(args []string, stdout, stderr io.Writer, command, label string, exporter func(io.Reader) (cloudflaremigration.RestoreBundle, error), canonicalize func(cloudflaremigration.RestoreManifest) (cloudflaremigration.RestoreManifest, error), planner func(cloudflaremigration.RestoreManifest) (cloudflaremigration.SQLPlan, error)) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	sourcePath := flags.String("source-jsonl", "", "absolute 0001-0017 source snapshot path")
-	bundlePath := flags.String("bundle", "", "absolute 0001-0017 restore bundle path")
+	sourcePath := flags.String("source-jsonl", "", "absolute "+label+" source snapshot path")
+	bundlePath := flags.String("bundle", "", "absolute "+label+" restore bundle path")
 	canonicalPath := flags.String("canonical-bundle", "", "absolute canonical restore bundle output path")
 	planPath := flags.String("sql-plan", "", "absolute D1 restore SQL output path")
 	validationPath := flags.String("validation-sql", "", "absolute read-only validation SQL output path")
@@ -399,7 +427,7 @@ func runPlan0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "read restore source snapshot failed")
 		return 1
 	}
-	sourceBundle, sourceErr := cloudflaremigration.ExportRestoreJSONL(sourceFile)
+	sourceBundle, sourceErr := exporter(sourceFile)
 	closeErr := sourceFile.Close()
 	if sourceErr != nil || closeErr != nil {
 		writeLine(stderr, "restore source snapshot rejected")
@@ -415,12 +443,12 @@ func runPlan0017(args []string, stdout, stderr io.Writer) int {
 		writeFormat(stderr, "restore bundle rejected: %v\n", err)
 		return 1
 	}
-	canonical, err := cloudflaremigration.CanonicalizeRestore(bundle.Manifest)
+	canonical, err := canonicalize(bundle.Manifest)
 	if err != nil {
 		writeFormat(stderr, "restore bundle rejected: %v\n", err)
 		return 1
 	}
-	sourceCanonical, err := cloudflaremigration.CanonicalizeRestore(sourceBundle.Manifest)
+	sourceCanonical, err := canonicalize(sourceBundle.Manifest)
 	if err != nil {
 		writeLine(stderr, "restore source failed canonical validation")
 		return 1
@@ -431,7 +459,7 @@ func runPlan0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "restore bundle does not match the supplied source snapshot")
 		return 1
 	}
-	plan, err := cloudflaremigration.BuildRestoreSQLPlan(canonical)
+	plan, err := planner(canonical)
 	if err != nil {
 		writeFormat(stderr, "restore SQL plan rejected: %v\n", err)
 		return 1
@@ -449,7 +477,7 @@ func runPlan0017(args []string, stdout, stderr io.Writer) int {
 		writeLine(stderr, "publish private restore outputs failed; inspect requested paths before retry")
 		return 1
 	}
-	writeFormat(stdout, "validated %d target chunks through canonical 0017; bundle sha256 %s\n", len(canonical.Tables), plan.BundleDigest)
+	writeFormat(stdout, "validated %d target chunks through canonical %s; bundle sha256 %s\n", len(canonical.Tables), label, plan.BundleDigest)
 	return 0
 }
 
@@ -508,6 +536,64 @@ func runUpgrade0017(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	writeFormat(stdout, "upgraded canonical empty-later-state bundle through 0017; bundle sha256 %s\n", plan.BundleDigest)
+	return 0
+}
+
+func runUpgrade0018(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("upgrade-0018", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	bundlePath := flags.String("bundle", "", "absolute accepted 0001-0017 restore bundle path")
+	outputPath := flags.String("out", "", "absolute upgraded 0001-0018 restore bundle path")
+	planPath := flags.String("sql-plan", "", "absolute upgraded D1 0018 restore SQL output path")
+	validationPath := flags.String("validation-sql", "", "absolute upgraded 0018 read-only validation SQL output path")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *bundlePath == "" || *outputPath == "" || *planPath == "" || *validationPath == "" || !filepath.IsAbs(*bundlePath) || !filepath.IsAbs(*outputPath) || !filepath.IsAbs(*planPath) || !filepath.IsAbs(*validationPath) {
+		writeLine(stderr, "-bundle, -out, -sql-plan, and -validation-sql must be distinct absolute paths; positional arguments are not accepted")
+		return 2
+	}
+	if err := cloudflaremigration.ValidateDistinctPaths([]cloudflaremigration.NamedPath{
+		{Name: "0017 restore bundle", Path: *bundlePath}, {Name: "0018 restore bundle output", Path: *outputPath},
+		{Name: "0018 restore SQL output", Path: *planPath}, {Name: "0018 validation SQL output", Path: *validationPath},
+	}); err != nil {
+		writeFormat(stderr, "upgrade paths rejected: %v\n", err)
+		return 2
+	}
+	input, err := readBoundedFile(*bundlePath, cloudflaremigration.MaxBundleBytes)
+	if err != nil {
+		writeLine(stderr, "read 0017 restore bundle failed")
+		return 1
+	}
+	legacy, err := cloudflaremigration.DecodeRestoreBundle(input)
+	if err != nil {
+		writeFormat(stderr, "0017 restore bundle rejected: %v\n", err)
+		return 1
+	}
+	upgraded, err := cloudflaremigration.UpgradeRestoreBundleTo0018(legacy)
+	if err != nil {
+		writeFormat(stderr, "0017 restore bundle cannot be upgraded: %v\n", err)
+		return 1
+	}
+	plan, err := cloudflaremigration.BuildRestoreSQLPlan0018(upgraded.Manifest)
+	if err != nil {
+		writeLine(stderr, "upgraded 0018 restore bundle failed final validation")
+		return 1
+	}
+	encoded, err := json.MarshalIndent(upgraded, "", "  ")
+	if err != nil || len(encoded)+1 > cloudflaremigration.MaxBundleBytes {
+		writeLine(stderr, "encode upgraded 0018 restore bundle failed or exceeded size bound")
+		return 1
+	}
+	if err := writePrivateFilesAtomically([]privateOutput{
+		{path: *outputPath, data: append(encoded, '\n')},
+		{path: *planPath, data: []byte(plan.SQL)},
+		{path: *validationPath, data: []byte(plan.ValidationSQL)},
+	}); err != nil {
+		writeLine(stderr, "publish upgraded 0018 restore outputs failed")
+		return 1
+	}
+	writeFormat(stdout, "upgraded canonical pristine-auth-session bundle through 0018; bundle sha256 %s\n", plan.BundleDigest)
 	return 0
 }
 

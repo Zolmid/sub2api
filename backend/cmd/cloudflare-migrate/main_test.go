@@ -115,13 +115,21 @@ func emptySourceSnapshotOmitting(t *testing.T, omitted string) []byte {
 }
 
 func emptyRestoreSourceSnapshot(t *testing.T) []byte {
+	return emptyRestoreSourceSnapshotWith(t, cloudflaremigration.RestoreSourceFormatVersion, cloudflaremigration.RestoreMappingProfileVersion)
+}
+
+func emptyRestoreSourceSnapshot0018(t *testing.T) []byte {
+	return emptyRestoreSourceSnapshotWith(t, cloudflaremigration.Restore0018SourceFormatVersion, cloudflaremigration.Restore0018MappingProfileVersion)
+}
+
+func emptyRestoreSourceSnapshotWith(t *testing.T, sourceFormatVersion, mappingProfileVersion string) []byte {
 	t.Helper()
 	emptyDigest, err := cloudflaremigration.DigestRows(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	header := testSourceHeader{Type: "source", Format: cloudflaremigration.RestoreSourceFormatVersion,
-		MappingProfile: cloudflaremigration.RestoreMappingProfileVersion, SnapshotID: "1:2:", SchemaName: "public",
+	header := testSourceHeader{Type: "source", Format: sourceFormatVersion,
+		MappingProfile: mappingProfileVersion, SnapshotID: "1:2:", SchemaName: "public",
 		ServerVersion: "170000", MigrationCount: "0", MigrationSHA256: emptyDigest,
 		CapturedAt: "2026-09-09T00:00:00Z", Complete: true}
 	tables := make([]string, 0, len(cloudflaremigration.RestoreCoverageMatrix()))
@@ -159,6 +167,19 @@ func emptyRestoreSourceSnapshot(t *testing.T) []byte {
 func emptyRestoreBundle(t *testing.T) []byte {
 	t.Helper()
 	bundle, err := cloudflaremigration.ExportRestoreJSONL(bytes.NewReader(emptyRestoreSourceSnapshot(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func emptyRestoreBundle0018(t *testing.T) []byte {
+	t.Helper()
+	bundle, err := cloudflaremigration.ExportRestoreJSONL0018(bytes.NewReader(emptyRestoreSourceSnapshot0018(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,5 +594,125 @@ func TestUpgrade0017CommandIsDeterministic(t *testing.T) {
 	secondBytes, _ := os.ReadFile(second)
 	if !bytes.Equal(firstBytes, secondBytes) {
 		t.Fatal("upgrade-0017 output was not deterministic")
+	}
+}
+
+func TestRestore0018CommandsAndUpgradeAreDeterministic(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source-0018.jsonl")
+	firstBundle := filepath.Join(directory, "first-0018.json")
+	secondBundle := filepath.Join(directory, "second-0018.json")
+	if err := os.WriteFile(source, emptyRestoreSourceSnapshot0018(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	for _, output := range []string{firstBundle, secondBundle} {
+		if code := run([]string{"export-0018", "-source-jsonl", source, "-out", output}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("export-0018 failed: code=%d stderr=%s", code, stderr.String())
+		}
+	}
+	first, _ := os.ReadFile(firstBundle)
+	second, _ := os.ReadFile(secondBundle)
+	if !bytes.Equal(first, second) {
+		t.Fatal("identical 0018 snapshots produced different bundles")
+	}
+	var decoded cloudflaremigration.RestoreBundle
+	if err := json.Unmarshal(first, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Manifest.TargetSchema != cloudflaremigration.Restore0018TargetSchemaVersion || decoded.Manifest.MappingProfile != cloudflaremigration.Restore0018MappingProfileVersion {
+		t.Fatal("export-0018 did not publish the 0018 canonical profile")
+	}
+	if len(decoded.Manifest.TargetMigrations) != 18 || decoded.Manifest.TargetMigrations[17].Filename != "0018_auth_sessions.sql" || decoded.Manifest.TargetMigrations[17].SHA256 != "f39e75c2351cb3535e951034d4e85af167b68d33d3f5eabde49c6e78f39168e4" {
+		t.Fatal("export-0018 omitted the pinned 0018 migration fingerprint")
+	}
+	for _, table := range []string{"auth_sessions", "auth_session_family_revocations", "auth_session_audit_events", "auth_session_rotation_witnesses"} {
+		found := false
+		for _, item := range decoded.Manifest.OperationalInitialization {
+			if item.Entity == table && item.Mode == "empty-before-import" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("export-0018 omitted pristine auth-session state %s", table)
+		}
+	}
+
+	canonical := filepath.Join(directory, "canonical-0018.json")
+	plan := filepath.Join(directory, "restore-0018.sql")
+	validation := filepath.Join(directory, "validate-0018.sql")
+	if code := run([]string{"plan-0018", "-source-jsonl", source, "-bundle", firstBundle, "-canonical-bundle", canonical, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("plan-0018 failed: code=%d stderr=%s", code, stderr.String())
+	}
+	planBytes, _ := os.ReadFile(plan)
+	if !strings.Contains(string(planBytes), "0018 auth session schema") || !strings.Contains(string(planBytes), "offline_migration/v5/bundle") {
+		t.Fatal("plan-0018 omitted auth-session schema assertion or v5 provenance")
+	}
+
+	restore0017 := filepath.Join(directory, "source-0017.json")
+	if err := os.WriteFile(restore0017, emptyRestoreBundle(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	upgradedA := filepath.Join(directory, "upgraded-a.json")
+	upgradedB := filepath.Join(directory, "upgraded-b.json")
+	for index, output := range []string{upgradedA, upgradedB} {
+		planPath := filepath.Join(directory, fmt.Sprintf("upgrade-0018-plan-%d.sql", index))
+		validationPath := filepath.Join(directory, fmt.Sprintf("upgrade-0018-validation-%d.sql", index))
+		if code := run([]string{"upgrade-0018", "-bundle", restore0017, "-out", output, "-sql-plan", planPath, "-validation-sql", validationPath}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("upgrade-0018 failed: code=%d stderr=%s", code, stderr.String())
+		}
+	}
+	upgradedABytes, _ := os.ReadFile(upgradedA)
+	upgradedBBytes, _ := os.ReadFile(upgradedB)
+	if !bytes.Equal(upgradedABytes, upgradedBBytes) {
+		t.Fatal("upgrade-0018 output was not deterministic")
+	}
+}
+
+func TestRestore0018CommandsRejectVersionMismatchAndRollbackPublication(t *testing.T) {
+	directory := t.TempDir()
+	source0018 := filepath.Join(directory, "source-0018.jsonl")
+	bundle0017 := filepath.Join(directory, "bundle-0017.json")
+	if err := os.WriteFile(source0018, emptyRestoreSourceSnapshot0018(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundle0017, emptyRestoreBundle(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	canonical := filepath.Join(directory, "bad-canonical.json")
+	plan := filepath.Join(directory, "bad-plan.sql")
+	validation := filepath.Join(directory, "bad-validation.sql")
+	if code := run([]string{"plan-0018", "-source-jsonl", source0018, "-bundle", bundle0017, "-canonical-bundle", canonical, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("plan-0018 accepted a 0017 bundle: code=%d stderr=%s", code, stderr.String())
+	}
+	for _, path := range []string{canonical, plan, validation} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rejected plan-0018 emitted %s", path)
+		}
+	}
+
+	originalPublish := linkPrivateOutput
+	t.Cleanup(func() { linkPrivateOutput = originalPublish })
+	publications := 0
+	linkPrivateOutput = func(oldPath, newPath string) error {
+		publications++
+		if publications == 2 {
+			return errors.New("injected 0018 publication failure")
+		}
+		return originalPublish(oldPath, newPath)
+	}
+	outputs := []string{
+		filepath.Join(directory, "rollback-bundle.json"),
+		filepath.Join(directory, "rollback-plan.sql"),
+		filepath.Join(directory, "rollback-validation.sql"),
+	}
+	if code := run([]string{"upgrade-0018", "-bundle", bundle0017, "-out", outputs[0], "-sql-plan", outputs[1], "-validation-sql", outputs[2]}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("upgrade-0018 publication failure returned code=%d stderr=%s", code, stderr.String())
+	}
+	for _, path := range outputs {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed upgrade-0018 publication left partial output %s: %v", path, err)
+		}
 	}
 }

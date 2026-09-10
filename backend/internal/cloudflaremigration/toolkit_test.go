@@ -91,12 +91,22 @@ func restoreFromLegacyForTest(t *testing.T) RestoreBundle {
 
 func openCanonicalRestoreDatabase(t *testing.T) *sql.DB {
 	t.Helper()
+	return openCanonicalRestoreDatabaseWith(t, CanonicalTargetMigrations)
+}
+
+func openCanonicalRestoreDatabase0018(t *testing.T) *sql.DB {
+	t.Helper()
+	return openCanonicalRestoreDatabaseWith(t, CanonicalTargetMigrations0018)
+}
+
+func openCanonicalRestoreDatabaseWith(t *testing.T, migrations []MigrationFingerprint) *sql.DB {
+	t.Helper()
 	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "restore.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	database.SetMaxOpenConns(1)
-	for _, migration := range CanonicalTargetMigrations {
+	for _, migration := range migrations {
 		path := filepath.Join("..", "..", "..", "deploy", "cloudflare", "migrations", migration.Filename)
 		contents, readErr := os.ReadFile(path)
 		if readErr != nil {
@@ -617,6 +627,53 @@ func TestCanonicalRestoreMigrationsAndOperationalCoverage(t *testing.T) {
 	}
 }
 
+func TestCanonicalRestore0018MigrationsAndAuthSessionOperationalState(t *testing.T) {
+	if len(CanonicalTargetMigrations0018) != 18 || CanonicalTargetMigrations0018[17].Filename != "0018_auth_sessions.sql" || CanonicalTargetMigrations0018[17].SHA256 != "f39e75c2351cb3535e951034d4e85af167b68d33d3f5eabde49c6e78f39168e4" {
+		t.Fatal("restore migration manifest does not cover pinned canonical 0001-0018")
+	}
+	for _, migration := range CanonicalTargetMigrations0018 {
+		path := filepath.Join("..", "..", "..", "deploy", "cloudflare", "migrations", migration.Filename)
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(contents)
+		if hex.EncodeToString(digest[:]) != migration.SHA256 {
+			t.Fatalf("0018 migration fingerprint drifted: %s", migration.Filename)
+		}
+	}
+	database := openCanonicalRestoreDatabase0018(t)
+	for _, table := range []string{"auth_sessions", "auth_session_family_revocations", "auth_session_audit_events", "auth_session_rotation_witnesses"} {
+		var count int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM ` + quoteIdentifier(table)).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("auth session target-only table %s is not present and pristine: count=%d err=%v", table, count, err)
+		}
+		found := false
+		for _, initialization := range CanonicalOperationalInitialization0018 {
+			if initialization.Entity == table && initialization.Mode == "empty-before-import" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("auth session target-only table %s lacks pristine operational classification", table)
+		}
+	}
+	restore := restoreFromLegacyForTest(t)
+	upgraded, err := UpgradeRestoreBundleTo0018(restore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := CanonicalizeRestore0018(upgraded.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chunk := range canonical.Tables {
+		if strings.HasPrefix(chunk.Table, "auth_session") {
+			t.Fatalf("auth-session runtime state was emitted as source-backed rows in %s", chunk.Table)
+		}
+	}
+}
+
 func TestRestoreUpgradeDeterminismAndVersionFailures(t *testing.T) {
 	first := restoreFromLegacyForTest(t)
 	second := restoreFromLegacyForTest(t)
@@ -655,6 +712,44 @@ func TestRestoreUpgradeDeterminismAndVersionFailures(t *testing.T) {
 	}
 	if _, err := UpgradeBundleToRestore(Bundle{Manifest: legacy}); err == nil {
 		t.Fatal("legacy bundle claiming omitted subscription rows was upgraded")
+	}
+}
+
+func TestRestoreUpgrade0018DeterminismAndVersionFailures(t *testing.T) {
+	source := restoreFromLegacyForTest(t)
+	first, err := UpgradeRestoreBundleTo0018(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := UpgradeRestoreBundleTo0018(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, _ := json.Marshal(first)
+	secondJSON, _ := json.Marshal(second)
+	if !bytes.Equal(firstJSON, secondJSON) {
+		t.Fatal("identical 0017 restore bundles upgraded to 0018 non-deterministically")
+	}
+	if _, err := CanonicalizeRestore(first.Manifest); err == nil {
+		t.Fatal("0018 restore bundle was accepted by the legacy 0017 canonicalizer")
+	}
+	if _, err := CanonicalizeRestore0018(first.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	bad := first.Manifest
+	bad.TargetMigrations = append([]MigrationFingerprint(nil), bad.TargetMigrations...)
+	bad.TargetMigrations[17].SHA256 = strings.Repeat("0", 64)
+	if _, err := CanonicalizeRestore0018(bad); err == nil {
+		t.Fatal("0018 canonical migration fingerprint mismatch accepted")
+	}
+	bad = first.Manifest
+	bad.OperationalInitialization = append([]OperationalInitialization(nil), bad.OperationalInitialization...)
+	bad.OperationalInitialization = bad.OperationalInitialization[:len(bad.OperationalInitialization)-1]
+	if _, err := CanonicalizeRestore0018(bad); err == nil {
+		t.Fatal("missing auth-session pristine initialization accepted")
+	}
+	if _, err := UpgradeRestoreBundleTo0018(RestoreBundle{Manifest: RestoreManifest{Format: FormatVersion}}); err == nil {
+		t.Fatal("non-0017 restore bundle was accepted for 0018 upgrade")
 	}
 }
 
@@ -698,6 +793,113 @@ func TestRestorePlanReplayAndConditionalFailure(t *testing.T) {
 	_ = tx.Rollback()
 	if err := blocked.QueryRow(`SELECT COUNT(*) FROM groups`).Scan(&groups); err != nil || groups != 0 {
 		t.Fatalf("conditional precondition failure left partial source rows: groups=%d err=%v", groups, err)
+	}
+}
+
+func TestRestorePlan0018ReplayAndAuthSessionPristineFailure(t *testing.T) {
+	restore, err := UpgradeRestoreBundleTo0018(restoreFromLegacyForTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildRestoreSQLPlan0018(restore.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.SQL, "0018 auth session schema") || !strings.Contains(plan.SQL, "offline_migration/v5/bundle") {
+		t.Fatal("0018 restore plan omitted auth-session schema or v5 provenance")
+	}
+	database := openCanonicalRestoreDatabase0018(t)
+	for attempt := 1; attempt <= 2; attempt++ {
+		tx, err := database.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(plan.SQL); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("0018 restore attempt %d failed: %v", attempt, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	blocked := openCanonicalRestoreDatabase0018(t)
+	if _, err := blocked.Exec(`INSERT INTO auth_session_audit_events(audit_id,event_type,detail_hash,created_at) VALUES('audit-1','store','` + strings.Repeat("a", 64) + `','2026-09-10T00:00:00.000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := blocked.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(plan.SQL); err == nil {
+		_ = tx.Rollback()
+		t.Fatal("non-pristine auth-session runtime state was accepted on first 0018 restore")
+	}
+	_ = tx.Rollback()
+	var count int
+	if err := blocked.QueryRow(`SELECT COUNT(*) FROM groups`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("auth-session precondition failure left partial source rows: count=%d err=%v", count, err)
+	}
+}
+
+func TestAuthSession0018TokenVersionAndTimestampSemantics(t *testing.T) {
+	restore, err := UpgradeRestoreBundleTo0018(restoreFromLegacyForTest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildRestoreSQLPlan0018(restore.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := openCanonicalRestoreDatabase0018(t)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(plan.SQL); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	hash := strings.Repeat
+	validSession := func(tokenHash, status, tokenVersion, consumedAt, replacedBy string) string {
+		consumed := "NULL"
+		if consumedAt != "" {
+			consumed = SQLLiteral(consumedAt)
+		}
+		replacement := "NULL"
+		if replacedBy != "" {
+			replacement = SQLLiteral(replacedBy)
+		}
+		return fmt.Sprintf(`INSERT INTO auth_sessions(token_hash,user_id,token_version,family_id,binding_hash,status,created_at,expires_at,consumed_at,replaced_by_token_hash,revoked_at,revoke_reason,updated_at) VALUES(%s,'9007199254740993',%s,'family-1',%s,%s,'2026-09-10T00:00:00.000Z','2026-09-11T00:00:00.000Z',%s,%s,NULL,NULL,'2026-09-10T00:00:00.000Z')`,
+			SQLLiteral(tokenHash), SQLLiteral(tokenVersion), SQLLiteral(hash("c", 32)), SQLLiteral(status), consumed, replacement)
+	}
+	oldHash, newHash := hash("a", 64), hash("b", 64)
+	if _, err := database.Exec(validSession(oldHash, "consumed", "0", "2026-09-10T01:00:00.000Z", newHash)); err != nil {
+		t.Fatalf("token_version 0 consumed session rejected: %v", err)
+	}
+	if _, err := database.Exec(validSession(newHash, "active", "0", "", "")); err != nil {
+		t.Fatalf("token_version 0 active session rejected: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO auth_session_rotation_witnesses(old_token_hash,new_token_hash,detail_hash,created_at) VALUES(?,?,?,?)`, oldHash, newHash, hash("d", 64), "2026-09-10T01:00:00.000Z"); err != nil {
+		t.Fatalf("equal token_version rotation rejected: %v", err)
+	}
+
+	oldDifferent, newDifferent := hash("e", 64), hash("f", 64)
+	if _, err := database.Exec(validSession(oldDifferent, "consumed", "0", "2026-09-10T02:00:00.000Z", newDifferent)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(validSession(newDifferent, "active", "1", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO auth_session_rotation_witnesses(old_token_hash,new_token_hash,detail_hash,created_at) VALUES(?,?,?,?)`, oldDifferent, newDifferent, hash("d", 64), "2026-09-10T02:00:00.000Z"); err == nil {
+		t.Fatal("rotation with changed token_version was accepted")
+	}
+	if _, err := database.Exec(`INSERT INTO auth_session_audit_events(audit_id,event_type,detail_hash,created_at) VALUES('bad-hour','store',?,'2026-09-10T24:00:00.000Z')`, hash("d", 64)); err == nil {
+		t.Fatal("RFC3339 timestamp with hour 24 was accepted")
 	}
 }
 

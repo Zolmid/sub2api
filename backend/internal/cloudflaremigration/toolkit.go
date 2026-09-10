@@ -1098,6 +1098,11 @@ const (
 	RestoreSourceFormatVersion   = "sub2api-postgresql-jsonl/v3"
 	RestoreTargetSchemaVersion   = "cloudflare-d1/0001-0017"
 	RestoreMappingProfileVersion = "legacy-postgresql-to-d1-0017/v1"
+
+	Restore0018FormatVersion         = "sub2api-cloudflare-offline-restore/v5"
+	Restore0018SourceFormatVersion   = "sub2api-postgresql-jsonl/v4"
+	Restore0018TargetSchemaVersion   = "cloudflare-d1/0001-0018"
+	Restore0018MappingProfileVersion = "legacy-postgresql-to-d1-0018/v1"
 )
 
 type MigrationFingerprint struct {
@@ -1154,6 +1159,10 @@ var CanonicalTargetMigrations = []MigrationFingerprint{
 	{Filename: "0017_email_runtime.sql", SHA256: "480183fbaa08cffba77441b0fc9423d25ff339b47f5c91d4f02f3dcf58555a0b"},
 }
 
+var CanonicalTargetMigrations0018 = append(append([]MigrationFingerprint(nil), CanonicalTargetMigrations...),
+	MigrationFingerprint{Filename: "0018_auth_sessions.sql", SHA256: "f39e75c2351cb3535e951034d4e85af167b68d33d3f5eabde49c6e78f39168e4"},
+)
+
 var CanonicalOperationalInitialization = []OperationalInitialization{
 	{Entity: "users.balance_version", Mode: "column-default:0"},
 	{Entity: "accounts.credential_version", Mode: "column-default:1"},
@@ -1209,6 +1218,13 @@ var CanonicalOperationalInitialization = []OperationalInitialization{
 	{Entity: "subscription_runtime_guards", Mode: "empty-before-import"},
 	{Entity: "usage_events", Mode: "empty-before-import"},
 }
+
+var CanonicalOperationalInitialization0018 = append(append([]OperationalInitialization(nil), CanonicalOperationalInitialization...),
+	OperationalInitialization{Entity: "auth_sessions", Mode: "empty-before-import"},
+	OperationalInitialization{Entity: "auth_session_family_revocations", Mode: "empty-before-import"},
+	OperationalInitialization{Entity: "auth_session_audit_events", Mode: "empty-before-import"},
+	OperationalInitialization{Entity: "auth_session_rotation_witnesses", Mode: "empty-before-import"},
+)
 
 var restoreSchemas = buildRestoreSchemas()
 
@@ -1303,7 +1319,15 @@ func DecodeRestoreBundle(input []byte) (RestoreBundle, error) {
 }
 
 func CanonicalizeRestore(manifest RestoreManifest) (RestoreManifest, error) {
-	if manifest.Format != RestoreFormatVersion || manifest.TargetSchema != RestoreTargetSchemaVersion || manifest.MappingProfile != RestoreMappingProfileVersion {
+	return canonicalizeRestoreWith(manifest, RestoreFormatVersion, RestoreTargetSchemaVersion, RestoreMappingProfileVersion, CanonicalTargetMigrations, CanonicalOperationalInitialization, "0001-0017")
+}
+
+func CanonicalizeRestore0018(manifest RestoreManifest) (RestoreManifest, error) {
+	return canonicalizeRestoreWith(manifest, Restore0018FormatVersion, Restore0018TargetSchemaVersion, Restore0018MappingProfileVersion, CanonicalTargetMigrations0018, CanonicalOperationalInitialization0018, "0001-0018")
+}
+
+func canonicalizeRestoreWith(manifest RestoreManifest, formatVersion, targetSchemaVersion, mappingProfileVersion string, migrations []MigrationFingerprint, operationalInitialization []OperationalInitialization, label string) (RestoreManifest, error) {
+	if manifest.Format != formatVersion || manifest.TargetSchema != targetSchemaVersion || manifest.MappingProfile != mappingProfileVersion {
 		return RestoreManifest{}, errors.New("unsupported restore format, target schema, or mapping profile")
 	}
 	if err := validateSource(manifest.Source); err != nil {
@@ -1315,10 +1339,10 @@ func CanonicalizeRestore(manifest RestoreManifest) (RestoreManifest, error) {
 	if !equalStrings(manifest.DependencyOrder, RestoreTableOrder) {
 		return RestoreManifest{}, errors.New("restore dependency_order does not match canonical order")
 	}
-	if !equalMigrationFingerprints(manifest.TargetMigrations, CanonicalTargetMigrations) {
-		return RestoreManifest{}, errors.New("restore target migration manifest does not match canonical 0001-0017")
+	if !equalMigrationFingerprints(manifest.TargetMigrations, migrations) {
+		return RestoreManifest{}, fmt.Errorf("restore target migration manifest does not match canonical %s", label)
 	}
-	if !equalOperationalInitialization(manifest.OperationalInitialization, CanonicalOperationalInitialization) {
+	if !equalOperationalInitialization(manifest.OperationalInitialization, operationalInitialization) {
 		return RestoreManifest{}, errors.New("restore operational initialization manifest is incomplete or non-canonical")
 	}
 	if manifest.Warnings == nil {
@@ -1967,6 +1991,14 @@ func normalizeRestoreSelected(table string, row map[string]json.RawMessage, fiel
 }
 
 func ExportPostgreSQLRestoreSnapshot(ctx context.Context, database *sql.DB, output io.Writer, options PostgreSQLSnapshotOptions) error {
+	return exportPostgreSQLRestoreSnapshotWith(ctx, database, output, options, RestoreSourceFormatVersion, RestoreMappingProfileVersion)
+}
+
+func ExportPostgreSQLRestoreSnapshot0018(ctx context.Context, database *sql.DB, output io.Writer, options PostgreSQLSnapshotOptions) error {
+	return exportPostgreSQLRestoreSnapshotWith(ctx, database, output, options, Restore0018SourceFormatVersion, Restore0018MappingProfileVersion)
+}
+
+func exportPostgreSQLRestoreSnapshotWith(ctx context.Context, database *sql.DB, output io.Writer, options PostgreSQLSnapshotOptions, sourceFormatVersion, mappingProfileVersion string) error {
 	if database == nil || output == nil {
 		return errors.New("PostgreSQL database and restore snapshot writer are required")
 	}
@@ -2002,11 +2034,11 @@ func ExportPostgreSQLRestoreSnapshot(ctx context.Context, database *sql.DB, outp
 	if err != nil {
 		return errors.New("compute PostgreSQL restore migration fingerprint failed")
 	}
-	header := sourceHeader{Type: "source", Format: RestoreSourceFormatVersion, MappingProfile: RestoreMappingProfileVersion,
+	header := sourceHeader{Type: "source", Format: sourceFormatVersion, MappingProfile: mappingProfileVersion,
 		SnapshotID: snapshotID, SchemaName: schemaName, ServerVersion: serverVersion,
 		MigrationCount: strconv.Itoa(len(migrationRows)), MigrationSHA256: migrationDigest,
 		CapturedAt: capturedAt.UTC().Format(time.RFC3339Nano), Complete: true}
-	if err := validateRestoreSourceHeader(header); err != nil {
+	if err := validateRestoreSourceHeaderWith(header, sourceFormatVersion, mappingProfileVersion); err != nil {
 		return err
 	}
 	inventory, err := readPostgreSQLInventory(ctx, tx, schemaName)
@@ -2149,7 +2181,15 @@ func exportRestorePostgreSQLTable(ctx context.Context, tx *sql.Tx, schemaName, t
 }
 
 func validateRestoreSourceHeader(header sourceHeader) error {
-	if header.Type != "source" || header.Format != RestoreSourceFormatVersion || header.MappingProfile != RestoreMappingProfileVersion || !header.Complete {
+	return validateRestoreSourceHeaderWith(header, RestoreSourceFormatVersion, RestoreMappingProfileVersion)
+}
+
+func validateRestoreSourceHeader0018(header sourceHeader) error {
+	return validateRestoreSourceHeaderWith(header, Restore0018SourceFormatVersion, Restore0018MappingProfileVersion)
+}
+
+func validateRestoreSourceHeaderWith(header sourceHeader, sourceFormatVersion, mappingProfileVersion string) error {
+	if header.Type != "source" || header.Format != sourceFormatVersion || header.MappingProfile != mappingProfileVersion || !header.Complete {
 		return errors.New("restore source must declare the supported format, mapping profile, and complete_inventory=true")
 	}
 	if header.SnapshotID == "" || header.SchemaName == "" || header.ServerVersion == "" || containsControl(header.SnapshotID+header.SchemaName+header.ServerVersion) || !sourceIdentifier(header.SchemaName) {
@@ -2162,6 +2202,14 @@ func validateRestoreSourceHeader(header sourceHeader) error {
 }
 
 func ExportRestoreJSONL(reader io.Reader) (RestoreBundle, error) {
+	return exportRestoreJSONLWith(reader, RestoreSourceFormatVersion, RestoreMappingProfileVersion, CanonicalizeRestore, CanonicalTargetMigrations, CanonicalOperationalInitialization, RestoreFormatVersion, RestoreTargetSchemaVersion)
+}
+
+func ExportRestoreJSONL0018(reader io.Reader) (RestoreBundle, error) {
+	return exportRestoreJSONLWith(reader, Restore0018SourceFormatVersion, Restore0018MappingProfileVersion, CanonicalizeRestore0018, CanonicalTargetMigrations0018, CanonicalOperationalInitialization0018, Restore0018FormatVersion, Restore0018TargetSchemaVersion)
+}
+
+func exportRestoreJSONLWith(reader io.Reader, sourceFormatVersion, mappingProfileVersion string, canonicalize func(RestoreManifest) (RestoreManifest, error), migrations []MigrationFingerprint, operationalInitialization []OperationalInitialization, formatVersion, targetSchemaVersion string) (RestoreBundle, error) {
 	if reader == nil {
 		return RestoreBundle{}, errors.New("restore source JSONL reader is nil")
 	}
@@ -2197,7 +2245,7 @@ func ExportRestoreJSONL(reader io.Reader) (RestoreBundle, error) {
 			return RestoreBundle{}, fmt.Errorf("restore source line %d is invalid JSON", lineNumber)
 		}
 		if lineNumber == 1 {
-			if decodeStrict(line, &header) != nil || validateRestoreSourceHeader(header) != nil {
+			if decodeStrict(line, &header) != nil || validateRestoreSourceHeaderWith(header, sourceFormatVersion, mappingProfileVersion) != nil {
 				return RestoreBundle{}, errors.New("restore source header is unsupported or invalid")
 			}
 			continue
@@ -2272,10 +2320,14 @@ func ExportRestoreJSONL(reader io.Reader) (RestoreBundle, error) {
 	if lineNumber == 0 || !finished {
 		return RestoreBundle{}, errors.New("restore source is empty, truncated, or missing snapshot_end")
 	}
-	return buildRestoreBundle(header, snapshotSHA, summaries, present, tables)
+	return buildRestoreBundleWith(header, snapshotSHA, summaries, present, tables, canonicalize, migrations, operationalInitialization, formatVersion, targetSchemaVersion, mappingProfileVersion)
 }
 
 func buildRestoreBundle(header sourceHeader, snapshotSHA string, inventory []snapshotTableSummary, present map[string]bool, sourceRows map[string][]json.RawMessage) (RestoreBundle, error) {
+	return buildRestoreBundleWith(header, snapshotSHA, inventory, present, sourceRows, CanonicalizeRestore, CanonicalTargetMigrations, CanonicalOperationalInitialization, RestoreFormatVersion, RestoreTargetSchemaVersion, RestoreMappingProfileVersion)
+}
+
+func buildRestoreBundleWith(header sourceHeader, snapshotSHA string, inventory []snapshotTableSummary, present map[string]bool, sourceRows map[string][]json.RawMessage, canonicalize func(RestoreManifest) (RestoreManifest, error), migrations []MigrationFingerprint, operationalInitialization []OperationalInitialization, formatVersion, targetSchemaVersion, mappingProfileVersion string) (RestoreBundle, error) {
 	if err := validateSourceMigrationFingerprint(header, present, sourceRows); err != nil {
 		return RestoreBundle{}, err
 	}
@@ -2342,15 +2394,17 @@ func buildRestoreBundle(header sourceHeader, snapshotSHA string, inventory []sna
 		tables = append(tables, chunks...)
 	}
 	manifest := RestoreManifest{Format: RestoreFormatVersion, TargetSchema: RestoreTargetSchemaVersion,
-		MappingProfile: RestoreMappingProfileVersion,
+		MappingProfile: mappingProfileVersion,
 		Source: SourceFingerprint{Engine: "postgresql-offline-export", SnapshotID: header.SnapshotID,
 			SchemaName: header.SchemaName, ServerVersion: header.ServerVersion, MigrationCount: header.MigrationCount,
 			MigrationSHA256: header.MigrationSHA256, SnapshotSHA256: snapshotSHA, CapturedAt: header.CapturedAt},
 		Coverage: coverage, DependencyOrder: append([]string(nil), RestoreTableOrder...),
-		TargetMigrations:          append([]MigrationFingerprint(nil), CanonicalTargetMigrations...),
-		OperationalInitialization: append([]OperationalInitialization(nil), CanonicalOperationalInitialization...),
+		TargetMigrations:          append([]MigrationFingerprint(nil), migrations...),
+		OperationalInitialization: append([]OperationalInitialization(nil), operationalInitialization...),
 		Warnings:                  warnings, Blockers: []string{}, Tables: tables}
-	canonical, err := CanonicalizeRestore(manifest)
+	manifest.Format = formatVersion
+	manifest.TargetSchema = targetSchemaVersion
+	canonical, err := canonicalize(manifest)
 	if err != nil {
 		return RestoreBundle{}, fmt.Errorf("restore export failed canonical validation: %w", err)
 	}
@@ -2442,6 +2496,32 @@ func UpgradeBundleToRestore(bundle Bundle) (RestoreBundle, error) {
 	return RestoreBundle{Manifest: canonical}, nil
 }
 
+func UpgradeRestoreBundleTo0018(bundle RestoreBundle) (RestoreBundle, error) {
+	legacy, err := CanonicalizeRestore(bundle.Manifest)
+	if err != nil {
+		return RestoreBundle{}, fmt.Errorf("0017 restore bundle rejected: %w", err)
+	}
+	manifest := RestoreManifest{
+		Format:                    Restore0018FormatVersion,
+		TargetSchema:              Restore0018TargetSchemaVersion,
+		MappingProfile:            Restore0018MappingProfileVersion,
+		Source:                    legacy.Source,
+		Coverage:                  append([]CoverageRecord(nil), legacy.Coverage...),
+		DependencyOrder:           append([]string(nil), RestoreTableOrder...),
+		TargetMigrations:          append([]MigrationFingerprint(nil), CanonicalTargetMigrations0018...),
+		OperationalInitialization: append([]OperationalInitialization(nil), CanonicalOperationalInitialization0018...),
+		Warnings:                  append([]string(nil), legacy.Warnings...),
+		Blockers:                  []string{},
+		Tables:                    append([]TableChunk(nil), legacy.Tables...),
+	}
+	manifest.Warnings = append(manifest.Warnings, "upgraded from canonical 0001-0017 restore bundle; auth session runtime state must start pristine")
+	canonical, err := CanonicalizeRestore0018(manifest)
+	if err != nil {
+		return RestoreBundle{}, err
+	}
+	return RestoreBundle{Manifest: canonical}, nil
+}
+
 var restoreColumnOrder = func() map[string][]string {
 	result := make(map[string][]string, len(targetColumnOrder)+2)
 	for table, columns := range targetColumnOrder {
@@ -2465,24 +2545,7 @@ var restoreColumnOrder = func() map[string][]string {
 }()
 
 func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
-	canonical, err := CanonicalizeRestore(manifest)
-	if err != nil {
-		return SQLPlan{}, err
-	}
-	bundleBytes, err := json.Marshal(RestoreBundle{Manifest: canonical})
-	if err != nil {
-		return SQLPlan{}, errors.New("encode canonical restore bundle")
-	}
-	digestBytes := sha256.Sum256(bundleBytes)
-	bundleDigest := hex.EncodeToString(digestBytes[:])
-	guardKey := "offline_migration/v4/assert/" + bundleDigest
-	bundleKey := "offline_migration/v4/bundle"
-	resume := fmt.Sprintf(`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"=%s AND "value"=%s)`, SQLLiteral(bundleKey), SQLLiteral(bundleDigest))
-	var plan strings.Builder
-	_, _ = plan.WriteString("-- Generated offline restore plan for canonical D1 migrations 0001-0017.\n")
-	_, _ = plan.WriteString("-- Local execution is transactional; remote whole-file atomicity is not assumed.\n")
-	_, _ = plan.WriteString("PRAGMA defer_foreign_keys = ON;\n")
-	for _, condition := range []struct{ expression, label string }{
+	return buildRestoreSQLPlanWith(manifest, CanonicalizeRestore, "0001-0017", "v4", "offline_migration/v4", []struct{ expression, label string }{
 		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_bridge_schema_version' AND "value"='2026-09-06.v1')`, "0001 bridge schema"},
 		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_e8_money_scale' AND "value"='8')`, "0008 E8 schema"},
 		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_billing_reservation_schema_version' AND "value"='2026-09-09.v3')`, "0009 billing schema"},
@@ -2494,7 +2557,45 @@ func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
 		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_settings_runtime_schema_version' AND "value"='2026-09-10.v1')`, "0015 settings schema"},
 		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='payment_records')`, "0016 payment schema"},
 		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_email_runtime_schema_version' AND "value"='2026-09-10.v4')`, "0017 email schema"},
-	} {
+	})
+}
+
+func BuildRestoreSQLPlan0018(manifest RestoreManifest) (SQLPlan, error) {
+	return buildRestoreSQLPlanWith(manifest, CanonicalizeRestore0018, "0001-0018", "v5", "offline_migration/v5", []struct{ expression, label string }{
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_bridge_schema_version' AND "value"='2026-09-06.v1')`, "0001 bridge schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_e8_money_scale' AND "value"='8')`, "0008 E8 schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_billing_reservation_schema_version' AND "value"='2026-09-09.v3')`, "0009 billing schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_account_runtime')`, "0010 scheduler schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_jobs')`, "0011 job schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_subscription_runtime_schema_version' AND "value"='2026-09-09.v1')`, "0012 subscription schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='oauth_refresh_attempts')`, "0013 OAuth schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_auth_cache_schema_version' AND "value"='2026-09-09.v4')`, "0014 auth cache schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_settings_runtime_schema_version' AND "value"='2026-09-10.v1')`, "0015 settings schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='payment_records')`, "0016 payment schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_email_runtime_schema_version' AND "value"='2026-09-10.v4')`, "0017 email schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_auth_sessions_schema_version' AND "value"='2026-09-10.v1')`, "0018 auth session schema"},
+	})
+}
+
+func buildRestoreSQLPlanWith(manifest RestoreManifest, canonicalize func(RestoreManifest) (RestoreManifest, error), label, provenanceVersion, provenancePrefix string, schemaAssertions []struct{ expression, label string }) (SQLPlan, error) {
+	canonical, err := canonicalize(manifest)
+	if err != nil {
+		return SQLPlan{}, err
+	}
+	bundleBytes, err := json.Marshal(RestoreBundle{Manifest: canonical})
+	if err != nil {
+		return SQLPlan{}, errors.New("encode canonical restore bundle")
+	}
+	digestBytes := sha256.Sum256(bundleBytes)
+	bundleDigest := hex.EncodeToString(digestBytes[:])
+	guardKey := provenancePrefix + "/assert/" + bundleDigest
+	bundleKey := provenancePrefix + "/bundle"
+	resume := fmt.Sprintf(`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"=%s AND "value"=%s)`, SQLLiteral(bundleKey), SQLLiteral(bundleDigest))
+	var plan strings.Builder
+	_, _ = fmt.Fprintf(&plan, "-- Generated offline restore plan for canonical D1 migrations %s.\n", label)
+	_, _ = plan.WriteString("-- Local execution is transactional; remote whole-file atomicity is not assumed.\n")
+	_, _ = plan.WriteString("PRAGMA defer_foreign_keys = ON;\n")
+	for _, condition := range schemaAssertions {
 		writeAssertion(&plan, guardKey, condition.expression, condition.label+" is installed")
 	}
 	for _, initialization := range canonical.OperationalInitialization {
@@ -2514,9 +2615,9 @@ func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
 				return SQLPlan{}, err
 			}
 			_, _ = plan.WriteString(rowSQL)
-			writeProvenance(&plan, guardKey, "offline_migration/v4/row/"+chunk.Table+"/"+identityDigest(identity), rowDigest)
+			writeProvenance(&plan, guardKey, provenancePrefix+"/row/"+chunk.Table+"/"+identityDigest(identity), rowDigest)
 		}
-		writeProvenance(&plan, guardKey, "offline_migration/v4/chunk/"+chunk.ID, chunk.SHA256)
+		writeProvenance(&plan, guardKey, provenancePrefix+"/chunk/"+chunk.ID, chunk.SHA256)
 	}
 	for _, table := range RestoreTableOrder {
 		expected := strconv.Itoa(tableCounts[table])
@@ -2526,7 +2627,7 @@ func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
 	writeProvenance(&plan, guardKey, bundleKey, bundleDigest)
 
 	var validation strings.Builder
-	_, _ = validation.WriteString("-- Read-only 0001-0017 post-restore validation. Success returns no rows.\n")
+	_, _ = fmt.Fprintf(&validation, "-- Read-only %s post-restore validation. Success returns no rows.\n", label)
 	_, _ = validation.WriteString("SELECT 'foreign_key' AS failure, \"table\" AS subject, CAST(rowid AS TEXT) AS actual, parent AS expected FROM pragma_foreign_key_check;\n")
 	_, _ = validation.WriteString("SELECT 'quick_check' AS failure, 'database' AS subject, quick_check AS actual, 'ok' AS expected FROM pragma_quick_check WHERE quick_check <> 'ok';\n")
 	for _, table := range RestoreTableOrder {
@@ -2534,7 +2635,7 @@ func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
 		_, _ = fmt.Fprintf(&validation, "SELECT 'row_count' AS failure, %s AS subject, CAST(COUNT(*) AS TEXT) AS actual, %s AS expected FROM %s HAVING COUNT(*) <> %s;\n", SQLLiteral(table), SQLLiteral(expected), quoteIdentifier(table), expected)
 	}
 	_, _ = fmt.Fprintf(&validation, "SELECT 'bundle_digest' AS failure, %s AS subject, COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"=%s),'missing') AS actual, %s AS expected WHERE COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"=%s),'missing') <> %s;\n", SQLLiteral(bundleKey), SQLLiteral(bundleKey), SQLLiteral(bundleDigest), SQLLiteral(bundleKey), SQLLiteral(bundleDigest))
-	_, _ = validation.WriteString("SELECT 'assertion_guard' AS failure, \"key\" AS subject, \"value\" AS actual, 'absent' AS expected FROM \"schema_metadata\" WHERE \"key\" LIKE 'offline_migration/v4/assert/%';\n")
+	_, _ = fmt.Fprintf(&validation, "SELECT 'assertion_guard' AS failure, \"key\" AS subject, \"value\" AS actual, 'absent' AS expected FROM \"schema_metadata\" WHERE \"key\" LIKE 'offline_migration/%s/assert/%%';\n", provenanceVersion)
 	return SQLPlan{BundleDigest: bundleDigest, SQL: plan.String(), ValidationSQL: validation.String()}, nil
 }
 

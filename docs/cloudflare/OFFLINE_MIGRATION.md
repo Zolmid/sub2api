@@ -1,10 +1,12 @@
-# Offline PostgreSQL to D1 migration
+# Historical offline PostgreSQL to D1 0008 migration
+
+This page documents the preserved legacy `snapshot-postgres`, `export`, and `plan` command contract for `legacy-postgresql-to-d1-0008/v1`. For the current canonical restore path through `0018_auth_sessions.sql`, use [MIGRATION.md](MIGRATION.md) and the explicit `snapshot-postgres-0018`, `export-0018`, `plan-0018`, and `upgrade-0018` commands.
 
 cloudflare-migrate is a fail-closed migration preparation tool. It has one narrowly scoped database operation: snapshot-postgres opens the legacy PostgreSQL database and reads one REPEATABLE READ, READ ONLY transaction. It never writes PostgreSQL. The other commands consume local artifacts. No command invokes Wrangler, Cloudflare, D1 import, Time Travel restore, deployment, or traffic cutover.
 
 The bundle format is sub2api-cloudflare-offline-bundle/v3, the row-streamed source format is sub2api-postgresql-jsonl/v2, and the mapping profile is legacy-postgresql-to-d1-0008/v1.
 
-Important: this profile targets only canonical D1 migrations 0001 through 0008. Migrations 0009 through 0012 are under active development and were intentionally not inspected by this correction. This tool is therefore not final cutover acceptance for any persistent table or column added after 0008. A later schema-extension pass must add a new mapping-profile version, coverage rules, dependency order, transforms, SQL columns, and tests before production approval.
+Important: this historical profile targets only canonical D1 migrations 0001 through 0008. It is retained for compatibility and reproducibility of already reviewed legacy artifacts, not for a new canonical Cloudflare restore.
 
 ## 1. Secret and path contract
 
@@ -214,6 +216,6 @@ If command outcome is unknown, verify first. An exact bundle provenance value, e
 
 If any row or provenance value diverges, stop writers and do not replay. Use the retained pre-import export for investigation and, only with explicit destructive authorization, restore D1 to the retained pre-import Time Travel bookmark. After D1 has accepted authoritative writes, reconcile post-cutover writes before selecting any restore point. An old export or bookmark is not automatically safe.
 
-## 8. Remaining acceptance blocker
+## 8. Historical scope
 
-This correction closes the offline PostgreSQL path and the 0001–0008 mapping contract. It deliberately does not certify persistent state introduced by 0009–0012. The later pass must inspect those canonical migrations after they stabilize, add every new source/target entity to the versioned matrix, and rerun staging acceptance. Until then, production cutover remains blocked.
+This page closes only the offline PostgreSQL path and the 0001–0008 mapping contract. Current canonical restore limitations and commands live in [MIGRATION.md](MIGRATION.md).

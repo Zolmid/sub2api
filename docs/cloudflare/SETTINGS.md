@@ -16,6 +16,8 @@ identity check only; it never selects the settings account or domain. The
 server owns the fixed `SettingsRuntime` scope identity
 `accountId=sub2api-settings-control-v1` and
 `domain=worker-private-control-plane-v1`.
+Public Worker ingress reserves the complete `/v1/private` namespace before
+Container forwarding, including normalized and encoded path variants.
 
 The body is a JSON object within the shared 64 KiB control-plane limit. Every
 route rejects unknown fields. These are the only accepted paths; prefixes and

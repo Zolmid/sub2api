@@ -9,7 +9,8 @@ POST-only routes: `create`, `transition`, `create-refund`, `transition-refund`,
 header, accepts JSON objects only, delegates all exact field/value validation
 to PaymentRuntime, preserves successful runtime snapshots, and sanitizes
 corruption/storage failures as `PAYMENT_UNAVAILABLE`. It creates no public
-Worker payment route. All amounts, versions,
+Worker payment route: public ingress reserves the complete `/v1/private`
+namespace before Container forwarding. All amounts, versions,
 identifiers, timestamps, states, audit/outbox evidence, provider-event
 deduplication, and idempotency witnesses are constrained and immutable where
 appropriate.

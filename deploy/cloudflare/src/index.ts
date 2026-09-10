@@ -79,7 +79,10 @@ const RESERVED_INGRESS_HEADERS = [
 ];
 const AUTH_LOGIN_PATH = "/api/v1/auth/login";
 const AUTH_LOGIN_ADMISSION_KEY_BYTES = 32;
-const RESERVED_INTERNAL_INGRESS_NAMESPACE = "/internal/cloudflare";
+const RESERVED_INGRESS_NAMESPACES = [
+  "/internal/cloudflare",
+  "/v1/private",
+] as const;
 
 function normalizeIngressPathForNamespace(pathname: string): string {
   // Decode only the syntax characters that can change path segmentation. Do
@@ -112,10 +115,11 @@ function normalizeIngressPathForNamespace(pathname: string): string {
   return `/${segments.join("/")}`;
 }
 
-function isReservedInternalIngressPath(pathname: string): boolean {
+function isReservedIngressPath(pathname: string): boolean {
   const normalized = normalizeIngressPathForNamespace(pathname);
-  return normalized === RESERVED_INTERNAL_INGRESS_NAMESPACE ||
-    normalized.startsWith(`${RESERVED_INTERNAL_INGRESS_NAMESPACE}/`);
+  return RESERVED_INGRESS_NAMESPACES.some((namespace) =>
+    normalized === namespace || normalized.startsWith(`${namespace}/`)
+  );
 }
 
 export type ContainerForwarder = (
@@ -463,11 +467,10 @@ export async function routeIngress(
     return error("NOT_FOUND", 404);
   }
   const url = new URL(request.url);
-  if (isReservedInternalIngressPath(url.pathname)) {
-    // The complete /internal/cloudflare namespace is reserved for
-    // Worker-to-Container RPC. Public ingress must fail closed before fixture
-    // headers or Container routing are honored, including path forms that a
-    // downstream HTTP stack could normalize into this namespace.
+  if (isReservedIngressPath(url.pathname)) {
+    // Worker-to-Container and Container-to-Worker RPC namespaces are never
+    // public ingress. Fail closed before fixture headers or Container routing
+    // are honored, including paths a downstream HTTP stack could normalize.
     return error("NOT_FOUND", 404);
   }
   if (request.method === "GET" && url.pathname === "/ready") {

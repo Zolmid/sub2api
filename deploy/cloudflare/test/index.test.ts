@@ -98,7 +98,7 @@ describe("edge readiness", () => {
     expect(forwarded).toBe(0);
   });
 
-  it("fails closed for normalized forms of the reserved internal namespace", async () => {
+  it("fails closed for normalized forms of every private RPC namespace", async () => {
     let forwarded = 0;
     const forward = async () => {
       forwarded += 1;
@@ -116,6 +116,12 @@ describe("edge readiness", () => {
       "/INTERNAL/CLOUDFLARE/jobs/execute",
       "/internal/%2e/cloudflare/jobs/execute",
       "/internal/cloudflare/%2e%2e/cloudflare/jobs/execute",
+      "/v1/private/settings/get",
+      "/v1/private/payments/create",
+      "/v1%2fprivate%2fsubscriptions/get",
+      "/v1%252Fprivate%252Fauth-sessions%252Fget",
+      "/V1/PRIVATE/settings/get",
+      "/v1/private/../private/payments/create",
     ];
 
     for (const path of hostilePaths) {
@@ -146,6 +152,7 @@ describe("edge readiness", () => {
     for (const path of [
       "/internality/cloudflare",
       "/internal/cloudflared/jobs/execute",
+      "/v1/privately/settings/get",
       "/api/v1/models",
       "/v1/chat/completions",
     ]) {
@@ -159,6 +166,7 @@ describe("edge readiness", () => {
     expect(forwardedPaths).toEqual([
       "/internality/cloudflare",
       "/internal/cloudflared/jobs/execute",
+      "/v1/privately/settings/get",
       "/api/v1/models",
       "/v1/chat/completions",
     ]);

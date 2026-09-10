@@ -1,7 +1,15 @@
 # Cloudflare payment foundation
 
-Migration 0016_payment_runtime.sql and payment-runtime.ts provide an unwired
-D1-authoritative E8 USD payment and refund foundation. All amounts, versions,
+Migration 0016_payment_runtime.sql and payment-runtime.ts provide a
+D1-authoritative E8 USD payment and refund foundation. The Worker now wires it
+only through the private Container outbound control plane at these exact
+POST-only routes: `create`, `transition`, `create-refund`, `transition-refund`,
+`refund-payment`, and `accept-provider-event` under
+`/v1/private/payments/`. The adapter requires the bounded Container boundary
+header, accepts JSON objects only, delegates all exact field/value validation
+to PaymentRuntime, preserves successful runtime snapshots, and sanitizes
+corruption/storage failures as `PAYMENT_UNAVAILABLE`. It creates no public
+Worker payment route. All amounts, versions,
 identifiers, timestamps, states, audit/outbox evidence, provider-event
 deduplication, and idempotency witnesses are constrained and immutable where
 appropriate.
@@ -71,8 +79,9 @@ one transition and ledger effect.
 
 ## Limitations
 
-This module has no provider credentials, webhook verification, network client,
-endpoint wiring, queue consumer, Cloudflare resource creation, live charge, or
-live refund action. A production integration must authenticate provider events,
-perform reconciliation, and obtain explicit authorization for financial or
-deployment actions.
+Provider authentication and provider network actions remain absent: there are
+no provider credentials, webhook verification, provider HTTP client, queue
+consumer, live charge, or live refund action. Go callers and public payment
+endpoints also remain absent. A production integration must authenticate
+provider events, perform reconciliation, and obtain explicit authorization for
+financial or deployment actions.

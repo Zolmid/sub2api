@@ -25,6 +25,10 @@ import {
   settingsControlPlane,
 } from "./settings-control";
 import {
+  isPaymentControlPath,
+  paymentControlPlane,
+} from "./payment-control";
+import {
   BRIDGE_VERSION,
   INTERNAL_HOST,
   MAX_CONTROL_BODY_BYTES,
@@ -160,6 +164,9 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
     }
     if (isSettingsControlPath(url.pathname)) {
       return await settingsControlPlane(request, env, url.pathname);
+    }
+    if (isPaymentControlPath(url.pathname)) {
+      return await paymentControlPlane(request, env, url.pathname);
     }
     switch (url.pathname) {
       case "/v1/auth/resolve":

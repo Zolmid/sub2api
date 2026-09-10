@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -19,6 +20,19 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
+
+const accountCacheLockShardCount = 64
+
+// Account is intentionally copied by value in several forwarding paths, so a
+// mutex cannot safely live on the struct itself. Sharded package-level locks
+// serialize only the non-persistent hot-cache fields for a given Account
+// pointer while preserving the existing copy semantics.
+var accountCacheLocks [accountCacheLockShardCount]sync.Mutex
+
+func accountCacheLock(a *Account) *sync.Mutex {
+	index := (reflect.ValueOf(a).Pointer() >> 3) % accountCacheLockShardCount
+	return &accountCacheLocks[index]
+}
 
 type Account struct {
 	ID                      int64
@@ -584,6 +598,10 @@ func stringMappingFromRaw(raw any) map[string]string {
 }
 
 func (a *Account) GetModelMapping() map[string]string {
+	cacheLock := accountCacheLock(a)
+	cacheLock.Lock()
+	defer cacheLock.Unlock()
+
 	runtimeVersion := xai.RuntimeModelMappingVersion()
 	credentialsPtr := mapPtr(a.Credentials)
 	rawMapping, _ := a.Credentials["model_mapping"].(map[string]any)

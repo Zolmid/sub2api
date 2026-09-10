@@ -102,6 +102,13 @@ func (a *Account) IsHeaderOverrideEnabled() bool {
 // 结果带热路径缓存（同 GetModelMapping 先例）：同一 credentials 映射在
 // 一次请求 / 一条 WS 会话内的多次调用只做一次解析与校验。
 func (a *Account) GetHeaderOverrides() map[string]string {
+	if a == nil {
+		return nil
+	}
+	cacheLock := accountCacheLock(a)
+	cacheLock.Lock()
+	defer cacheLock.Unlock()
+
 	if !a.IsHeaderOverrideEnabled() {
 		return nil
 	}

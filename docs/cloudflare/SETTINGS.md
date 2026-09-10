@@ -40,7 +40,8 @@ responses preserve the runtime result rather than exposing envelope fields or
 secret material.
 
 Malformed or oversized JSON and runtime `INVALID_INPUT` are `400`. A missing
-setting is `404`. `CAS_MISMATCH`, `IDEMPOTENCY_COLLISION`, and
+setting is returned as JSON `null` by `get`, while `get-value` reports `404`.
+`CAS_MISMATCH`, `IDEMPOTENCY_COLLISION`, and
 `VERSION_EXHAUSTED` are `409`. Corruption, idempotency-witness corruption, D1
 errors, secret configuration errors, and unexpected failures return only
 `503 SETTINGS_UNAVAILABLE`; exception text, data keys, fingerprint material,

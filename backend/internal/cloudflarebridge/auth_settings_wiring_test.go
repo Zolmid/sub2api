@@ -146,6 +146,17 @@ func testBackendModeAuthComposition(t *testing.T) {
 	rotatedDenied := cloudflareSettingsRequest(t, handler, http.MethodPost, "/api/v1/auth/refresh", `{"refresh_token":"`+pair.Refresh+`"}`, "ua-one", "198.51.100.8:1234", "")
 	require.Equal(t, http.StatusForbidden, rotatedDenied.Code, rotatedDenied.Body.String())
 
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleAdmin
+	control.mu.Unlock()
+	rotatedAllowed := cloudflareSettingsRequest(t, handler, http.MethodPost, "/api/v1/auth/refresh", `{"refresh_token":"`+pair.Refresh+`"}`, "ua-one", "198.51.100.8:1234", "")
+	require.Equal(t, http.StatusOK, rotatedAllowed.Code, rotatedAllowed.Body.String())
+	rotatedPair := cloudflareTokenPair(t, rotatedAllowed.Body.Bytes())
+	require.NotEqual(t, pair.Refresh, rotatedPair.Refresh)
+
+	control.mu.Lock()
+	control.users[userID].Role = service.RoleUser
+	control.mu.Unlock()
 	user := resolvedTestUser(control.users[userID])
 	auth := service.NewAuthService(nil, NewAuthUserRepository(control), nil, control, runtime.Application, settings, nil, nil, nil, nil, nil, nil, nil)
 	userToken, err := auth.GenerateToken(context.Background(), user)

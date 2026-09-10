@@ -393,13 +393,11 @@ func (h *cloudflareUserAPIHandler) RefreshToken(c *gin.Context) {
 		response.BadRequest(c, "Invalid request")
 		return
 	}
-	result, err := h.authService.RefreshTokenPair(c.Request.Context(), request.RefreshToken)
+	result, err := h.authService.RefreshTokenPairWithGuard(c.Request.Context(), request.RefreshToken, func(user *service.User) error {
+		return h.ensureBackendModeAllowsUser(c.Request.Context(), user)
+	})
 	if err != nil {
 		response.ErrorFrom(c, err)
-		return
-	}
-	if h.isBackendModeEnabled(c.Request.Context()) && result.UserRole != service.RoleAdmin {
-		response.ErrorFrom(c, infraerrors.Forbidden("BACKEND_MODE_ADMIN_ONLY", "Backend mode is active. Only admin login is allowed."))
 		return
 	}
 	response.Success(c, cloudflareAuthResponse{

@@ -1823,9 +1823,17 @@ func (s *AuthService) storePreparedRefreshToken(ctx context.Context, prepared *p
 	return nil
 }
 
-// RefreshTokenPair 使用Refresh Token刷新Token对
-// 实现Token轮转：每次刷新都会生成新的Refresh Token，旧Token立即失效
+// RefreshTokenPair 使用Refresh Token刷新Token对。
+// 实现Token轮转：每次刷新都会生成新的Refresh Token，旧Token立即失效。
 func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string) (*TokenPairWithUser, error) {
+	return s.RefreshTokenPairWithGuard(ctx, refreshToken, nil)
+}
+
+// RefreshTokenPairWithGuard refreshes a token pair after validating the token,
+// loaded user, and session binding. When provided, guard runs before any token
+// is prepared, deleted, or rotated, so a rejected authorization decision leaves
+// the presented refresh token usable.
+func (s *AuthService) RefreshTokenPairWithGuard(ctx context.Context, refreshToken string, guard func(*User) error) (*TokenPairWithUser, error) {
 	// 检查 refreshTokenCache 是否可用
 	if s.refreshTokenCache == nil {
 		return nil, ErrRefreshTokenInvalid
@@ -1908,6 +1916,12 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 			_ = s.refreshTokenCache.DeleteTokenFamily(ctx, data.FamilyID)
 			logger.LegacyPrintf("service.auth", "[Auth] Session binding mismatch on refresh for user %d, family revoked", data.UserID)
 			return nil, ErrSessionBindingMismatch
+		}
+	}
+
+	if guard != nil {
+		if err := guard(user); err != nil {
+			return nil, err
 		}
 	}
 

@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -187,4 +188,32 @@ func TestAuthServiceRefreshTokenPairUsesAtomicRotatorOnlyOneConcurrentRefreshWin
 	require.Equal(t, 1, rotations)
 	require.Equal(t, user.TokenVersion, oldVersion)
 	require.Equal(t, oldVersion, newVersion)
+}
+
+func TestAuthServiceRefreshTokenPairWithGuardRejectsBeforeAtomicRotation(t *testing.T) {
+	user := &User{ID: 102, Email: "user@example.test", Role: RoleUser, Status: StatusActive, PasswordHash: "stable-password-hash"}
+	user.TokenVersion = resolvedTokenVersion(user)
+	user.TokenVersionResolved = true
+	cache := newAtomicRefreshTokenCacheStub()
+	svc := NewAuthService(nil, &userRepoStub{user: user}, nil, cache, &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret", ExpireHour: 1, AccessTokenExpireMinutes: 15, RefreshTokenExpireDays: 30},
+	}, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	initial, err := svc.GenerateTokenPair(context.Background(), user, "")
+	require.NoError(t, err)
+
+	denied := errors.New("refresh not authorized")
+	_, err = svc.RefreshTokenPairWithGuard(context.Background(), initial.RefreshToken, func(got *User) error {
+		require.Same(t, user, got)
+		return denied
+	})
+	require.ErrorIs(t, err, denied)
+	rotations, _, _ := cache.rotationVersionSnapshot()
+	require.Zero(t, rotations)
+
+	rotated, err := svc.RefreshTokenPair(context.Background(), initial.RefreshToken)
+	require.NoError(t, err)
+	require.NotEqual(t, initial.RefreshToken, rotated.RefreshToken)
+	rotations, _, _ = cache.rotationVersionSnapshot()
+	require.Equal(t, 1, rotations)
 }

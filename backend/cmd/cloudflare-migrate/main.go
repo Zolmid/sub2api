@@ -20,9 +20,20 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+// Diagnostic output is best effort: the command's exit code describes the
+// migration operation, while a broken caller-provided writer must not replace
+// or expose the underlying (potentially secret-bearing) failure.
+func writeLine(writer io.Writer, values ...any) {
+	_, _ = fmt.Fprintln(writer, values...)
+}
+
+func writeFormat(writer io.Writer, format string, values ...any) {
+	_, _ = fmt.Fprintf(writer, format, values...)
+}
+
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: cloudflare-migrate <snapshot-postgres|export|plan|remote-plan> [flags]")
+		writeLine(stderr, "usage: cloudflare-migrate <snapshot-postgres|export|plan|remote-plan> [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -35,7 +46,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "remote-plan":
 		return runRemotePlan(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintln(stderr, "unknown command; expected snapshot-postgres, export, plan, or remote-plan")
+		writeLine(stderr, "unknown command; expected snapshot-postgres, export, plan, or remote-plan")
 		return 2
 	}
 }
@@ -52,28 +63,28 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *output == "" || !filepath.IsAbs(*output) {
-		fmt.Fprintln(stderr, "-out must be absolute; secrets and positional arguments are not accepted")
+		writeLine(stderr, "-out must be absolute; secrets and positional arguments are not accepted")
 		return 2
 	}
 	if err := cloudflaremigration.ValidateDistinctPaths([]cloudflaremigration.NamedPath{{Name: "snapshot output", Path: *output}}); err != nil {
-		fmt.Fprintf(stderr, "snapshot paths rejected: %v\n", err)
+		writeFormat(stderr, "snapshot paths rejected: %v\n", err)
 		return 2
 	}
 	dsnBytes, _, err := secretFromEnvironmentOrFD("SUB2API_PG_DSN", *dsnFD, true)
 	if err != nil {
-		fmt.Fprintln(stderr, "PostgreSQL DSN input rejected")
+		writeLine(stderr, "PostgreSQL DSN input rejected")
 		return 2
 	}
 	defer wipe(dsnBytes)
 	targetEncoded, targetSet, err := secretFromEnvironmentOrFD("SUB2API_D1_CREDENTIAL_KEY", *targetKeyFD, false)
 	if err != nil {
-		fmt.Fprintln(stderr, "target credential key input rejected")
+		writeLine(stderr, "target credential key input rejected")
 		return 2
 	}
 	defer wipe(targetEncoded)
 	legacyEncoded, legacySet, err := secretFromEnvironmentOrFD("SUB2API_LEGACY_TOTP_KEY", *legacyTOTPKeyFD, false)
 	if err != nil {
-		fmt.Fprintln(stderr, "legacy TOTP key input rejected")
+		writeLine(stderr, "legacy TOTP key input rejected")
 		return 2
 	}
 	defer wipe(legacyEncoded)
@@ -81,7 +92,7 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 	if targetSet {
 		targetKey, err = cloudflaremigration.DecodeTargetCredentialKey(string(targetEncoded))
 		if err != nil {
-			fmt.Fprintln(stderr, "target credential key input rejected")
+			writeLine(stderr, "target credential key input rejected")
 			return 2
 		}
 		defer wipe(targetKey)
@@ -89,7 +100,7 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 	if legacySet {
 		legacyKey, err = cloudflaremigration.DecodeLegacyTOTPKey(string(legacyEncoded))
 		if err != nil {
-			fmt.Fprintln(stderr, "legacy TOTP key input rejected")
+			writeLine(stderr, "legacy TOTP key input rejected")
 			return 2
 		}
 		defer wipe(legacyKey)
@@ -98,16 +109,20 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 	if rawHosts, ok := os.LookupEnv("SUB2API_CF_UPSTREAM_ALLOWED_HOSTS"); ok {
 		allowedHosts, err = cloudflaremigration.ParseAllowedUpstreamHosts(rawHosts)
 		if err != nil {
-			fmt.Fprintln(stderr, "upstream host allowlist rejected")
+			writeLine(stderr, "upstream host allowlist rejected")
 			return 2
 		}
 	}
 	database, err := cloudflaremigration.OpenPostgreSQL(string(dsnBytes))
 	if err != nil {
-		fmt.Fprintln(stderr, "open PostgreSQL failed")
+		writeLine(stderr, "open PostgreSQL failed")
 		return 1
 	}
-	defer database.Close()
+	defer func() {
+		if closeErr := database.Close(); closeErr != nil {
+			writeFormat(stderr, "close PostgreSQL failed: %v\n", closeErr)
+		}
+	}()
 	database.SetMaxOpenConns(1)
 	options := cloudflaremigration.PostgreSQLSnapshotOptions{Schema: *schema, Credentials: cloudflaremigration.CredentialTransformer{
 		TargetKey: targetKey, LegacyTOTPKey: legacyKey, AllowedUpstreamHosts: allowedHosts,
@@ -115,10 +130,10 @@ func runSnapshotPostgreSQL(args []string, stdout, stderr io.Writer) int {
 	if err := writePrivateStream(*output, func(writer io.Writer) error {
 		return cloudflaremigration.ExportPostgreSQLSnapshot(context.Background(), database, writer, options)
 	}); err != nil {
-		fmt.Fprintf(stderr, "PostgreSQL snapshot rejected: %v\n", err)
+		writeFormat(stderr, "PostgreSQL snapshot rejected: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(stdout, "wrote a secret-safe PostgreSQL snapshot locally; no D1 operation was performed")
+	writeLine(stdout, "wrote a secret-safe PostgreSQL snapshot locally; no D1 operation was performed")
 	return 0
 }
 
@@ -131,45 +146,49 @@ func runExport(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *output == "" || !filepath.IsAbs(*output) || *source == "" || !filepath.IsAbs(*source) {
-		fmt.Fprintln(stderr, "-source-jsonl and -out must be absolute; positional arguments are not accepted")
+		writeLine(stderr, "-source-jsonl and -out must be absolute; positional arguments are not accepted")
 		return 2
 	}
 	if err := cloudflaremigration.ValidateDistinctPaths([]cloudflaremigration.NamedPath{
 		{Name: "source JSONL", Path: *source}, {Name: "bundle output", Path: *output},
 	}); err != nil {
-		fmt.Fprintf(stderr, "export paths rejected: %v\n", err)
+		writeFormat(stderr, "export paths rejected: %v\n", err)
 		return 2
 	}
 	input, err := os.Open(*source)
 	if err != nil {
-		fmt.Fprintln(stderr, "open offline source failed")
+		writeLine(stderr, "open offline source failed")
 		return 1
 	}
-	defer input.Close()
+	defer func() {
+		if closeErr := input.Close(); closeErr != nil {
+			writeFormat(stderr, "close offline source failed: %v\n", closeErr)
+		}
+	}()
 	bundle, err := cloudflaremigration.ExportJSONL(input)
 	if err != nil {
-		fmt.Fprintf(stderr, "offline PostgreSQL export rejected: %v\n", err)
+		writeFormat(stderr, "offline PostgreSQL export rejected: %v\n", err)
 		return 1
 	}
 	encoded, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
-		fmt.Fprintln(stderr, "encode private bundle failed")
+		writeLine(stderr, "encode private bundle failed")
 		return 1
 	}
 	if len(encoded)+1 > cloudflaremigration.MaxBundleBytes {
-		fmt.Fprintln(stderr, "private bundle exceeds size bound")
+		writeLine(stderr, "private bundle exceeds size bound")
 		return 1
 	}
 	plan, err := cloudflaremigration.BuildSQLPlan(bundle.Manifest)
 	if err != nil {
-		fmt.Fprintln(stderr, "exported bundle failed final validation")
+		writeLine(stderr, "exported bundle failed final validation")
 		return 1
 	}
 	if err := writePrivateFile(*output, append(encoded, '\n')); err != nil {
-		fmt.Fprintln(stderr, "write private bundle failed")
+		writeLine(stderr, "write private bundle failed")
 		return 1
 	}
-	fmt.Fprintf(stdout, "exported %d classified source tables with %d warning(s); bundle sha256 %s\n", len(bundle.Manifest.Coverage), len(bundle.Manifest.Warnings), plan.BundleDigest)
+	writeFormat(stdout, "exported %d classified source tables with %d warning(s); bundle sha256 %s\n", len(bundle.Manifest.Coverage), len(bundle.Manifest.Warnings), plan.BundleDigest)
 	return 0
 }
 
@@ -185,7 +204,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "positional arguments are not accepted")
+		writeLine(stderr, "positional arguments are not accepted")
 		return 2
 	}
 	paths := []struct{ name, value string }{
@@ -197,7 +216,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, path := range paths {
 		if path.value == "" || !filepath.IsAbs(path.value) {
-			fmt.Fprintf(stderr, "%s must be an absolute path\n", path.name)
+			writeFormat(stderr, "%s must be an absolute path\n", path.name)
 			return 2
 		}
 	}
@@ -206,54 +225,54 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		namedPaths = append(namedPaths, cloudflaremigration.NamedPath{Name: path.name, Path: path.value})
 	}
 	if err := cloudflaremigration.ValidateDistinctPaths(namedPaths); err != nil {
-		fmt.Fprintf(stderr, "plan paths rejected: %v\n", err)
+		writeFormat(stderr, "plan paths rejected: %v\n", err)
 		return 2
 	}
 	sourceFile, err := os.Open(*sourcePath)
 	if err != nil {
-		fmt.Fprintln(stderr, "read source snapshot failed")
+		writeLine(stderr, "read source snapshot failed")
 		return 1
 	}
 	sourceBundle, err := cloudflaremigration.ExportJSONL(sourceFile)
 	closeErr := sourceFile.Close()
 	if err != nil || closeErr != nil {
-		fmt.Fprintln(stderr, "source snapshot rejected")
+		writeLine(stderr, "source snapshot rejected")
 		return 1
 	}
 	input, err := readBoundedFile(*bundlePath, cloudflaremigration.MaxBundleBytes)
 	if err != nil {
-		fmt.Fprintln(stderr, "read bundle failed")
+		writeLine(stderr, "read bundle failed")
 		return 1
 	}
 	bundle, err := cloudflaremigration.DecodeBundle(input)
 	if err != nil {
-		fmt.Fprintf(stderr, "bundle rejected: %v\n", err)
+		writeFormat(stderr, "bundle rejected: %v\n", err)
 		return 1
 	}
 	canonical, err := cloudflaremigration.Canonicalize(bundle.Manifest)
 	if err != nil {
-		fmt.Fprintf(stderr, "bundle rejected: %v\n", err)
+		writeFormat(stderr, "bundle rejected: %v\n", err)
 		return 1
 	}
 	sourceCanonical, err := cloudflaremigration.Canonicalize(sourceBundle.Manifest)
 	if err != nil {
-		fmt.Fprintln(stderr, "source snapshot failed canonical validation")
+		writeLine(stderr, "source snapshot failed canonical validation")
 		return 1
 	}
 	canonicalComparison, _ := json.Marshal(canonical)
 	sourceComparison, _ := json.Marshal(sourceCanonical)
 	if !bytes.Equal(canonicalComparison, sourceComparison) {
-		fmt.Fprintln(stderr, "bundle does not match the supplied source snapshot")
+		writeLine(stderr, "bundle does not match the supplied source snapshot")
 		return 1
 	}
 	plan, err := cloudflaremigration.BuildSQLPlan(canonical)
 	if err != nil {
-		fmt.Fprintf(stderr, "SQL plan rejected: %v\n", err)
+		writeFormat(stderr, "SQL plan rejected: %v\n", err)
 		return 1
 	}
 	canonicalBytes, err := json.MarshalIndent(cloudflaremigration.Bundle{Manifest: canonical}, "", "  ")
 	if err != nil {
-		fmt.Fprintln(stderr, "encode canonical bundle failed")
+		writeLine(stderr, "encode canonical bundle failed")
 		return 1
 	}
 	outputs := []struct {
@@ -266,11 +285,11 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, output := range outputs {
 		if err := writePrivateFile(output.path, output.data); err != nil {
-			fmt.Fprintln(stderr, "write private output failed")
+			writeLine(stderr, "write private output failed")
 			return 1
 		}
 	}
-	fmt.Fprintf(stdout, "validated %d target table chunks; bundle sha256 %s\n", len(canonical.Tables), plan.BundleDigest)
+	writeFormat(stdout, "validated %d target table chunks; bundle sha256 %s\n", len(canonical.Tables), plan.BundleDigest)
 	return 0
 }
 
@@ -288,29 +307,33 @@ func runRemotePlan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "positional arguments are not accepted")
+		writeLine(stderr, "positional arguments are not accepted")
 		return 2
 	}
 	remote, err := cloudflaremigration.PlanRemoteImport(*ack, *database, *backup, *plan, *validation, *workingDirectory, *config)
 	if err != nil {
-		fmt.Fprintf(stderr, "remote plan rejected: %v\n", err)
+		writeFormat(stderr, "remote plan rejected: %v\n", err)
 		return 1
 	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(remote); err != nil {
-		fmt.Fprintln(stderr, "encode remote plan failed")
+		writeLine(stderr, "encode remote plan failed")
 		return 1
 	}
 	return 0
 }
 
-func readBoundedFile(path string, maximum int) ([]byte, error) {
+func readBoundedFile(path string, maximum int) (contents []byte, returnErr error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && returnErr == nil {
+			returnErr = fmt.Errorf("close bounded input file: %w", closeErr)
+		}
+	}()
 	data, err := io.ReadAll(io.LimitReader(file, int64(maximum)+1))
 	if err != nil || len(data) > maximum {
 		return nil, errors.New("file exceeds size bound")
@@ -325,7 +348,7 @@ func writePrivateFile(path string, contents []byte) error {
 	})
 }
 
-func writePrivateStream(path string, write func(io.Writer) error) error {
+func writePrivateStream(path string, write func(io.Writer) error) (returnErr error) {
 	if write == nil {
 		return errors.New("private writer callback is nil")
 	}
@@ -337,7 +360,13 @@ func writePrivateStream(path string, write func(io.Writer) error) error {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() {
+		if removeErr := os.Remove(temporaryPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			if returnErr == nil {
+				returnErr = fmt.Errorf("remove temporary migration file: %w", removeErr)
+			}
+		}
+	}()
 	if err := temporary.Chmod(0o600); err != nil {
 		_ = temporary.Close()
 		return err
@@ -366,7 +395,13 @@ func secretFromEnvironmentOrFD(environment string, fd int, required bool) ([]byt
 		if file == nil {
 			return nil, false, errors.New("secret file descriptor is invalid")
 		}
-		defer file.Close()
+		defer func() {
+			if closeErr := file.Close(); closeErr != nil {
+				// The descriptor is an input-only secret source; report close failures
+				// without exposing the secret or changing an already-determined result.
+				writeFormat(os.Stderr, "close inherited secret failed: %v\n", closeErr)
+			}
+		}()
 		data, err := io.ReadAll(io.LimitReader(file, 64<<10))
 		if err != nil || len(data) == 64<<10 {
 			return nil, false, errors.New("secret file descriptor is unreadable or oversized")

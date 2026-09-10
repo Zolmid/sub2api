@@ -26,7 +26,7 @@ func TestPlanUsesCanonicalDependencyOrderAndNoSilentConflict(t *testing.T) {
 	userAt := strings.Index(plan.SQL, "-- table users")
 	accountAt := strings.Index(plan.SQL, "-- table accounts")
 	keyAt := strings.Index(plan.SQL, "-- table api_keys")
-	if !(groupAt < userAt && userAt < accountAt && accountAt < keyAt) {
+	if groupAt >= userAt || userAt >= accountAt || accountAt >= keyAt {
 		t.Fatalf("dependency order is wrong: %d %d %d %d", groupAt, userAt, accountAt, keyAt)
 	}
 	if !strings.Contains(plan.SQL, "O''Reilly") {
@@ -45,7 +45,11 @@ func TestPlanRehearsesAgainstTrackedCanonicalMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	t.Cleanup(func() {
+		if closeErr := database.Close(); closeErr != nil {
+			t.Errorf("close rehearsal database: %v", closeErr)
+		}
+	})
 	root := filepath.Clean(filepath.Join("..", "..", ".."))
 	migrations := []string{
 		"deploy/cloudflare/migrations/0001_initial.sql",

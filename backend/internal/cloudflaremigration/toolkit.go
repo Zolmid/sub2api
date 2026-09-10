@@ -689,7 +689,9 @@ func canonicalPricingIdentifier(value string) bool {
 		return false
 	}
 	for _, character := range value {
-		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || strings.ContainsRune("._:-", character)) {
+		isLetter := character >= 'a' && character <= 'z'
+		isDigit := character >= '0' && character <= '9'
+		if !isLetter && !isDigit && !strings.ContainsRune("._:-", character) {
 			return false
 		}
 	}
@@ -710,7 +712,9 @@ func validPricingPattern(value, kind string) bool {
 		return false
 	}
 	for _, character := range core {
-		if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || strings.ContainsRune("._:/-", character)) {
+		isLetter := character >= 'a' && character <= 'z'
+		isDigit := character >= '0' && character <= '9'
+		if !isLetter && !isDigit && !strings.ContainsRune("._:/-", character) {
 			return false
 		}
 	}

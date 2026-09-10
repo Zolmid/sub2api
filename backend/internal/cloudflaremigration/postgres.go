@@ -52,7 +52,7 @@ func ExportPostgreSQLSnapshot(ctx context.Context, database *sql.DB, output io.W
 	if err != nil {
 		return errors.New("begin PostgreSQL read-only snapshot failed")
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, PostgreSQLReadOnlyTransaction); err != nil {
 		return errors.New("enforce PostgreSQL REPEATABLE READ READ ONLY failed")
 	}
@@ -153,7 +153,7 @@ func readMigrationFingerprint(ctx context.Context, tx *sql.Tx, schema string) ([
 	if err != nil {
 		return nil, errors.New("read schema_migrations failed; the repository-owned migration registry is required")
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := []json.RawMessage{}
 	for rows.Next() {
 		var filename, checksum string
@@ -177,7 +177,7 @@ func readPostgreSQLInventory(ctx context.Context, tx *sql.Tx, schema string) (ma
 	if err != nil {
 		return nil, errors.New("read PostgreSQL table inventory failed")
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := map[string]bool{}
 	for rows.Next() {
 		var table string
@@ -206,7 +206,7 @@ ORDER BY table_name, column_name`, schema)
 	if err != nil {
 		return nil, errors.New("read PostgreSQL column inventory failed")
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := make(map[string][]string, len(inventory))
 	for table := range inventory {
 		result[table] = []string{}
@@ -276,7 +276,7 @@ func exportPostgreSQLTable(ctx context.Context, tx *sql.Tx, schema, table string
 	if err != nil {
 		return 0, "", fmt.Errorf("read transformed source table %q failed", table)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	count := 0
 	for rows.Next() {
 		var raw []byte

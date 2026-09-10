@@ -533,7 +533,9 @@ func sourceIdentifier(value string) bool {
 		return false
 	}
 	for index, character := range value {
-		if !(character == '_' || character >= 'a' && character <= 'z' || index > 0 && character >= '0' && character <= '9') {
+		isLetter := character >= 'a' && character <= 'z'
+		isNonLeadingDigit := index > 0 && character >= '0' && character <= '9'
+		if character != '_' && !isLetter && !isNonLeadingDigit {
 			return false
 		}
 	}

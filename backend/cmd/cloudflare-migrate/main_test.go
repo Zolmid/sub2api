@@ -88,8 +88,12 @@ func emptySourceSnapshotOmitting(t *testing.T, omitted string) []byte {
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
-		output.Write(encoded)
-		output.WriteByte('\n')
+		if _, err := output.Write(encoded); err != nil {
+			t.Fatal(err)
+		}
+		if err := output.WriteByte('\n'); err != nil {
+			t.Fatal(err)
+		}
 	}
 	writeLine(header)
 	for _, table := range tables {

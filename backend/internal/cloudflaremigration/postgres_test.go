@@ -77,7 +77,11 @@ func TestExportPostgreSQLSnapshotUsesVerifiedReadOnlyTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	database.SetMaxOpenConns(1)
-	defer database.Close()
+	t.Cleanup(func() {
+		if closeErr := database.Close(); closeErr != nil {
+			t.Errorf("close snapshot test database: %v", closeErr)
+		}
+	})
 
 	var output bytes.Buffer
 	if err := ExportPostgreSQLSnapshot(context.Background(), database, &output, PostgreSQLSnapshotOptions{Schema: "public"}); err != nil {

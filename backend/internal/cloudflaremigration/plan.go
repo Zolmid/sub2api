@@ -69,22 +69,28 @@ func BuildSQLPlan(manifest Manifest) (SQLPlan, error) {
 	guardKey := "offline_migration/v3/assert/" + bundleDigest
 
 	var plan strings.Builder
-	plan.WriteString("-- Generated offline migration data plan for canonical D1 migrations 0001-0008.\n")
-	plan.WriteString("-- Remote whole-file atomicity is not assumed. Preserve a Time Travel bookmark and verify before replay.\n")
-	plan.WriteString("PRAGMA defer_foreign_keys = ON;\n")
+	if _, err := plan.WriteString("-- Generated offline migration data plan for canonical D1 migrations 0001-0008.\n"); err != nil {
+		return SQLPlan{}, err
+	}
+	if _, err := plan.WriteString("-- Remote whole-file atomicity is not assumed. Preserve a Time Travel bookmark and verify before replay.\n"); err != nil {
+		return SQLPlan{}, err
+	}
+	if _, err := plan.WriteString("PRAGMA defer_foreign_keys = ON;\n"); err != nil {
+		return SQLPlan{}, err
+	}
 	writeAssertion(&plan, guardKey, `EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_bridge_schema_version' AND "value"='2026-09-06.v1')`, "canonical bridge schema is installed")
 	writeAssertion(&plan, guardKey, `EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_e8_money_scale' AND "value"='8')`, "E8 migration is installed")
 
 	tableCounts := map[string]int{}
 	for _, chunk := range canonical.Tables {
-		fmt.Fprintf(&plan, "\n-- table %s; chunk %s\n", chunk.Table, chunk.ID)
+		_, _ = fmt.Fprintf(&plan, "\n-- table %s; chunk %s\n", chunk.Table, chunk.ID)
 		tableCounts[chunk.Table] += len(chunk.Rows)
 		for _, raw := range chunk.Rows {
 			rowSQL, identity, rowDigest, rowErr := rowPlanSQL(chunk.Table, raw, guardKey)
 			if rowErr != nil {
 				return SQLPlan{}, rowErr
 			}
-			plan.WriteString(rowSQL)
+			_, _ = plan.WriteString(rowSQL)
 			provenanceKey := "offline_migration/v3/row/" + chunk.Table + "/" + identityDigest(identity)
 			writeProvenance(&plan, guardKey, provenanceKey, rowDigest)
 		}
@@ -99,15 +105,15 @@ func BuildSQLPlan(manifest Manifest) (SQLPlan, error) {
 	writeProvenance(&plan, guardKey, "offline_migration/v3/bundle", bundleDigest)
 
 	var validation strings.Builder
-	validation.WriteString("-- Read-only post-import validation. Success returns no failure rows.\n")
-	validation.WriteString("SELECT 'foreign_key' AS failure, \"table\" AS subject, CAST(rowid AS TEXT) AS actual, parent AS expected FROM pragma_foreign_key_check;\n")
-	validation.WriteString("SELECT 'quick_check' AS failure, 'database' AS subject, quick_check AS actual, 'ok' AS expected FROM pragma_quick_check WHERE quick_check <> 'ok';\n")
+	_, _ = validation.WriteString("-- Read-only post-import validation. Success returns no failure rows.\n")
+	_, _ = validation.WriteString("SELECT 'foreign_key' AS failure, \"table\" AS subject, CAST(rowid AS TEXT) AS actual, parent AS expected FROM pragma_foreign_key_check;\n")
+	_, _ = validation.WriteString("SELECT 'quick_check' AS failure, 'database' AS subject, quick_check AS actual, 'ok' AS expected FROM pragma_quick_check WHERE quick_check <> 'ok';\n")
 	for _, table := range TableOrder {
 		expected := strconv.Itoa(tableCounts[table])
-		fmt.Fprintf(&validation, "SELECT 'row_count' AS failure, %s AS subject, CAST(COUNT(*) AS TEXT) AS actual, %s AS expected FROM %s HAVING COUNT(*) <> %s;\n", SQLLiteral(table), SQLLiteral(expected), quoteIdentifier(table), expected)
+		_, _ = fmt.Fprintf(&validation, "SELECT 'row_count' AS failure, %s AS subject, CAST(COUNT(*) AS TEXT) AS actual, %s AS expected FROM %s HAVING COUNT(*) <> %s;\n", SQLLiteral(table), SQLLiteral(expected), quoteIdentifier(table), expected)
 	}
-	fmt.Fprintf(&validation, "SELECT 'bundle_digest' AS failure, 'offline_migration/v3/bundle' AS subject, COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"='offline_migration/v3/bundle'),'missing') AS actual, %s AS expected WHERE COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"='offline_migration/v3/bundle'),'missing') <> %s;\n", SQLLiteral(bundleDigest), SQLLiteral(bundleDigest))
-	validation.WriteString("SELECT 'assertion_guard' AS failure, \"key\" AS subject, \"value\" AS actual, 'absent' AS expected FROM \"schema_metadata\" WHERE \"key\" LIKE 'offline_migration/v3/assert/%';\n")
+	_, _ = fmt.Fprintf(&validation, "SELECT 'bundle_digest' AS failure, 'offline_migration/v3/bundle' AS subject, COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"='offline_migration/v3/bundle'),'missing') AS actual, %s AS expected WHERE COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"='offline_migration/v3/bundle'),'missing') <> %s;\n", SQLLiteral(bundleDigest), SQLLiteral(bundleDigest))
+	_, _ = validation.WriteString("SELECT 'assertion_guard' AS failure, \"key\" AS subject, \"value\" AS actual, 'absent' AS expected FROM \"schema_metadata\" WHERE \"key\" LIKE 'offline_migration/v3/assert/%';\n")
 	return SQLPlan{BundleDigest: bundleDigest, SQL: plan.String(), ValidationSQL: validation.String()}, nil
 }
 
@@ -141,7 +147,7 @@ func rowPlanSQL(table string, raw json.RawMessage, guardKey string) (string, str
 		primary[index] = quoteIdentifier(column) + " IS " + value
 	}
 	var result strings.Builder
-	fmt.Fprintf(&result, "INSERT INTO %s(%s) SELECT %s WHERE NOT EXISTS(SELECT 1 FROM %s WHERE %s);\n",
+	_, _ = fmt.Fprintf(&result, "INSERT INTO %s(%s) SELECT %s WHERE NOT EXISTS(SELECT 1 FROM %s WHERE %s);\n",
 		quoteIdentifier(table), strings.Join(quoteIdentifiers(columns), ","), strings.Join(values, ","),
 		quoteIdentifier(table), strings.Join(primary, " AND "))
 	writeAssertion(&result, guardKey, "EXISTS(SELECT 1 FROM "+quoteIdentifier(table)+" WHERE "+strings.Join(equality, " AND ")+")", table+" row "+identity+" is identical")
@@ -150,17 +156,17 @@ func rowPlanSQL(table string, raw json.RawMessage, guardKey string) (string, str
 }
 
 func writeProvenance(plan *strings.Builder, guardKey, key, value string) {
-	fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,%s WHERE NOT EXISTS(SELECT 1 FROM \"schema_metadata\" WHERE \"key\"=%s);\n", SQLLiteral(key), SQLLiteral(value), SQLLiteral(key))
+	_, _ = fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,%s WHERE NOT EXISTS(SELECT 1 FROM \"schema_metadata\" WHERE \"key\"=%s);\n", SQLLiteral(key), SQLLiteral(value), SQLLiteral(key))
 	condition := fmt.Sprintf(`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"=%s AND "value"=%s)`, SQLLiteral(key), SQLLiteral(value))
 	writeAssertion(plan, guardKey, condition, "provenance is identical")
 }
 
 func writeAssertion(plan *strings.Builder, guardKey, condition, label string) {
-	fmt.Fprintf(plan, "-- assert: %s\n", strings.ReplaceAll(label, "\n", " "))
-	fmt.Fprintf(plan, "DELETE FROM \"schema_metadata\" WHERE \"key\"=%s;\n", SQLLiteral(guardKey))
-	fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,'first' WHERE NOT (%s);\n", SQLLiteral(guardKey), condition)
-	fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,'second' WHERE NOT (%s);\n", SQLLiteral(guardKey), condition)
-	fmt.Fprintf(plan, "DELETE FROM \"schema_metadata\" WHERE \"key\"=%s;\n", SQLLiteral(guardKey))
+	_, _ = fmt.Fprintf(plan, "-- assert: %s\n", strings.ReplaceAll(label, "\n", " "))
+	_, _ = fmt.Fprintf(plan, "DELETE FROM \"schema_metadata\" WHERE \"key\"=%s;\n", SQLLiteral(guardKey))
+	_, _ = fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,'first' WHERE NOT (%s);\n", SQLLiteral(guardKey), condition)
+	_, _ = fmt.Fprintf(plan, "INSERT INTO \"schema_metadata\"(\"key\",\"value\") SELECT %s,'second' WHERE NOT (%s);\n", SQLLiteral(guardKey), condition)
+	_, _ = fmt.Fprintf(plan, "DELETE FROM \"schema_metadata\" WHERE \"key\"=%s;\n", SQLLiteral(guardKey))
 }
 
 func identityDigest(identity string) string {
@@ -269,15 +275,15 @@ func PlanRemoteImport(acknowledgement, database, backupPath, sqlPath, validation
 		return RemotePlan{}, errors.New("remote database name is invalid")
 	}
 	if !filepath.IsAbs(workingDirectory) {
-		return RemotePlan{}, errors.New("Wrangler working directory must be absolute")
+		return RemotePlan{}, errors.New("wrangler working directory must be absolute")
 	}
 	workInfo, err := os.Lstat(filepath.Clean(workingDirectory))
 	if err != nil || !workInfo.IsDir() || workInfo.Mode()&os.ModeSymlink != 0 {
-		return RemotePlan{}, errors.New("Wrangler working directory must be a real directory, not a symlink")
+		return RemotePlan{}, errors.New("wrangler working directory must be a real directory, not a symlink")
 	}
 	resolvedWork, err := filepath.EvalSymlinks(filepath.Clean(workingDirectory))
 	if err != nil {
-		return RemotePlan{}, errors.New("Wrangler working directory could not be resolved")
+		return RemotePlan{}, errors.New("wrangler working directory could not be resolved")
 	}
 	if err := ValidateDistinctPaths([]NamedPath{
 		{Name: "backup", Path: backupPath},
@@ -289,11 +295,11 @@ func PlanRemoteImport(acknowledgement, database, backupPath, sqlPath, validation
 	}
 	resolvedConfig, err := filepath.EvalSymlinks(filepath.Clean(configPath))
 	if err != nil {
-		return RemotePlan{}, errors.New("Wrangler config could not be resolved")
+		return RemotePlan{}, errors.New("wrangler config could not be resolved")
 	}
 	relativeConfig, err := filepath.Rel(resolvedWork, resolvedConfig)
 	if err != nil || relativeConfig == ".." || strings.HasPrefix(relativeConfig, ".."+string(filepath.Separator)) {
-		return RemotePlan{}, errors.New("Wrangler config must be inside the working directory")
+		return RemotePlan{}, errors.New("wrangler config must be inside the working directory")
 	}
 	for label, path := range map[string]string{"SQL": sqlPath, "validation": validationPath} {
 		info, err := os.Stat(path)
@@ -312,7 +318,7 @@ func PlanRemoteImport(acknowledgement, database, backupPath, sqlPath, validation
 	}
 	configInfo, err := os.Stat(configPath)
 	if err != nil || !configInfo.Mode().IsRegular() {
-		return RemotePlan{}, errors.New("Wrangler config must be a regular file")
+		return RemotePlan{}, errors.New("wrangler config must be a regular file")
 	}
 	wranglerVersion, err := pinnedWranglerVersion(resolvedWork)
 	if err != nil {
@@ -352,7 +358,7 @@ func pinnedWranglerVersion(workingDirectory string) (string, error) {
 		return "", errors.New("package.json has no devDependencies object")
 	}
 	version, ok := dependencies["wrangler"].(string)
-	exactVersion := regexp.MustCompile("^[0-9]+\\.[0-9]+\\.[0-9]+$")
+	exactVersion := regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 	if !ok || !exactVersion.MatchString(version) {
 		return "", errors.New("package.json must pin Wrangler to an exact version")
 	}

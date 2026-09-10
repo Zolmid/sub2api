@@ -10,10 +10,10 @@ import (
 const (
 	// ProtocolVersion is sent on every Container-to-Worker control-plane request.
 	// Changes that are not backward compatible must use a new version and route.
-	ProtocolVersion    = "2026-09-08.v2"
-	UsageSchemaVersion = "2026-09-06.v1"
+	ProtocolVersion    = "2026-09-09.v3"
+	UsageSchemaVersion = "2026-09-09.v2"
 	InternalHost       = "sub2api.internal"
-	UsageEventType     = "gateway.usage.v1"
+	UsageEventType     = "gateway.usage.v2"
 )
 
 const (
@@ -31,6 +31,7 @@ type ControlPlane interface {
 	ResolveAPIKey(ctx context.Context, key string) (*service.APIKey, error)
 	TouchAPIKey(ctx context.Context, keyID int64, usedAt time.Time) error
 	Admit(ctx context.Context, request AdmissionRequest) (*Admission, error)
+	Start(ctx context.Context, request StartRequest) error
 	Renew(ctx context.Context, request RenewRequest) (*Lease, error)
 	Complete(ctx context.Context, request CompletionRequest) error
 	Release(ctx context.Context, request ReleaseRequest) error
@@ -64,23 +65,40 @@ type Admission struct {
 }
 
 type CompletionRequest struct {
-	SchemaVersion   string `json:"schema_version"`
-	EventType       string `json:"event_type"`
-	EventID         string `json:"event_id"`
-	RequestID       string `json:"request_id"`
-	APIKeyID        string `json:"api_key_id"`
-	AccountID       string `json:"account_id"`
-	LeaseID         string `json:"lease_id"`
-	LeaseEpoch      string `json:"lease_epoch"`
-	Outcome         string `json:"outcome"`
-	UsageState      string `json:"usage_state"`
-	InputTokens     string `json:"input_tokens"`
-	OutputTokens    string `json:"output_tokens"`
-	CacheReadTokens string `json:"cache_read_tokens"`
-	Model           string `json:"model"`
-	UpstreamModel   string `json:"upstream_model"`
-	UpstreamID      string `json:"upstream_request_id,omitempty"`
-	DurationMillis  string `json:"duration_ms"`
+	SchemaVersion         string `json:"schema_version"`
+	EventType             string `json:"event_type"`
+	EventID               string `json:"event_id"`
+	RequestID             string `json:"request_id"`
+	APIKeyID              string `json:"api_key_id"`
+	AccountID             string `json:"account_id"`
+	LeaseID               string `json:"lease_id"`
+	LeaseEpoch            string `json:"lease_epoch"`
+	Outcome               string `json:"outcome"`
+	UsageState            string `json:"usage_state"`
+	InputTokens           string `json:"input_tokens"`
+	ImageInputTokens      string `json:"image_input_tokens"`
+	OutputTokens          string `json:"output_tokens"`
+	ImageOutputTokens     string `json:"image_output_tokens"`
+	CacheCreationTokens   string `json:"cache_creation_tokens"`
+	CacheCreation5mTokens string `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens string `json:"cache_creation_1h_tokens"`
+	CacheReadTokens       string `json:"cache_read_tokens"`
+	ServiceTier           string `json:"service_tier"`
+	ReasoningEffort       string `json:"reasoning_effort"`
+	Model                 string `json:"model"`
+	UpstreamModel         string `json:"upstream_model"`
+	UpstreamID            string `json:"upstream_request_id,omitempty"`
+	DurationMillis        string `json:"duration_ms"`
+}
+
+type StartRequest struct {
+	RequestID     string `json:"request_id"`
+	APIKeyID      string `json:"api_key_id"`
+	AccountID     string `json:"account_id"`
+	LeaseID       string `json:"lease_id"`
+	LeaseEpoch    string `json:"lease_epoch"`
+	Model         string `json:"model"`
+	UpstreamModel string `json:"upstream_model"`
 }
 
 type RenewRequest struct {

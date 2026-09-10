@@ -453,6 +453,9 @@ async function balanceAdjustment(env: Env, route: string, body: Record<string, u
   const [actor, target] = await Promise.all([getUser(env, body.actor_user_id as string), getUser(env, body.target_user_id as string)]);
   if (!actor || actor.deleted_at !== null || actor.status !== "active" || actor.role !== "admin") return error("ACTOR_FORBIDDEN", 403);
   if (!target || target.deleted_at !== null) return error("TARGET_NOT_FOUND", 404);
+  const balanceVersion = await env.DB.prepare("SELECT balance_version FROM users WHERE id=?")
+    .bind(target.id).first<{balance_version:number}>();
+  if (!balanceVersion || !Number.isSafeInteger(balanceVersion.balance_version)) return error("STALE_BALANCE", 409);
   let before: bigint; let amount: bigint;
   try { before = BigInt(target.balance_e8_usd); amount = BigInt(admittedAmount); } catch { return error("INVALID_REQUEST"); }
   const after = body.operation === "set" ? amount : body.operation === "add" ? before + amount : before - amount;
@@ -462,7 +465,7 @@ async function balanceAdjustment(env: Env, route: string, body: Record<string, u
   const response = { balance: { ledger_id: operation, actor_user_id: actor.id, target_user_id: target.id, adjustment_type: body.operation, reason: body.reason, delta_e8_usd: delta.toString(), balance_before_e8_usd: before.toString(), balance_after_e8_usd: after.toString(), ...(legacyMicrousd(delta.toString()) === undefined ? {} : { delta_microusd: legacyMicrousd(delta.toString()) }), ...(legacyMicrousd(before.toString()) === undefined ? {} : { balance_before_microusd: legacyMicrousd(before.toString()) }), ...(legacyMicrousd(after.toString()) === undefined ? {} : { balance_after_microusd: legacyMicrousd(after.toString()) }) } };
   const stamp = now();
   const saved = await managedOperation(env, route, operation, fingerprint, response, [
-    env.DB.prepare("UPDATE users SET balance_e8_usd=?,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_e8_usd=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind(after.toString(), stamp, target.id, before.toString(), actor.id),
+    env.DB.prepare("UPDATE users SET balance_e8_usd=?,balance_version=balance_version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND balance_e8_usd=? AND balance_version=? AND EXISTS(SELECT 1 FROM users AS actor WHERE actor.id=? AND actor.deleted_at IS NULL AND actor.status='active' AND actor.role='admin')").bind(after.toString(), stamp, target.id, before.toString(), balanceVersion.balance_version, actor.id),
     env.DB.prepare("INSERT INTO balance_ledger(id,operation_id,actor_user_id,target_user_id,adjustment_type,reason,delta_e8_usd,balance_before_e8_usd,balance_after_e8_usd,created_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM management_operations WHERE operation_id=?)").bind(operation, operation, actor.id, target.id, body.operation, body.reason, delta.toString(), before.toString(), after.toString(), stamp, operation),
   ]);
   if (saved) return json({ ...saved.response, replayed: saved.replay });

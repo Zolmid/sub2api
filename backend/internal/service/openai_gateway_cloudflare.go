@@ -1,6 +1,16 @@
 package service
 
-import "github.com/Wei-Shaw/sub2api/internal/config"
+import (
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"sync/atomic"
+
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
+	"github.com/gin-gonic/gin"
+)
 
 // NewCloudflareVerticalSliceOpenAIGatewayService composes the existing OpenAI
 // protocol forwarder without the PostgreSQL/Redis-backed scheduling graph. It
@@ -23,7 +33,7 @@ func NewCloudflareVerticalSliceOpenAIGatewayService(cfg *config.Config, httpUpst
 		nil, // billing service
 		nil, // rate-limit service
 		nil, // billing cache service
-		httpUpstream,
+		cloudflareUsageObservingUpstream{next: httpUpstream},
 		nil, // deferred service
 		nil, // OpenAI token provider: first slice uses API-key accounts
 		nil, // Grok token provider
@@ -33,4 +43,255 @@ func NewCloudflareVerticalSliceOpenAIGatewayService(cfg *config.Config, httpUpst
 		nil, // setting service
 		nil, // user platform quota repository
 	)
+}
+
+// ForwardCloudflareResponses keeps the mature Responses forwarding path while
+// making the Worker's admitted model authoritative for this one request. The
+// account is cloned so concurrent requests and traditional deployments never
+// observe the temporary mapping.
+func (s *OpenAIGatewayService) ForwardCloudflareResponses(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	requestedModel string,
+	mappedModel string,
+) (*OpenAIForwardResult, error) {
+	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
+		return s.Forward(observedCtx, c, mappedAccount, body)
+	})
+}
+
+// ForwardCloudflareMessages applies the same request-local model authority to
+// the existing Anthropic Messages compatibility path.
+func (s *OpenAIGatewayService) ForwardCloudflareMessages(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	requestedModel string,
+	mappedModel string,
+) (*OpenAIForwardResult, error) {
+	return s.forwardCloudflareObserved(ctx, account, requestedModel, mappedModel, func(observedCtx context.Context, mappedAccount *Account) (*OpenAIForwardResult, error) {
+		return s.ForwardAsAnthropic(observedCtx, c, mappedAccount, body, "", mappedModel)
+	})
+}
+
+func (s *OpenAIGatewayService) forwardCloudflareObserved(
+	ctx context.Context,
+	account *Account,
+	requestedModel string,
+	mappedModel string,
+	forward func(context.Context, *Account) (*OpenAIForwardResult, error),
+) (*OpenAIForwardResult, error) {
+	observation := &cloudflareUsageObservation{}
+	observedCtx := context.WithValue(ctx, cloudflareUsageObservationKey{}, observation)
+	result, err := forward(observedCtx, cloudflareAccountWithMappedModel(account, requestedModel, mappedModel))
+	if result != nil && observation.present.Load() {
+		result.UsagePresent = true
+	}
+	return result, err
+}
+
+func cloudflareAccountWithMappedModel(account *Account, requestedModel, mappedModel string) *Account {
+	requestedModel = strings.TrimSpace(requestedModel)
+	mappedModel = strings.TrimSpace(mappedModel)
+	if account == nil || requestedModel == "" || mappedModel == "" {
+		return account
+	}
+
+	clone := *account
+	clone.Credentials = make(map[string]any, len(account.Credentials)+1)
+	for key, value := range account.Credentials {
+		clone.Credentials[key] = value
+	}
+	mapping := make(map[string]any)
+	for key, value := range account.GetModelMapping() {
+		mapping[key] = value
+	}
+	mapping[requestedModel] = mappedModel
+	clone.Credentials["model_mapping"] = mapping
+	clone.modelMappingCache = nil
+	clone.modelMappingCacheReady = false
+	return &clone
+}
+
+type cloudflareUsageObservationKey struct{}
+
+type cloudflareUsageObservation struct {
+	present atomic.Bool
+}
+
+// cloudflareUsageObservingUpstream observes the upstream wire representation,
+// before protocol conversion can synthesize an empty usage object. It records
+// presence only; the mature forwarder remains authoritative for token values.
+type cloudflareUsageObservingUpstream struct {
+	next HTTPUpstream
+}
+
+func (u cloudflareUsageObservingUpstream) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
+	resp, err := u.next.Do(req, proxyURL, accountID, accountConcurrency)
+	return wrapCloudflareUsageResponse(req, resp), err
+}
+
+func (u cloudflareUsageObservingUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile) (*http.Response, error) {
+	resp, err := u.next.DoWithTLS(req, proxyURL, accountID, accountConcurrency, profile)
+	return wrapCloudflareUsageResponse(req, resp), err
+}
+
+func wrapCloudflareUsageResponse(req *http.Request, resp *http.Response) *http.Response {
+	if req == nil || resp == nil || resp.Body == nil {
+		return resp
+	}
+	observation, _ := req.Context().Value(cloudflareUsageObservationKey{}).(*cloudflareUsageObservation)
+	if observation == nil {
+		return resp
+	}
+	resp.Body = &cloudflareUsageObservingBody{ReadCloser: resp.Body, observation: observation}
+	return resp
+}
+
+type cloudflareUsageObservingBody struct {
+	io.ReadCloser
+	observation *cloudflareUsageObservation
+	scanner     cloudflareUsageKeyScanner
+}
+
+func (b *cloudflareUsageObservingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 && !b.observation.present.Load() && b.scanner.Write(p[:n]) {
+		b.observation.present.Store(true)
+	}
+	return n, err
+}
+
+// cloudflareUsageKeyScanner recognizes a JSON object named "usage" that has a
+// direct token-count field. It is incremental across arbitrary Read boundaries
+// and ignores matching text inside JSON strings, so metadata or generated text
+// containing a nested object named usage cannot confirm billing by itself.
+type cloudflareUsageKeyScanner struct {
+	inString       bool
+	escaped        bool
+	stringValue    [24]byte
+	stringLength   int
+	stringOverflow bool
+	waitingColon   bool
+	waitingValue   bool
+	pendingKey     string
+	objectDepth    int
+	objectParents  [16]string
+	usageDepth     int
+}
+
+func (s *cloudflareUsageKeyScanner) Write(data []byte) bool {
+	for _, ch := range data {
+		if s.inString {
+			if s.escaped {
+				s.escaped = false
+				s.stringOverflow = true
+				continue
+			}
+			if ch == '\\' {
+				s.escaped = true
+				continue
+			}
+			if ch == '"' {
+				s.inString = false
+				s.pendingKey = ""
+				if !s.stringOverflow {
+					s.pendingKey = string(s.stringValue[:s.stringLength])
+				}
+				s.waitingColon = true
+				continue
+			}
+			if s.stringLength < len(s.stringValue) {
+				s.stringValue[s.stringLength] = ch
+			} else {
+				s.stringOverflow = true
+			}
+			s.stringLength++
+			continue
+		}
+
+		if s.waitingColon {
+			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+				continue
+			}
+			s.waitingColon = false
+			if ch == ':' {
+				if s.usageDepth > 0 && s.objectDepth == s.usageDepth &&
+					isCloudflareUsageTokenKey(s.pendingKey) {
+					return true
+				}
+				s.waitingValue = true
+				continue
+			}
+			s.pendingKey = ""
+		}
+		if s.waitingValue {
+			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+				continue
+			}
+			key := s.pendingKey
+			s.waitingValue = false
+			s.pendingKey = ""
+			if ch == '{' {
+				s.openObject(key)
+				continue
+			}
+		}
+		switch ch {
+		case '{':
+			s.openObject("")
+			continue
+		case '}':
+			if s.objectDepth == s.usageDepth {
+				s.usageDepth = 0
+			}
+			if s.objectDepth > 0 {
+				if s.objectDepth < len(s.objectParents) {
+					s.objectParents[s.objectDepth] = ""
+				}
+				s.objectDepth--
+			}
+			continue
+		}
+		if ch == '"' {
+			s.inString = true
+			s.escaped = false
+			s.stringLength = 0
+			s.stringOverflow = false
+		}
+	}
+	return false
+}
+
+func (s *cloudflareUsageKeyScanner) openObject(key string) {
+	containingDepth := s.objectDepth
+	s.objectDepth++
+	if s.objectDepth < len(s.objectParents) {
+		s.objectParents[s.objectDepth] = key
+	}
+	if key != "usage" || s.usageDepth != 0 {
+		return
+	}
+	if containingDepth == 1 {
+		s.usageDepth = s.objectDepth
+		return
+	}
+	if containingDepth == 2 && containingDepth < len(s.objectParents) {
+		parent := s.objectParents[containingDepth]
+		if parent == "response" || parent == "message" {
+			s.usageDepth = s.objectDepth
+		}
+	}
+}
+
+func isCloudflareUsageTokenKey(value string) bool {
+	switch value {
+	case "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens":
+		return true
+	default:
+		return false
+	}
 }

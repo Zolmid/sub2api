@@ -21,6 +21,7 @@ const maxControlPlaneResponseBytes int64 = 1 << 20
 var (
 	ErrControlPlaneUnavailable = errors.New("cloudflare control plane unavailable")
 	ErrAdmissionRejected       = errors.New("cloudflare admission rejected")
+	ErrInsufficientBalance     = errors.New("cloudflare insufficient balance")
 )
 
 // controlPlaneResponseError preserves the bounded machine-readable status from
@@ -59,7 +60,11 @@ func NewHTTPControlPlane(baseURL string, client *http.Client) (*HTTPControlPlane
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	if client == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, errors.New("default HTTP transport is not configurable")
+		}
+		transport := defaultTransport.Clone()
 		// The virtual outbound-handler hostname must never be sent through a
 		// user-supplied HTTP(S)_PROXY or redirected to a public endpoint.
 		transport.Proxy = nil
@@ -96,6 +101,9 @@ func (c *HTTPControlPlane) post(ctx context.Context, path string, input, output 
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("control plane request canceled: %w", ctxErr)
+		}
 		return fmt.Errorf("%w: %v", ErrControlPlaneUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -115,6 +123,9 @@ func (c *HTTPControlPlane) post(ctx context.Context, path string, input, output 
 		if code == "API_KEY_NOT_FOUND" {
 			return service.ErrAPIKeyNotFound
 		}
+		if code == "INSUFFICIENT_BALANCE" || resp.StatusCode == http.StatusPaymentRequired {
+			return ErrInsufficientBalance
+		}
 		if code == "ADMISSION_REJECTED" || resp.StatusCode == http.StatusTooManyRequests {
 			return ErrAdmissionRejected
 		}
@@ -128,8 +139,12 @@ func (c *HTTPControlPlane) post(ctx context.Context, path string, input, output 
 	}
 	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(output); err != nil {
 		return fmt.Errorf("%w: decode response: %v", ErrControlPlaneUnavailable, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: decode response: trailing JSON value", ErrControlPlaneUnavailable)
 	}
 	return nil
 }
@@ -365,6 +380,10 @@ func isCanonicalPositiveDecimal(value string) bool {
 
 func (c *HTTPControlPlane) Complete(ctx context.Context, request CompletionRequest) error {
 	return c.post(ctx, "/v1/requests/complete", request, nil)
+}
+
+func (c *HTTPControlPlane) Start(ctx context.Context, request StartRequest) error {
+	return c.post(ctx, "/v1/requests/start", request, nil)
 }
 
 func (c *HTTPControlPlane) Renew(ctx context.Context, request RenewRequest) (*Lease, error) {

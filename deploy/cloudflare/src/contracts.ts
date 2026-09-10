@@ -1,7 +1,7 @@
-export const BRIDGE_VERSION = "2026-09-08.v2";
+export const BRIDGE_VERSION = "2026-09-09.v3";
 export const D1_BASE_SCHEMA_VERSION = "2026-09-06.v1";
-export const USAGE_SCHEMA_VERSION = "2026-09-06.v1";
-export const USAGE_EVENT_TYPE = "gateway.usage.v1";
+export const USAGE_SCHEMA_VERSION = "2026-09-09.v2";
+export const USAGE_EVENT_TYPE = "gateway.usage.v2";
 export const INTERNAL_HOST = "sub2api.internal";
 export const MAX_CONTROL_BODY_BYTES = 64 * 1024;
 
@@ -129,8 +129,15 @@ export type Completion = Omit<LeaseIdentity, "owner" | "epoch"> & {
   outcome: "succeeded" | "failed";
   usage_state: "confirmed" | "unknown";
   input_tokens: string;
+  image_input_tokens?: string;
   output_tokens: string;
+  image_output_tokens?: string;
+  cache_creation_tokens?: string;
+  cache_creation_5m_tokens?: string;
+  cache_creation_1h_tokens?: string;
   cache_read_tokens: string;
+  service_tier?: string;
+  reasoning_effort?: string;
   model: string;
   upstream_model: string;
   upstream_request_id?: string;

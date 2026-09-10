@@ -6,6 +6,7 @@ import {
   createAndEnqueueJob,
   drainOutbox,
   getJob,
+  listExpiredJobs,
   listDrainableOutbox,
   makeQueueEnvelope,
   markOutboxPublished,
@@ -103,6 +104,21 @@ async function counts(jobId: string) {
 }
 
 describe("D1 background job runtime", () => {
+  it("lists a bounded recovery worklist without mutating job state", async () => {
+    const first = await create();
+    const second = await create();
+    const firstClaim = await claim(first.envelope, 100, "expired-first");
+    const secondClaim = await claim(second.envelope, 100, "expired-second");
+    expect(firstClaim.job?.status).toBe("claimed");
+    expect(secondClaim.job?.status).toBe("claimed");
+
+    const worklist = await listExpiredJobs(db, 1_100, 1);
+    expect(worklist).toHaveLength(1);
+    expect(worklist[0]?.status).toBe("claimed");
+    expect(await getJob(db, first.job.jobId)).toMatchObject({ status: "claimed" });
+    expect(await getJob(db, second.job.jobId)).toMatchObject({ status: "claimed" });
+  });
+
   it("commits create, transition, and enqueue atomically and recovers a pending outbox", async () => {
     const { input, job } = await create();
     expect(job).toMatchObject({ status: "queued", version: 1, attemptCount: 0 });

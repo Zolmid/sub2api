@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	SchemaVersion            = "cloudflare-loadcheck/v2"
+	SchemaVersion            = "cloudflare-loadcheck/v3"
 	MaxRequests              = 10_000
 	MaxConcurrency           = 64
 	MaxTimeout               = 2 * time.Minute
@@ -41,6 +42,8 @@ const (
 	DefaultMaxResponseBytes  = 4 << 20
 	MaxResponseBytes         = 64 << 20
 )
+
+var concurrencyMatrix = []int{1, 3, 10}
 
 var errBodyTooLarge = errors.New("response body exceeds configured limit")
 
@@ -243,18 +246,81 @@ func isCredentialHeader(name string) bool {
 
 // Report has a fixed field layout so its JSON is stable for automation.
 type Report struct {
-	SchemaVersion         string      `json:"schema_version"`
-	Requested             int         `json:"requested"`
-	Attempted             int         `json:"attempted"`
-	Completed             int         `json:"completed"`
-	Cancelled             int         `json:"cancelled"`
-	Failures              Failures    `json:"failures"`
-	ElapsedMS             float64     `json:"elapsed_ms"`
-	ThroughputRPS         float64     `json:"throughput_rps"`
+	SchemaVersion string   `json:"schema_version"`
+	Requested     int      `json:"requested"`
+	Attempted     int      `json:"attempted"`
+	Completed     int      `json:"completed"`
+	Cancelled     int      `json:"cancelled"`
+	Failures      Failures `json:"failures"`
+	ElapsedMS     float64  `json:"elapsed_ms"`
+	ThroughputRPS float64  `json:"throughput_rps"`
+	// TTFBLatency is the time to the response headers as observed by net/http.
+	// FirstBodyByteLatency remains separate because a stream can flush headers
+	// before emitting its first body byte.
+	TTFBLatency           Percentiles `json:"ttfb_latency_ms"`
 	ResponseHeaderLatency Percentiles `json:"response_header_latency_ms"`
 	FirstBodyByteLatency  Percentiles `json:"first_body_byte_latency_ms"`
 	FirstBodyByteAbsent   int         `json:"first_body_byte_absent"`
 	EndToEndLatency       Percentiles `json:"end_to_end_latency_ms"`
+}
+
+// ConnectionMode describes only the HTTP client's connection-reuse behavior.
+// It does not claim to create or measure a Cloudflare Worker cold start.
+type ConnectionMode string
+
+const (
+	ConnectionCold ConnectionMode = "cold"
+	ConnectionWarm ConnectionMode = "warm"
+)
+
+// VariantTarget identifies a route whose response shape is part of a matrix run.
+// The tool reads both routes fully; "streaming" means the target is expected to
+// flush a body incrementally, not that the tool changes its request protocol.
+type VariantTarget struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+const (
+	ResponseBodyVariant = "response_body"
+	StreamingVariant    = "streaming"
+)
+
+// MatrixConfig controls the fixed 1/3/10 concurrency acceptance matrix.
+// PlatformOperations are operator-supplied counts per completed request. They
+// are multiplied only by the observed completed count; no prices are inferred.
+type MatrixConfig struct {
+	Config             Config
+	BodyPath           string
+	StreamPath         string
+	Modes              []ConnectionMode
+	PlatformOperations map[string]int64
+}
+
+// PlatformOperationEstimate keeps supplied values and derived estimates
+// distinct from actual platform telemetry.
+type PlatformOperationEstimate struct {
+	Basis                         string           `json:"basis"`
+	SuppliedPerCompletedRequest   map[string]int64 `json:"supplied_per_completed_request,omitempty"`
+	EstimatedForCompletedRequests map[string]int64 `json:"estimated_for_completed_requests,omitempty"`
+}
+
+// MatrixRow is one response-shape, connection-mode, and concurrency result.
+type MatrixRow struct {
+	Variant            string                     `json:"variant"`
+	Path               string                     `json:"path"`
+	ConnectionMode     ConnectionMode             `json:"connection_mode"`
+	ModeSemantics      string                     `json:"mode_semantics"`
+	Report             Report                     `json:"report"`
+	PlatformOperations *PlatformOperationEstimate `json:"platform_operation_estimates,omitempty"`
+}
+
+// MatrixReport is the machine-readable result of the fixed acceptance matrix.
+type MatrixReport struct {
+	SchemaVersion       string      `json:"schema_version"`
+	ConcurrencyMatrix   []int       `json:"concurrency_matrix"`
+	Rows                []MatrixRow `json:"rows"`
+	ResourceMetricsNote string      `json:"resource_metrics_note"`
 }
 
 // Failures are deterministic aggregate counters. HTTP and body categories may both count one response.
@@ -347,20 +413,21 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	if isNilValue(ctx) {
 		return Report{}, fmt.Errorf("context must not be nil")
 	}
-	client := &http.Client{
-		Timeout: cfg.Timeout,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	return runWithDoer(ctx, cfg, client)
+	return runMode(ctx, cfg, ConnectionWarm)
 }
 
 func runWithDoer(ctx context.Context, cfg Config, client httpDoer) (Report, error) {
+	if isNilValue(client) {
+		return Report{}, fmt.Errorf("HTTP doer must not be nil")
+	}
+	return runWithDoerFactory(ctx, cfg, func() httpDoer { return client })
+}
+
+func runWithDoerFactory(ctx context.Context, cfg Config, newDoer func() httpDoer) (Report, error) {
 	if isNilValue(ctx) {
 		return Report{}, fmt.Errorf("context must not be nil")
 	}
-	if isNilValue(client) {
+	if newDoer == nil {
 		return Report{}, fmt.Errorf("HTTP doer must not be nil")
 	}
 	if err := cfg.Validate(); err != nil {
@@ -388,6 +455,12 @@ func runWithDoer(ctx context.Context, cfg Config, client httpDoer) (Report, erro
 					return
 				}
 				attempted.Add(1)
+				client := newDoer()
+				if isNilValue(client) {
+					failures.transportOther.Add(1)
+					samples.append(0, false, 0, false, false, 0)
+					continue
+				}
 				if runOne(runCtx, cfg, target.String(), client, &failures, &cancelled, &samples) {
 					completed.Add(1)
 				}
@@ -411,6 +484,7 @@ func runWithDoer(ctx context.Context, cfg Config, client httpDoer) (Report, erro
 		Cancelled:             int(cancelled.Load()),
 		Failures:              failures.snapshot(),
 		ElapsedMS:             milliseconds(elapsed),
+		TTFBLatency:           responseHeader,
 		ResponseHeaderLatency: responseHeader,
 		FirstBodyByteLatency:  firstBodyByte,
 		FirstBodyByteAbsent:   firstBodyAbsent,
@@ -420,6 +494,157 @@ func runWithDoer(ctx context.Context, cfg Config, client httpDoer) (Report, erro
 		report.ThroughputRPS = float64(report.Completed) / elapsed.Seconds()
 	}
 	return report, nil
+}
+
+func newHTTPClient(timeout time.Duration, disableKeepAlives bool) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: disableKeepAlives,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func runMode(ctx context.Context, cfg Config, mode ConnectionMode) (Report, error) {
+	switch mode {
+	case ConnectionWarm:
+		client := newHTTPClient(cfg.Timeout, false)
+		defer client.CloseIdleConnections()
+		return runWithDoer(ctx, cfg, client)
+	case ConnectionCold:
+		return runWithDoerFactory(ctx, cfg, func() httpDoer {
+			return newHTTPClient(cfg.Timeout, true)
+		})
+	default:
+		return Report{}, fmt.Errorf("connection mode must be cold or warm")
+	}
+}
+
+type matrixRunFunc func(context.Context, Config, ConnectionMode) (Report, error)
+
+// RunMatrix executes both response-body and streaming routes at concurrency
+// 1, 3, and 10. Cold mode disables HTTP connection reuse; warm mode permits it
+// within each row. Neither mode measures remote Worker isolate state.
+func RunMatrix(ctx context.Context, cfg MatrixConfig) (MatrixReport, error) {
+	return runMatrixWith(ctx, cfg, runMode)
+}
+
+func runMatrixWith(ctx context.Context, cfg MatrixConfig, execute matrixRunFunc) (MatrixReport, error) {
+	if isNilValue(ctx) {
+		return MatrixReport{}, fmt.Errorf("context must not be nil")
+	}
+	if execute == nil {
+		return MatrixReport{}, fmt.Errorf("matrix execute function must not be nil")
+	}
+	variants, modes, err := cfg.matrixInputs()
+	if err != nil {
+		return MatrixReport{}, err
+	}
+	report := MatrixReport{
+		SchemaVersion:       SchemaVersion,
+		ConcurrencyMatrix:   append([]int(nil), concurrencyMatrix...),
+		ResourceMetricsNote: "RSS and CPU are omitted: this portable HTTP harness does not measure process or Cloudflare resource usage.",
+	}
+	for _, variant := range variants {
+		for _, mode := range modes {
+			for _, concurrency := range concurrencyMatrix {
+				runConfig := cfg.Config
+				runConfig.Path = variant.Path
+				runConfig.Concurrency = concurrency
+				rowReport, err := execute(ctx, runConfig, mode)
+				if err != nil {
+					return MatrixReport{}, fmt.Errorf("%s/%s/concurrency-%d: %w", variant.Name, mode, concurrency, err)
+				}
+				row := MatrixRow{
+					Variant:        variant.Name,
+					Path:           variant.Path,
+					ConnectionMode: mode,
+					ModeSemantics:  modeSemantics(mode),
+					Report:         rowReport,
+				}
+				if len(cfg.PlatformOperations) > 0 {
+					row.PlatformOperations = estimatePlatformOperations(cfg.PlatformOperations, rowReport.Completed)
+				}
+				report.Rows = append(report.Rows, row)
+			}
+		}
+	}
+	return report, nil
+}
+
+func (c MatrixConfig) matrixInputs() ([]VariantTarget, []ConnectionMode, error) {
+	if c.BodyPath == "" || c.StreamPath == "" {
+		return nil, nil, fmt.Errorf("matrix requires both body-path and stream-path")
+	}
+	if c.Config.Requests < 10 {
+		return nil, nil, fmt.Errorf("matrix requests must be at least 10")
+	}
+	variants := []VariantTarget{{Name: ResponseBodyVariant, Path: c.BodyPath}, {Name: StreamingVariant, Path: c.StreamPath}}
+	for _, variant := range variants {
+		validationConfig := c.Config
+		validationConfig.Path = variant.Path
+		validationConfig.Concurrency = 1
+		if err := validationConfig.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("%s variant: %w", variant.Name, err)
+		}
+	}
+	modes := c.Modes
+	if len(modes) == 0 {
+		modes = []ConnectionMode{ConnectionCold, ConnectionWarm}
+	}
+	seenModes := make(map[ConnectionMode]bool, len(modes))
+	for _, mode := range modes {
+		if mode != ConnectionCold && mode != ConnectionWarm {
+			return nil, nil, fmt.Errorf("connection mode must be cold or warm")
+		}
+		if seenModes[mode] {
+			return nil, nil, fmt.Errorf("connection modes must not repeat")
+		}
+		seenModes[mode] = true
+	}
+	for name, count := range c.PlatformOperations {
+		if !validOperationName(name) || count < 0 || count > int64(1<<63-1)/int64(c.Config.Requests) {
+			return nil, nil, fmt.Errorf("platform operations must use valid non-negative name=count values")
+		}
+	}
+	return variants, modes, nil
+}
+
+func modeSemantics(mode ConnectionMode) string {
+	if mode == ConnectionCold {
+		return "cold disables client HTTP connection reuse; it is not a Cloudflare Worker cold-start measurement"
+	}
+	return "warm permits client HTTP connection reuse within this row; it is not a Cloudflare Worker warm-isolate measurement"
+}
+
+func validOperationName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for _, character := range name {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '.' && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func estimatePlatformOperations(supplied map[string]int64, completed int) *PlatformOperationEstimate {
+	estimate := &PlatformOperationEstimate{
+		Basis:                         "operator-supplied per-completed-request counts multiplied by observed completed requests; not Cloudflare telemetry and no prices are included",
+		SuppliedPerCompletedRequest:   make(map[string]int64, len(supplied)),
+		EstimatedForCompletedRequests: make(map[string]int64, len(supplied)),
+	}
+	for name, count := range supplied {
+		estimate.SuppliedPerCompletedRequest[name] = count
+		if completed > 0 && count <= int64(1<<63-1)/int64(completed) {
+			estimate.EstimatedForCompletedRequests[name] = count * int64(completed)
+		}
+	}
+	return estimate
 }
 
 func runOne(ctx context.Context, cfg Config, target string, client httpDoer, failures *atomicFailures, cancelled *atomic.Int64, samples *measurements) bool {
@@ -602,17 +827,36 @@ func (h *headerFlags) Set(value string) error {
 	return nil
 }
 
+type operationFlags []string
+
+func (o *operationFlags) String() string { return "<operator-supplied>" }
+func (o *operationFlags) Set(value string) error {
+	*o = append(*o, value)
+	return nil
+}
+
 type runFunc func(context.Context, Config) (Report, error)
 
 // RunCLI parses command arguments, validates them before execution, and returns a process exit code.
 func RunCLI(args []string, stdout, stderr io.Writer) int {
-	return runCLI(args, stdout, stderr, Run)
+	return runCLIWithMatrix(args, stdout, stderr, Run, RunMatrix)
 }
 
 func runCLI(args []string, stdout, stderr io.Writer, execute runFunc) int {
+	return runCLIWithMatrix(args, stdout, stderr, execute, RunMatrix)
+}
+
+type matrixFunc func(context.Context, MatrixConfig) (MatrixReport, error)
+
+func runCLIWithMatrix(args []string, stdout, stderr io.Writer, execute runFunc, executeMatrix matrixFunc) int {
 	defaults := DefaultConfig()
 	cfg := defaults
 	var rawHeaders headerFlags
+	var rawOperations operationFlags
+	var matrix bool
+	var bodyPath string
+	var streamPath string
+	var modes string
 	flags := flag.NewFlagSet("cloudflare-loadcheck", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.BaseURL, "base-url", defaults.BaseURL, "local or explicitly authorized remote base URL")
@@ -626,6 +870,11 @@ func runCLI(args []string, stdout, stderr io.Writer, execute runFunc) int {
 	flags.DurationVar(&cfg.CancelAfter, "cancel-after", defaults.CancelAfter, "hard run deadline; zero uses the safe default")
 	flags.BoolVar(&cfg.AuthorizedRemoteTarget, "authorized-remote-target", false, "confirm authorization for a non-loopback target")
 	flags.Var(&rawHeaders, "header", "repeatable non-credential request header: Name: Value")
+	flags.BoolVar(&matrix, "concurrency-matrix", false, "run the fixed 1/3/10 matrix for body and streaming paths")
+	flags.StringVar(&bodyPath, "body-path", "", "response-body route for --concurrency-matrix")
+	flags.StringVar(&streamPath, "stream-path", "", "streaming response route for --concurrency-matrix")
+	flags.StringVar(&modes, "connection-modes", "cold,warm", "comma-separated cold,warm modes for --concurrency-matrix")
+	flags.Var(&rawOperations, "platform-operation", "repeatable supplied per-completed-request operation count: name=count")
 	if err := flags.Parse(args); err != nil {
 		writeConfigError(stdout, "invalid command arguments")
 		return 2
@@ -642,6 +891,43 @@ func runCLI(args []string, stdout, stderr io.Writer, execute runFunc) int {
 		}
 		cfg.Headers = append(cfg.Headers, Header{Name: strings.TrimSpace(name), Value: strings.TrimSpace(value)})
 	}
+	if matrix {
+		operations, ok := parsePlatformOperations(rawOperations)
+		if !ok {
+			writeConfigError(stdout, "platform operations must use valid non-negative name=count values")
+			return 2
+		}
+		matrixModes, ok := parseConnectionModes(modes)
+		if !ok {
+			writeConfigError(stdout, "connection-modes must be a comma-separated subset of cold,warm")
+			return 2
+		}
+		matrixConfig := MatrixConfig{
+			Config:             cfg,
+			BodyPath:           bodyPath,
+			StreamPath:         streamPath,
+			Modes:              matrixModes,
+			PlatformOperations: operations,
+		}
+		if _, _, err := matrixConfig.matrixInputs(); err != nil {
+			writeConfigError(stdout, err.Error())
+			return 2
+		}
+		matrixReport, err := executeMatrix(context.Background(), matrixConfig)
+		if err != nil {
+			writeConfigError(stdout, "run failed")
+			return 1
+		}
+		if err := json.NewEncoder(stdout).Encode(matrixReport); err != nil {
+			_, _ = fmt.Fprintln(stderr, "failed to write JSON report")
+			return 1
+		}
+		return 0
+	}
+	if bodyPath != "" || streamPath != "" || len(rawOperations) != 0 || modes != "cold,warm" {
+		writeConfigError(stdout, "matrix options require --concurrency-matrix")
+		return 2
+	}
 	if err := cfg.Validate(); err != nil {
 		writeConfigError(stdout, err.Error())
 		return 2
@@ -656,6 +942,46 @@ func runCLI(args []string, stdout, stderr io.Writer, execute runFunc) int {
 		return 1
 	}
 	return 0
+}
+
+func parseConnectionModes(raw string) ([]ConnectionMode, bool) {
+	if raw == "" {
+		return nil, false
+	}
+	parts := strings.Split(raw, ",")
+	modes := make([]ConnectionMode, 0, len(parts))
+	seen := make(map[ConnectionMode]bool, len(parts))
+	for _, part := range parts {
+		mode := ConnectionMode(strings.TrimSpace(part))
+		if (mode != ConnectionCold && mode != ConnectionWarm) || seen[mode] {
+			return nil, false
+		}
+		seen[mode] = true
+		modes = append(modes, mode)
+	}
+	return modes, true
+}
+
+func parsePlatformOperations(raw []string) (map[string]int64, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	operations := make(map[string]int64, len(raw))
+	for _, item := range raw {
+		name, countText, ok := strings.Cut(item, "=")
+		if !ok || !validOperationName(name) || countText == "" {
+			return nil, false
+		}
+		count, err := strconv.ParseInt(countText, 10, 64)
+		if err != nil || count < 0 {
+			return nil, false
+		}
+		if _, exists := operations[name]; exists {
+			return nil, false
+		}
+		operations[name] = count
+	}
+	return operations, true
 }
 
 func writeConfigError(output io.Writer, message string) {

@@ -490,7 +490,7 @@ export class TOTPSecurityDO extends DurableObject<TOTPRuntimeEnv> {
         return failure("TOTP_INVALID_CODE");
       }
       const stamp = new Date(timeMs).toISOString();
-      const updated = await this.env.DB.prepare(
+      await this.env.DB.prepare(
         `UPDATE users
          SET totp_secret_envelope=?,totp_enabled=1,totp_enabled_at=?,
              totp_revision=totp_revision+1,updated_at=?
@@ -504,7 +504,16 @@ export class TOTPSecurityDO extends DurableObject<TOTPRuntimeEnv> {
         userID,
         setup.base_revision,
       ).run();
-      if ((updated.meta.changes ?? 0) !== 1) {
+      // D1's reported change count includes writes made by auth-cache
+      // triggers. Confirm the exact guarded postcondition instead of treating
+      // that implementation detail as the CAS result.
+      const committed = await this.user(userID);
+      if (
+        !committed ||
+        committed.totp_enabled !== 1 ||
+        committed.totp_revision !== setup.base_revision + 1 ||
+        committed.totp_secret_envelope !== setup.secret_envelope
+      ) {
         return failure("TOTP_STATE_CONFLICT");
       }
       this.ctx.storage.sql.exec(
@@ -526,7 +535,7 @@ export class TOTPSecurityDO extends DurableObject<TOTPRuntimeEnv> {
         return failure("TOTP_NOT_SETUP");
       }
       const stamp = new Date().toISOString();
-      const updated = await this.env.DB.prepare(
+      await this.env.DB.prepare(
         `UPDATE users
          SET totp_secret_envelope=NULL,totp_enabled=0,totp_enabled_at=NULL,
              totp_revision=totp_revision+1,updated_at=?
@@ -534,7 +543,16 @@ export class TOTPSecurityDO extends DurableObject<TOTPRuntimeEnv> {
            AND totp_enabled=1 AND totp_revision=?
            AND totp_revision<9007199254740991`,
       ).bind(stamp, userID, user.totp_revision).run();
-      if ((updated.meta.changes ?? 0) !== 1) {
+      // See completeSetup: a trigger-expanded D1 change count is not a
+      // reliable indication that this guarded update lost its CAS race.
+      const cleared = await this.user(userID);
+      if (
+        !cleared ||
+        cleared.totp_enabled !== 0 ||
+        cleared.totp_secret_envelope !== null ||
+        cleared.totp_enabled_at !== null ||
+        cleared.totp_revision !== user.totp_revision + 1
+      ) {
         return failure("TOTP_STATE_CONFLICT");
       }
       this.ctx.storage.sql.exec("DELETE FROM totp_setup");

@@ -310,8 +310,68 @@ Evidence from the persisted local runtime state:
 
 The forced-kill request deliberately remains pending/unknown for a future
 reconciler. It is evidence of the documented uncertainty window, not a complete
-stage D reconciliation implementation. Slow-client, rolling-update, load, and
-resource-accounting tests remain stage E work.
+stage D reconciliation implementation. Slow-client, rolling-update, remote
+production-load, and resource-accounting tests remain stage E work.
+
+## Stage E bounded load-check matrix
+
+`cloudflare-loadcheck` is a bounded HTTP acceptance harness. It does not deploy
+anything, call a real upstream by itself, create Cloudflare resources, or touch
+R2. The existing single-run invocation remains available and has unchanged
+defaults:
+
+```sh
+cd backend
+go run ./cmd/cloudflare-loadcheck --base-url http://127.0.0.1:8787 --path /health
+```
+
+Use the matrix only with a local or separately authorized disposable target
+that exposes one ordinary response-body route and one route that genuinely
+flushes a streaming body. `--requests` must be at least 10 because every row
+runs the fixed `1,3,10` concurrency matrix. This example sends no credentials:
+
+```sh
+cd backend
+go run ./cmd/cloudflare-loadcheck \
+  --concurrency-matrix \
+  --base-url http://127.0.0.1:8787 \
+  --requests 10 \
+  --body-path /loadcheck/body \
+  --stream-path /loadcheck/stream \
+  --connection-modes cold,warm
+```
+
+Each JSON row reports nearest-rank p50/p95/p99 for `ttfb_latency_ms`,
+`first_body_byte_latency_ms`, and `end_to_end_latency_ms`. TTFB is the time at
+which Go's HTTP client receives response headers; first-body-byte timing remains
+separate so a streaming route that flushes headers before data is represented
+truthfully. `cold` disables client HTTP connection reuse for each request and
+`warm` permits reuse within one matrix row. Neither setting measures or claims a
+Cloudflare Worker cold start, warm isolate, Container lifecycle, edge cache, or
+remote production behavior.
+
+Optional platform-operation values are deliberately operator-supplied
+per-completed-request counts, not detected Cloudflare telemetry. The tool copies
+them to each result row and derives only `count × observed completed requests`.
+It never invents missing operation totals or Cloudflare prices. For example:
+
+```sh
+cd backend
+go run ./cmd/cloudflare-loadcheck \
+  --concurrency-matrix \
+  --base-url http://127.0.0.1:8787 \
+  --requests 10 \
+  --body-path /loadcheck/body \
+  --stream-path /loadcheck/stream \
+  --platform-operation d1.reads=2 \
+  --platform-operation queue.ops=1
+```
+
+RSS and CPU are omitted because this portable HTTP harness has no reliable
+process- or Cloudflare-runtime resource measurement. The JSON states that
+limitation rather than publishing synthetic resource numbers. A successful
+matrix is local client-to-target evidence only; it is not remote Cloudflare,
+production-load, price, capacity, or real-upstream acceptance.
 
 ## Remote and real-upstream gates
 

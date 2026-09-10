@@ -20,6 +20,9 @@
     "bindings": [
       { "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" },
       { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" },
+      { "name": "USER_RATE_LIMIT", "class_name": "UserRateLimitDO" },
+      { "name": "API_KEY_RATE_LIMIT", "class_name": "APIKeyRateLimitDO" },
+      { "name": "BILLING_PRINCIPAL", "class_name": "BillingPrincipalDO" },
       { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" },
       { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" }
     ]
@@ -27,13 +30,21 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Sub2APIContainer", "AccountLeaseDO"] },
     { "tag": "v2-auth-login-admission", "new_sqlite_classes": ["AuthLoginAdmissionDO"] },
-    { "tag": "v3-totp-security", "new_sqlite_classes": ["TOTPSecurityDO"] }
+    { "tag": "v3-totp-security", "new_sqlite_classes": ["TOTPSecurityDO"] },
+    { "tag": "v4-billing-principal", "new_sqlite_classes": ["BillingPrincipalDO"] },
+    { "tag": "v5-scheduler-rate-limits", "new_sqlite_classes": ["UserRateLimitDO", "APIKeyRateLimitDO"] }
   ],
   "d1_databases": [{ "binding": "DB", "database_name": "sub2api-cloudflare", "database_id": "REPLACE_WITH_D1_DATABASE_ID", "migrations_dir": "migrations" }],
   "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
   "queues": {
-    "producers": [{ "binding": "USAGE_QUEUE", "queue": "sub2api-usage" }],
-    "consumers": [{ "queue": "sub2api-usage", "max_batch_size": 20, "max_retries": 5, "dead_letter_queue": "sub2api-usage-dlq" }]
+    "producers": [
+      { "binding": "USAGE_QUEUE", "queue": "sub2api-usage" },
+      { "binding": "JOB_QUEUE", "queue": "sub2api-background-jobs" }
+    ],
+    "consumers": [
+      { "queue": "sub2api-usage", "max_batch_size": 20, "max_retries": 5, "dead_letter_queue": "sub2api-usage-dlq" },
+      { "queue": "sub2api-background-jobs", "max_batch_size": 10, "max_batch_timeout": 1, "max_retries": 5, "dead_letter_queue": "sub2api-background-jobs-dlq" }
+    ]
   },
   "triggers": { "crons": ["*/2 * * * *"] }
 }

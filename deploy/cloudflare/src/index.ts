@@ -4,7 +4,12 @@ import {
   getContainer,
   type OutboundHandlerContext,
 } from "@cloudflare/containers";
-import { consumeUsageBatch, controlPlane, drainOutbox } from "./control-plane";
+import {
+  consumeUsageBatch,
+  controlPlane,
+  drainOutbox,
+  recoverStaleAdmissions,
+} from "./control-plane";
 import {
   INTERNAL_HOST,
   error,
@@ -13,10 +18,32 @@ import {
 } from "./contracts";
 import { AuthLoginAdmissionDO } from "./auth-login-admission";
 import { AccountLeaseDO } from "./lease";
+import { APIKeyRateLimitDO, UserRateLimitDO } from "./rate-limit";
+import { BillingPrincipalDO } from "./billing";
 import { TOTPSecurityDO } from "./totp-security";
 import { validateActivePricing } from "./pricing";
+import {
+  BACKGROUND_JOB_QUEUE_NAME,
+  consumeJobQueueBatch,
+  drainBackgroundJobOutbox,
+  recoverExpiredBackgroundJobs,
+} from "./job-worker";
 
-export { AccountLeaseDO, AuthLoginAdmissionDO, TOTPSecurityDO, ContainerProxy };
+const USAGE_QUEUE_NAMES = new Set([
+  "sub2api-usage",
+  "usage-local",
+  "usage-test",
+]);
+
+export {
+  AccountLeaseDO,
+  APIKeyRateLimitDO,
+  AuthLoginAdmissionDO,
+  BillingPrincipalDO,
+  TOTPSecurityDO,
+  UserRateLimitDO,
+  ContainerProxy,
+};
 
 type ContainerRuntimeEnv = Omit<
   Env,
@@ -346,8 +373,20 @@ const worker = {
     return routeIngress(request, env);
   },
 
-  async queue(batch: MessageBatch<UsageEnvelope>, env: Env): Promise<void> {
-    await consumeUsageBatch(batch, env);
+  async queue(
+    batch: MessageBatch<UsageEnvelope | import("./job-runtime").QueueEnvelope>,
+    env: Env,
+  ): Promise<void> {
+    if (batch.queue === BACKGROUND_JOB_QUEUE_NAME) {
+      await consumeJobQueueBatch(batch, { db: env.DB });
+      return;
+    }
+    if (!USAGE_QUEUE_NAMES.has(batch.queue)) {
+      // Reject the batch so Cloudflare retries it. Treating an unknown binding
+      // as usage could acknowledge and discard a future queue's messages.
+      throw new Error("UNEXPECTED_QUEUE");
+    }
+    await consumeUsageBatch(batch as MessageBatch<UsageEnvelope>, env);
   },
 
   async scheduled(
@@ -357,7 +396,12 @@ const worker = {
   ): Promise<void> {
     // The bounded outbox drain never calls the Container and therefore cannot
     // defeat idle scale-to-zero.
-    ctx.waitUntil(drainOutbox(env));
+    ctx.waitUntil(Promise.all([
+      drainOutbox(env),
+      recoverStaleAdmissions(env),
+      drainBackgroundJobOutbox(env),
+      recoverExpiredBackgroundJobs(env.DB),
+    ]).then(() => undefined));
   },
 };
 

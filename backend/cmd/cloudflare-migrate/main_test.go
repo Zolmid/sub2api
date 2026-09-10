@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -110,6 +112,61 @@ func emptySourceSnapshotOmitting(t *testing.T, omitted string) []byte {
 	digest := sha256.Sum256(digestBytes)
 	writeLine(map[string]any{"type": "snapshot_end", "table_count": strconv.Itoa(len(tables)), "row_count": "0", "sha256": hex.EncodeToString(digest[:])})
 	return output.Bytes()
+}
+
+func emptyRestoreSourceSnapshot(t *testing.T) []byte {
+	t.Helper()
+	emptyDigest, err := cloudflaremigration.DigestRows(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := testSourceHeader{Type: "source", Format: cloudflaremigration.RestoreSourceFormatVersion,
+		MappingProfile: cloudflaremigration.RestoreMappingProfileVersion, SnapshotID: "1:2:", SchemaName: "public",
+		ServerVersion: "170000", MigrationCount: "0", MigrationSHA256: emptyDigest,
+		CapturedAt: "2026-09-09T00:00:00Z", Complete: true}
+	tables := make([]string, 0, len(cloudflaremigration.RestoreCoverageMatrix()))
+	for _, spec := range cloudflaremigration.RestoreCoverageMatrix() {
+		tables = append(tables, spec.SourceTable)
+	}
+	sort.Strings(tables)
+	summaries := make([]testTableSummary, 0, len(tables))
+	var output bytes.Buffer
+	writeJSONLine := func(value any) {
+		encoded, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		_, _ = output.Write(encoded)
+		_ = output.WriteByte('\n')
+	}
+	writeJSONLine(header)
+	for _, table := range tables {
+		writeJSONLine(map[string]any{"type": "table", "table": table, "present": true})
+		summary := testTableSummary{Table: table, Present: true, RowCount: "0", SHA256: emptyDigest}
+		summaries = append(summaries, summary)
+		writeJSONLine(map[string]any{"type": "table_end", "table": table, "row_count": "0", "sha256": emptyDigest})
+	}
+	digestInput := testSnapshotDigest{Format: header.Format, MappingProfile: header.MappingProfile,
+		SnapshotID: header.SnapshotID, SchemaName: header.SchemaName, ServerVersion: header.ServerVersion,
+		MigrationCount: header.MigrationCount, MigrationSHA256: header.MigrationSHA256,
+		CapturedAt: header.CapturedAt, Tables: summaries}
+	digestBytes, _ := json.Marshal(digestInput)
+	digest := sha256.Sum256(digestBytes)
+	writeJSONLine(map[string]any{"type": "snapshot_end", "table_count": strconv.Itoa(len(tables)), "row_count": "0", "sha256": hex.EncodeToString(digest[:])})
+	return output.Bytes()
+}
+
+func emptyRestoreBundle(t *testing.T) []byte {
+	t.Helper()
+	bundle, err := cloudflaremigration.ExportRestoreJSONL(bytes.NewReader(emptyRestoreSourceSnapshot(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestExportCommandIsDeterministicAndRejectsMissingInventory(t *testing.T) {
@@ -309,5 +366,212 @@ func TestCLIRejectsAliasedPathsBeforeWrite(t *testing.T) {
 	code := run([]string{"plan", "-source-jsonl", source, "-bundle", path, "-canonical-bundle", path, "-sql-plan", filepath.Join(directory, "plan.sql"), "-validation-sql", filepath.Join(directory, "validation.sql")}, strings.NewReader(""), &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "alias") {
 		t.Fatalf("aliased paths were not rejected: code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRestore0017CommandsAreDeterministicAndPublishAllOrNothing(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source-0017.jsonl")
+	firstBundle := filepath.Join(directory, "first-0017.json")
+	secondBundle := filepath.Join(directory, "second-0017.json")
+	if err := os.WriteFile(source, emptyRestoreSourceSnapshot(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	for _, output := range []string{firstBundle, secondBundle} {
+		if code := run([]string{"export-0017", "-source-jsonl", source, "-out", output}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("export-0017 failed: code=%d stderr=%s", code, stderr.String())
+		}
+	}
+	first, _ := os.ReadFile(firstBundle)
+	second, _ := os.ReadFile(secondBundle)
+	if !bytes.Equal(first, second) {
+		t.Fatal("identical 0017 snapshots produced different bundles")
+	}
+	canonical := filepath.Join(directory, "canonical-0017.json")
+	plan := filepath.Join(directory, "restore-0017.sql")
+	validation := filepath.Join(directory, "validate-0017.sql")
+	stderr.Reset()
+	code := run([]string{"plan-0017", "-source-jsonl", source, "-bundle", firstBundle, "-canonical-bundle", canonical, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("plan-0017 failed: code=%d stderr=%s", code, stderr.String())
+	}
+	for _, path := range []string{canonical, plan, validation} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("restore output %s missing: %v", path, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("restore output %s mode=%v", path, info.Mode())
+		}
+	}
+	originalPlan, _ := os.ReadFile(plan)
+	stderr.Reset()
+	if code := run([]string{"plan-0017", "-source-jsonl", source, "-bundle", firstBundle, "-canonical-bundle", canonical, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr); code != 1 {
+		t.Fatalf("existing accepted outputs were overwritten: code=%d stderr=%s", code, stderr.String())
+	}
+	afterPlan, _ := os.ReadFile(plan)
+	if !bytes.Equal(originalPlan, afterPlan) {
+		t.Fatal("failed repeated publication changed an accepted plan")
+	}
+
+	failureDirectory := filepath.Join(directory, "publish-failure")
+	if err := os.Mkdir(failureDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	partialCanonical := filepath.Join(failureDirectory, "canonical.json")
+	partialPlan := filepath.Join(failureDirectory, "plan.sql")
+	missingValidation := filepath.Join(failureDirectory, "missing", "validation.sql")
+	stderr.Reset()
+	code = run([]string{"plan-0017", "-source-jsonl", source, "-bundle", firstBundle, "-canonical-bundle", partialCanonical, "-sql-plan", partialPlan, "-validation-sql", missingValidation}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("conditional output failure returned code=%d stderr=%s", code, stderr.String())
+	}
+	for _, path := range []string{partialCanonical, partialPlan, missingValidation} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed publication left partial accepted output %s: %v", path, err)
+		}
+	}
+}
+
+func TestPrivateOutputPublicationRollbackRemovesPartialAcceptedFiles(t *testing.T) {
+	directory := t.TempDir()
+	outputs := []privateOutput{
+		{path: filepath.Join(directory, "one"), data: []byte("one")},
+		{path: filepath.Join(directory, "two"), data: []byte("two")},
+		{path: filepath.Join(directory, "three"), data: []byte("three")},
+	}
+	originalPublish := linkPrivateOutput
+	t.Cleanup(func() { linkPrivateOutput = originalPublish })
+	publications := 0
+	linkPrivateOutput = func(oldPath, newPath string) error {
+		publications++
+		if publications == 2 {
+			return errors.New("injected publication failure")
+		}
+		return originalPublish(oldPath, newPath)
+	}
+	if err := writePrivateFilesAtomically(outputs); err == nil {
+		t.Fatal("injected publication failure was accepted")
+	}
+	for _, output := range outputs {
+		if _, err := os.Stat(output.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("publication rollback left partial accepted output %s: %v", output.path, err)
+		}
+	}
+}
+
+func TestPrivateOutputPublicationDoesNotOverwriteRacingDestination(t *testing.T) {
+	directory := t.TempDir()
+	outputs := []privateOutput{
+		{path: filepath.Join(directory, "one"), data: []byte("one")},
+		{path: filepath.Join(directory, "two"), data: []byte("two")},
+		{path: filepath.Join(directory, "three"), data: []byte("three")},
+	}
+	originalPublish := linkPrivateOutput
+	t.Cleanup(func() { linkPrivateOutput = originalPublish })
+	publications := 0
+	linkPrivateOutput = func(oldPath, newPath string) error {
+		publications++
+		if publications == 1 {
+			if err := os.WriteFile(outputs[1].path, []byte("competitor"), 0o600); err != nil {
+				return err
+			}
+		}
+		return originalPublish(oldPath, newPath)
+	}
+	if err := writePrivateFilesAtomically(outputs); err == nil {
+		t.Fatal("racing destination was overwritten")
+	}
+	if _, err := os.Stat(outputs[0].path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("publication rollback left first accepted output: %v", err)
+	}
+	contents, err := os.ReadFile(outputs[1].path)
+	if err != nil {
+		t.Fatalf("racing destination missing: %v", err)
+	}
+	if string(contents) != "competitor" {
+		t.Fatalf("racing destination was overwritten: %q", contents)
+	}
+	if _, err := os.Stat(outputs[2].path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("publication created trailing output: %v", err)
+	}
+}
+
+func TestSnapshot0017RefusesExistingOutputBeforeOpeningPostgreSQL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "existing.jsonl")
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"snapshot-postgres-0017", "-out", path}, strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Fatalf("existing snapshot output reached PostgreSQL setup: code=%d stderr=%s", code, stderr.String())
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "keep" {
+		t.Fatalf("existing snapshot output changed: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestRestore0017CommandsRejectCorruptionAndVersionMismatch(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.jsonl")
+	corrupt := filepath.Join(directory, "corrupt.json")
+	mismatch := filepath.Join(directory, "mismatch.json")
+	if err := os.WriteFile(source, emptyRestoreSourceSnapshot(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(corrupt, []byte(`{"manifest":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var bundle cloudflaremigration.RestoreBundle
+	if err := json.Unmarshal(emptyRestoreBundle(t), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	bundle.Manifest.TargetSchema = "cloudflare-d1/0001-0016"
+	encoded, _ := json.Marshal(bundle)
+	if err := os.WriteFile(mismatch, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	for name, input := range map[string]string{"corrupt": corrupt, "version mismatch": mismatch} {
+		t.Run(name, func(t *testing.T) {
+			canonical := filepath.Join(directory, strings.ReplaceAll(name, " ", "-")+"-canonical.json")
+			plan := filepath.Join(directory, strings.ReplaceAll(name, " ", "-")+"-plan.sql")
+			validation := filepath.Join(directory, strings.ReplaceAll(name, " ", "-")+"-validation.sql")
+			stderr.Reset()
+			code := run([]string{"plan-0017", "-source-jsonl", source, "-bundle", input, "-canonical-bundle", canonical, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("bad restore bundle accepted: code=%d stderr=%s", code, stderr.String())
+			}
+			for _, path := range []string{canonical, plan, validation} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("rejected restore emitted %s", path)
+				}
+			}
+		})
+	}
+}
+
+func TestUpgrade0017CommandIsDeterministic(t *testing.T) {
+	directory := t.TempDir()
+	legacyPath := filepath.Join(directory, "legacy.json")
+	first := filepath.Join(directory, "first.json")
+	second := filepath.Join(directory, "second.json")
+	if err := os.WriteFile(legacyPath, emptyBundle(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	for index, output := range []string{first, second} {
+		plan := filepath.Join(directory, fmt.Sprintf("plan-%d.sql", index))
+		validation := filepath.Join(directory, fmt.Sprintf("validation-%d.sql", index))
+		if code := run([]string{"upgrade-0017", "-bundle", legacyPath, "-out", output, "-sql-plan", plan, "-validation-sql", validation}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("upgrade-0017 failed: code=%d stderr=%s", code, stderr.String())
+		}
+	}
+	firstBytes, _ := os.ReadFile(first)
+	secondBytes, _ := os.ReadFile(second)
+	if !bytes.Equal(firstBytes, secondBytes) {
+		t.Fatal("upgrade-0017 output was not deterministic")
 	}
 }

@@ -49,6 +49,8 @@ func TestDisplayBalanceFromE8USDConvertsOnlyAtThePresentationBoundary(t *testing
 	require.Equal(t, 2.5, mustDisplayBalance(t, "250000000"))
 	require.Equal(t, 0.00000001, mustDisplayBalance(t, "1"))
 	require.Greater(t, mustDisplayBalance(t, maxPublicBalanceE8USDString), 9_000_000_000.0)
+	_, err := displayBalanceFromE8USD("900719925474099101")
+	require.Error(t, err, "display ceiling plus one must fail closed")
 	for _, value := range []string{"", "01", "-1", "1.5", "10000000000000000000000000000000000000000"} {
 		_, err := displayBalanceFromE8USD(value)
 		require.Error(t, err, value)

@@ -2,12 +2,19 @@ package cloudflaremigration
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func validManifest(t *testing.T) Manifest {
@@ -59,6 +66,52 @@ func testUserRow(notes string) json.RawMessage {
 	return encoded
 }
 
+func restoreFromLegacyForTest(t *testing.T) RestoreBundle {
+	t.Helper()
+	legacy := validManifest(t)
+	for index := range legacy.Coverage {
+		record := &legacy.Coverage[index]
+		if record.SourceTable != "groups" && record.SourceTable != "users" {
+			continue
+		}
+		record.SourceRowCount = "1"
+		for _, chunk := range legacy.Tables {
+			if chunk.Table == record.SourceTable {
+				record.SourceSHA256 = chunk.SHA256
+				break
+			}
+		}
+	}
+	restore, err := UpgradeBundleToRestore(Bundle{Manifest: legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return restore
+}
+
+func openCanonicalRestoreDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+	database, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "restore.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	database.SetMaxOpenConns(1)
+	for _, migration := range CanonicalTargetMigrations {
+		path := filepath.Join("..", "..", "..", "deploy", "cloudflare", "migrations", migration.Filename)
+		contents, readErr := os.ReadFile(path)
+		if readErr != nil {
+			_ = database.Close()
+			t.Fatalf("read migration %s: %v", migration.Filename, readErr)
+		}
+		if _, execErr := database.Exec(string(contents)); execErr != nil {
+			_ = database.Close()
+			t.Fatalf("apply migration %s: %v", migration.Filename, execErr)
+		}
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return database
+}
+
 func safeSourceUserRow(t *testing.T, notes string) json.RawMessage {
 	t.Helper()
 	var row map[string]any
@@ -86,10 +139,17 @@ func migrationFingerprintForTest(t *testing.T, rows []json.RawMessage) (string, 
 		if err != nil {
 			t.Fatal(err)
 		}
-		filename := transformed["filename"].(string)
+		filename, ok := transformed["filename"].(string)
+		if !ok {
+			t.Fatal("transformed migration filename is not a string")
+		}
+		checksum, ok := transformed["checksum"].(string)
+		if !ok {
+			t.Fatal("transformed migration checksum is not a string")
+		}
 		encoded, err := json.Marshal(map[string]string{
 			"filename": filename,
-			"checksum": transformed["checksum"].(string),
+			"checksum": checksum,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -500,5 +560,248 @@ func replaceChunk(chunks []TableChunk, replacement TableChunk) {
 			chunks[index] = replacement
 			return
 		}
+	}
+}
+
+func TestCanonicalRestoreMigrationsAndOperationalCoverage(t *testing.T) {
+	if len(CanonicalTargetMigrations) != 17 || CanonicalTargetMigrations[0].Filename != "0001_initial.sql" || CanonicalTargetMigrations[16].Filename != "0017_email_runtime.sql" {
+		t.Fatal("restore migration manifest does not cover canonical 0001-0017")
+	}
+	for _, migration := range CanonicalTargetMigrations {
+		path := filepath.Join("..", "..", "..", "deploy", "cloudflare", "migrations", migration.Filename)
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(contents)
+		if hex.EncodeToString(digest[:]) != migration.SHA256 {
+			t.Fatalf("migration fingerprint drifted: %s", migration.Filename)
+		}
+	}
+	database := openCanonicalRestoreDatabase(t)
+	accounted := map[string]bool{"schema_metadata": true}
+	for _, table := range RestoreTableOrder {
+		accounted[table] = true
+	}
+	for _, initialization := range CanonicalOperationalInitialization {
+		if !strings.Contains(initialization.Entity, ".") {
+			accounted[initialization.Entity] = true
+		}
+	}
+	rows, err := database.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close canonical table inventory: %v", closeErr)
+		}
+	}()
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			t.Fatal(err)
+		}
+		if !accounted[table] {
+			t.Fatalf("canonical persistent table %q lacks source mapping or explicit operational initialization", table)
+		}
+		delete(accounted, table)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for table := range accounted {
+		if table != "schema_metadata" && !strings.Contains(table, ".") {
+			t.Fatalf("declared target table %q is absent from canonical migrations", table)
+		}
+	}
+}
+
+func TestRestoreUpgradeDeterminismAndVersionFailures(t *testing.T) {
+	first := restoreFromLegacyForTest(t)
+	second := restoreFromLegacyForTest(t)
+	firstJSON, _ := json.Marshal(first)
+	secondJSON, _ := json.Marshal(second)
+	if !bytes.Equal(firstJSON, secondJSON) {
+		t.Fatal("identical legacy bundle upgrades were not deterministic")
+	}
+	decoded, err := DecodeRestoreBundle(firstJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CanonicalizeRestore(decoded.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	bad := first.Manifest
+	bad.TargetSchema = "cloudflare-d1/0001-0016"
+	if _, err := CanonicalizeRestore(bad); err == nil {
+		t.Fatal("target schema version mismatch accepted")
+	}
+	bad = first.Manifest
+	bad.TargetMigrations = append([]MigrationFingerprint(nil), bad.TargetMigrations...)
+	bad.TargetMigrations[16].SHA256 = strings.Repeat("0", 64)
+	if _, err := CanonicalizeRestore(bad); err == nil {
+		t.Fatal("canonical migration fingerprint mismatch accepted")
+	}
+	if _, err := DecodeRestoreBundle(append(firstJSON, []byte("{}")...)); err == nil {
+		t.Fatal("restore bundle with trailing JSON accepted")
+	}
+	legacy := validManifest(t)
+	for index := range legacy.Coverage {
+		if legacy.Coverage[index].SourceTable == "subscription_plans" {
+			legacy.Coverage[index].SourceRowCount = "1"
+			legacy.Coverage[index].SourceSHA256 = strings.Repeat("a", 64)
+		}
+	}
+	if _, err := UpgradeBundleToRestore(Bundle{Manifest: legacy}); err == nil {
+		t.Fatal("legacy bundle claiming omitted subscription rows was upgraded")
+	}
+}
+
+func TestRestorePlanReplayAndConditionalFailure(t *testing.T) {
+	restore := restoreFromLegacyForTest(t)
+	plan, err := BuildRestoreSQLPlan(restore.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := openCanonicalRestoreDatabase(t)
+	for attempt := 1; attempt <= 2; attempt++ {
+		tx, err := database.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(plan.SQL); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("restore attempt %d failed: %v", attempt, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var groups, users int
+	if err := database.QueryRow(`SELECT (SELECT COUNT(*) FROM groups), (SELECT COUNT(*) FROM users)`).Scan(&groups, &users); err != nil || groups != 1 || users != 1 {
+		t.Fatalf("replayed restore changed accepted rows: groups=%d users=%d err=%v", groups, users, err)
+	}
+
+	blocked := openCanonicalRestoreDatabase(t)
+	if _, err := blocked.Exec(`INSERT INTO auth_cache_entity_revisions(entity_type,entity_id,revision,updated_at) VALUES('group','999','1','2026-09-09T00:00:00.000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := blocked.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(plan.SQL); err == nil {
+		_ = tx.Rollback()
+		t.Fatal("non-pristine operational state was accepted on first restore")
+	}
+	_ = tx.Rollback()
+	if err := blocked.QueryRow(`SELECT COUNT(*) FROM groups`).Scan(&groups); err != nil || groups != 0 {
+		t.Fatalf("conditional precondition failure left partial source rows: groups=%d err=%v", groups, err)
+	}
+}
+
+func TestRestoreSubscriptionFieldMappingIsExact(t *testing.T) {
+	planSource, _ := json.Marshal(map[string]any{
+		"id": int64(21), "group_id": int64(10), "name": "monthly", "description": "", "price": json.Number("12.34000000"),
+		"original_price": json.Number("20.00000000"), "currency": "USD", "validity_days": int64(30), "validity_unit": "day",
+		"features": "{}", "product_name": "Monthly", "for_sale": true, "sort_order": int64(1),
+		"created_at": "2026-09-09T00:00:00Z", "updated_at": "2026-09-09T00:00:00Z",
+	})
+	plan, err := TransformLegacyRow0017("subscription_plans", planSource, CredentialTransformer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var planRow map[string]json.RawMessage
+	_ = json.Unmarshal(plan, &planRow)
+	if jsonString(planRow["price_e8_usd"]) != "1234000000" || jsonString(planRow["original_price_e8_usd"]) != "2000000000" || !bytes.Equal(planRow["deleted_at"], []byte("null")) {
+		t.Fatal("subscription plan money or initialized fields were not mapped exactly")
+	}
+
+	subscriptionSource, _ := json.Marshal(map[string]any{
+		"id": int64(31), "created_at": "2026-09-09T00:00:00Z", "updated_at": "2026-09-09T00:00:00Z", "deleted_at": nil,
+		"starts_at": "2026-09-09T00:00:00Z", "expires_at": "2026-10-09T00:00:00Z", "status": "active",
+		"daily_window_start": nil, "weekly_window_start": "2026-09-09T00:00:00Z", "monthly_window_start": nil,
+		"daily_usage_usd": json.Number("0"), "weekly_usage_usd": json.Number("1.25000000"), "monthly_usage_usd": json.Number("2"),
+		"assigned_at": "2026-09-09T00:00:00Z", "notes": nil, "group_id": int64(10), "user_id": int64(9007199254740993), "assigned_by": int64(9007199254740993),
+	})
+	subscription, err := TransformLegacyRow0017("user_subscriptions", subscriptionSource, CredentialTransformer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var subscriptionRow map[string]json.RawMessage
+	_ = json.Unmarshal(subscription, &subscriptionRow)
+	if jsonString(subscriptionRow["weekly_usage_e8_usd"]) != "125000000" || jsonString(subscriptionRow["weekly_anchor_kind"]) != "legacy_initial" || !bytes.Equal(subscriptionRow["monthly_anchor_kind"], []byte("null")) || jsonString(subscriptionRow["notes"]) != "" {
+		t.Fatal("legacy subscription usage, anchors, or nullable notes were not mapped exactly")
+	}
+	restore := restoreFromLegacyForTest(t)
+	var group map[string]any
+	if err := json.Unmarshal(restore.Manifest.Tables[0].Rows[0], &group); err != nil {
+		t.Fatal(err)
+	}
+	group["subscription_type"] = "subscription"
+	groupJSON, _ := json.Marshal(group)
+	groupChunks, err := NewRestoreTableChunks("groups", []json.RawMessage{groupJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planChunks, err := NewRestoreTableChunks("subscription_plans", []json.RawMessage{plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriptionChunks, err := NewRestoreTableChunks("user_subscriptions", []json.RawMessage{subscription})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceChunk(restore.Manifest.Tables, groupChunks[0])
+	replaceChunk(restore.Manifest.Tables, planChunks[0])
+	replaceChunk(restore.Manifest.Tables, subscriptionChunks[0])
+	for index := range restore.Manifest.Coverage {
+		record := &restore.Manifest.Coverage[index]
+		var source json.RawMessage
+		switch record.SourceTable {
+		case "subscription_plans":
+			source = plan
+		case "user_subscriptions":
+			source = subscription
+		default:
+			continue
+		}
+		record.SourceRowCount = "1"
+		record.SourceSHA256, err = DigestRows([]json.RawMessage{source})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonical, err := CanonicalizeRestore(restore.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restorePlan, err := BuildRestoreSQLPlan(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := openCanonicalRestoreDatabase(t)
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(restorePlan.SQL); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("subscription restore plan failed canonical target constraints: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var planCount, subscriptionCount int
+	if err := database.QueryRow(`SELECT (SELECT COUNT(*) FROM subscription_plans), (SELECT COUNT(*) FROM user_subscriptions)`).Scan(&planCount, &subscriptionCount); err != nil || planCount != 1 || subscriptionCount != 1 {
+		t.Fatalf("subscription restore counts mismatch: plans=%d subscriptions=%d err=%v", planCount, subscriptionCount, err)
+	}
+	var bad map[string]any
+	_ = json.Unmarshal(planSource, &bad)
+	bad["price"] = json.Number("0.000000001")
+	badJSON, _ := json.Marshal(bad)
+	if _, err := TransformLegacyRow0017("subscription_plans", badJSON, CredentialTransformer{}); err == nil {
+		t.Fatal("unrepresentable subscription price precision was accepted")
 	}
 }

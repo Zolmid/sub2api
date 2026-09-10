@@ -1,8 +1,11 @@
 package cloudflaremigration
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -515,7 +518,7 @@ func validateField(table, name string, kind fieldKind, raw json.RawMessage) erro
 func validateSemanticField(table, name string, raw json.RawMessage) error {
 	var text string
 	_ = json.Unmarshal(raw, &text)
-	if name == "status" && text != "active" && text != "disabled" {
+	if name == "status" && table != "user_subscriptions" && text != "active" && text != "disabled" {
 		return fmt.Errorf("%s.status is unsupported", table)
 	}
 	if table == "users" && name == "role" && text != "user" && text != "admin" {
@@ -1084,4 +1087,1489 @@ func containsControl(value string) bool {
 		}
 	}
 	return false
+}
+
+// The restore-v4 contract is deliberately additive. The v3/0008 API above is
+// kept intact so already reviewed bundles and operator procedures remain
+// reproducible; new commands opt in to the complete canonical 0001-0017
+// target.
+const (
+	RestoreFormatVersion         = "sub2api-cloudflare-offline-restore/v4"
+	RestoreSourceFormatVersion   = "sub2api-postgresql-jsonl/v3"
+	RestoreTargetSchemaVersion   = "cloudflare-d1/0001-0017"
+	RestoreMappingProfileVersion = "legacy-postgresql-to-d1-0017/v1"
+)
+
+type MigrationFingerprint struct {
+	Filename string `json:"filename"`
+	SHA256   string `json:"sha256"`
+}
+
+type OperationalInitialization struct {
+	Entity string `json:"entity"`
+	Mode   string `json:"mode"`
+}
+
+type RestoreManifest struct {
+	Format                    string                      `json:"format"`
+	TargetSchema              string                      `json:"target_schema"`
+	MappingProfile            string                      `json:"mapping_profile"`
+	Source                    SourceFingerprint           `json:"source"`
+	Coverage                  []CoverageRecord            `json:"coverage"`
+	DependencyOrder           []string                    `json:"dependency_order"`
+	TargetMigrations          []MigrationFingerprint      `json:"target_migrations"`
+	OperationalInitialization []OperationalInitialization `json:"operational_initialization"`
+	Warnings                  []string                    `json:"warnings"`
+	Blockers                  []string                    `json:"blockers"`
+	Tables                    []TableChunk                `json:"tables"`
+}
+
+type RestoreBundle struct {
+	Manifest RestoreManifest `json:"manifest"`
+}
+
+var RestoreTableOrder = []string{
+	"groups", "users", "subscription_plans", "user_subscriptions",
+	"pricing_versions", "pricing_rules", "pricing_active_version",
+	"accounts", "account_groups", "api_keys", "model_aliases", "balance_ledger",
+}
+
+var CanonicalTargetMigrations = []MigrationFingerprint{
+	{Filename: "0001_initial.sql", SHA256: "7ecbe557b61ba557c0cf8e14caefdf11ce5885548d5f8af80461b4c86f2b94c7"},
+	{Filename: "0002_management_control_plane.sql", SHA256: "cd846f4d07dc92db47908d1ca94f577c279fdaa78e238acb793ebf0f86390fe9"},
+	{Filename: "0003_group_live_name_unique.sql", SHA256: "d49042eff7ec6dc4fbaf03c7598bb4c0bb9b311e8032082f3c87e6aecc5bfd89"},
+	{Filename: "0004_user_live_email_identity.sql", SHA256: "ad5efd4780f3f614bf82e8080ff55b5f809114fc86af1b965c5301567876b744"},
+	{Filename: "0005_balance_ledger.sql", SHA256: "60013ff0da8243f6263027e714468b4301fef202bed4577968fd48906f954722"},
+	{Filename: "0006_totp_security.sql", SHA256: "1ab45332b377b1dc494529627c12cc81b620a0465d58ab86ece5c3f99d2d79a9"},
+	{Filename: "0007_admin_role_management.sql", SHA256: "a146ba486562c64ecb3b5aa920e43a294fcca05ffc6fa5210457f2a927d9e214"},
+	{Filename: "0008_e8_money_and_pricing.sql", SHA256: "62c2eb3d734c19cd5e9943f822d0742157a8990dbad4267a967ec663ec26a588"},
+	{Filename: "0009_billing_reservations.sql", SHA256: "a8108f2644c1d0ca7e7db5b2b63e34cace0dcad557be69523595c2b6f7855837"},
+	{Filename: "0010_scheduler_runtime.sql", SHA256: "89a7f759465a018252d40cc2cfad448687029a9b852999520bf70a8613989dd7"},
+	{Filename: "0011_background_job_runtime.sql", SHA256: "9af6d6001510201c9134a9cce634b247153afd2b13b4ad10789cf891781f51c0"},
+	{Filename: "0012_subscription_runtime.sql", SHA256: "12dfbabb3c69ae48cc5f419c5212b9d0e311e92a2b3ff35f4ee17d52a27173af"},
+	{Filename: "0013_oauth_refresh_runtime.sql", SHA256: "45219392e34cfbdb4e94912e48ee2ce5d9442be07713c3cbc642ba33311af160"},
+	{Filename: "0014_auth_cache_runtime.sql", SHA256: "1f5534c55da45fdc930e2a8947064c5363148ed7a4cadcc917c2adadf9452c25"},
+	{Filename: "0015_settings_runtime.sql", SHA256: "b28eb57270c6f8dfde12e9091d420553e51a6f3764377ae1da0cf55cc144c96e"},
+	{Filename: "0016_payment_runtime.sql", SHA256: "8cf73de4f8834d780895a54338b1881c67599b22854ce69e044b732c8cf8f4b3"},
+	{Filename: "0017_email_runtime.sql", SHA256: "480183fbaa08cffba77441b0fc9423d25ff339b47f5c91d4f02f3dcf58555a0b"},
+}
+
+var CanonicalOperationalInitialization = []OperationalInitialization{
+	{Entity: "users.balance_version", Mode: "column-default:0"},
+	{Entity: "accounts.credential_version", Mode: "column-default:1"},
+	{Entity: "accounts.credential_fingerprint", Mode: "column-default:null"},
+	{Entity: "admin_role_change_audit", Mode: "empty-before-import"},
+	{Entity: "auth_cache_credential_revisions", Mode: "trigger-managed-from-source-inserts"},
+	{Entity: "auth_cache_entity_revisions", Mode: "trigger-managed-from-source-inserts"},
+	{Entity: "auth_cache_outbox", Mode: "trigger-managed-from-source-inserts"},
+	{Entity: "background_job_outbox", Mode: "empty-before-import"},
+	{Entity: "background_job_transitions", Mode: "empty-before-import"},
+	{Entity: "background_jobs", Mode: "empty-before-import"},
+	{Entity: "billing_cas_guards", Mode: "empty-before-import"},
+	{Entity: "billing_monetary_ledger", Mode: "empty-before-import"},
+	{Entity: "billing_reservation_events", Mode: "empty-before-import"},
+	{Entity: "billing_reservations", Mode: "empty-before-import"},
+	{Entity: "email_challenges", Mode: "empty-before-import"},
+	{Entity: "email_delivery_jobs", Mode: "empty-before-import"},
+	{Entity: "email_delivery_witnesses", Mode: "empty-before-import"},
+	{Entity: "email_issue_idempotency", Mode: "empty-before-import"},
+	{Entity: "email_issue_witnesses", Mode: "empty-before-import"},
+	{Entity: "email_runtime_audit", Mode: "empty-before-import"},
+	{Entity: "email_runtime_batch_guards", Mode: "empty-before-import"},
+	{Entity: "email_runtime_outbox", Mode: "empty-before-import"},
+	{Entity: "gateway_requests", Mode: "empty-before-import"},
+	{Entity: "management_operations", Mode: "empty-before-import"},
+	{Entity: "oauth_refresh_attempts", Mode: "empty-before-import"},
+	{Entity: "oauth_refresh_audit", Mode: "empty-before-import"},
+	{Entity: "oauth_refresh_commit_witnesses", Mode: "empty-before-import"},
+	{Entity: "oauth_refresh_fingerprint_audit", Mode: "empty-before-import"},
+	{Entity: "oauth_refresh_invalidation_outbox", Mode: "empty-before-import"},
+	{Entity: "outbox_conflicts", Mode: "empty-before-import"},
+	{Entity: "outbox_events", Mode: "empty-before-import"},
+	{Entity: "payment_audit_events", Mode: "empty-before-import"},
+	{Entity: "payment_batch_guards", Mode: "empty-before-import"},
+	{Entity: "payment_idempotency_witnesses", Mode: "empty-before-import"},
+	{Entity: "payment_ledger_transactions", Mode: "empty-before-import"},
+	{Entity: "payment_outbox_events", Mode: "empty-before-import"},
+	{Entity: "payment_provider_event_dedup", Mode: "empty-before-import"},
+	{Entity: "payment_records", Mode: "empty-before-import"},
+	{Entity: "payment_refund_records", Mode: "empty-before-import"},
+	{Entity: "pricing_version_activations", Mode: "trigger-managed-from-source-inserts"},
+	{Entity: "scheduler_account_runtime", Mode: "empty-before-import"},
+	{Entity: "scheduler_principal_limits", Mode: "empty-before-import"},
+	{Entity: "settings_runtime", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_audit", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_batch_guards", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_cas_claims", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_idempotency", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_outbox", Mode: "empty-before-import"},
+	{Entity: "settings_runtime_request_witness", Mode: "empty-before-import"},
+	{Entity: "subscription_operation_effects", Mode: "empty-before-import"},
+	{Entity: "subscription_operations", Mode: "empty-before-import"},
+	{Entity: "subscription_runtime_guards", Mode: "empty-before-import"},
+	{Entity: "usage_events", Mode: "empty-before-import"},
+}
+
+var restoreSchemas = buildRestoreSchemas()
+
+func buildRestoreSchemas() map[string]rowSchema {
+	result := make(map[string]rowSchema, len(targetSchemas)+2)
+	for table, definition := range targetSchemas {
+		fields := make(map[string]fieldKind, len(definition.fields)+1)
+		for name, kind := range definition.fields {
+			fields[name] = kind
+		}
+		result[table] = schema(append([]string(nil), definition.primaryKey...), fields)
+	}
+	groups := result["groups"]
+	groups.fields["rate_multiplier_bps"] = unsignedE8Field
+	result["groups"] = groups
+	result["subscription_plans"] = schema([]string{"id"}, map[string]fieldKind{
+		"id": unsignedIDField, "group_id": unsignedIDField, "name": textField, "description": textField,
+		"price_e8_usd": unsignedE8Field, "original_price_e8_usd": nullableTextField,
+		"daily_limit_e8_usd": nullableTextField, "weekly_limit_e8_usd": nullableTextField,
+		"monthly_limit_e8_usd": nullableTextField, "currency": textField, "validity_days": integerField,
+		"validity_unit": textField, "features": textField, "product_name": textField, "for_sale": boolField,
+		"sort_order": integerField, "version": integerField, "created_at": timestampField,
+		"updated_at": timestampField, "deleted_at": nullableTimestampField,
+	})
+	result["user_subscriptions"] = schema([]string{"id"}, map[string]fieldKind{
+		"id": unsignedIDField, "user_id": unsignedIDField, "group_id": unsignedIDField,
+		"plan_id": nullableTextField, "starts_at": timestampField, "expires_at": timestampField,
+		"status": textField, "initial_daily_boundary": nullableTimestampField,
+		"daily_window_start": nullableTimestampField, "weekly_window_start": nullableTimestampField,
+		"monthly_window_start": nullableTimestampField, "weekly_anchor_kind": nullableTextField,
+		"monthly_anchor_kind": nullableTextField, "daily_limit_e8_usd": nullableTextField,
+		"weekly_limit_e8_usd": nullableTextField, "monthly_limit_e8_usd": nullableTextField,
+		"daily_usage_e8_usd": unsignedE8Field, "weekly_usage_e8_usd": unsignedE8Field,
+		"monthly_usage_e8_usd": unsignedE8Field, "assigned_by": nullableTextField,
+		"assigned_at": timestampField, "notes": textField, "version": integerField,
+		"created_at": timestampField, "updated_at": timestampField, "deleted_at": nullableTimestampField,
+	})
+	return result
+}
+
+func RestoreCoverageMatrix() []CoverageSpec {
+	result := make([]CoverageSpec, len(CoverageMatrix))
+	copy(result, CoverageMatrix)
+	for index := range result {
+		spec := &result[index]
+		switch spec.SourceTable {
+		case "groups":
+			spec.Rule = "canonical group fields and exact decimal rate_multiplier are copied; unsupported policy fields must equal declared safe defaults"
+		case "subscription_plans":
+			spec.Classification = Transformed
+			spec.TargetTables = []string{"subscription_plans"}
+			spec.Rule = "copy every legacy plan field; convert money exactly to E8 and initialize only canonical version/deletion defaults"
+		case "user_subscriptions":
+			spec.Classification = Transformed
+			spec.TargetTables = []string{"user_subscriptions"}
+			spec.Rule = "copy every legacy subscription field; convert usage exactly to E8 and derive only explicit legacy anchor provenance"
+		case "settings":
+			spec.Rule = "nonempty legacy plaintext settings block: the 0015 target requires purpose-bound encrypted envelopes and cannot be inferred"
+		case "payment_orders", "payment_audit_logs":
+			spec.Rule = "nonempty legacy payment state blocks: the 0016 authority and immutable witnesses are not equivalent and cannot be invented"
+		}
+	}
+	return result
+}
+
+func restoreCoverageSpec(table string) (CoverageSpec, bool) {
+	for _, spec := range RestoreCoverageMatrix() {
+		if spec.SourceTable == table {
+			return spec, true
+		}
+	}
+	return CoverageSpec{}, false
+}
+
+func DecodeRestoreBundle(input []byte) (RestoreBundle, error) {
+	if len(input) == 0 || len(input) > MaxBundleBytes {
+		return RestoreBundle{}, errors.New("restore bundle is empty or exceeds size bound")
+	}
+	if err := rejectDuplicateKeys(input); err != nil {
+		return RestoreBundle{}, err
+	}
+	var bundle RestoreBundle
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&bundle); err != nil {
+		return RestoreBundle{}, fmt.Errorf("decode restore bundle: %w", err)
+	}
+	if err := ensureEOF(decoder); err != nil {
+		return RestoreBundle{}, err
+	}
+	return bundle, nil
+}
+
+func CanonicalizeRestore(manifest RestoreManifest) (RestoreManifest, error) {
+	if manifest.Format != RestoreFormatVersion || manifest.TargetSchema != RestoreTargetSchemaVersion || manifest.MappingProfile != RestoreMappingProfileVersion {
+		return RestoreManifest{}, errors.New("unsupported restore format, target schema, or mapping profile")
+	}
+	if err := validateSource(manifest.Source); err != nil {
+		return RestoreManifest{}, err
+	}
+	if len(manifest.Blockers) != 0 {
+		return RestoreManifest{}, fmt.Errorf("restore manifest contains blocking items: %s", strings.Join(manifest.Blockers, "; "))
+	}
+	if !equalStrings(manifest.DependencyOrder, RestoreTableOrder) {
+		return RestoreManifest{}, errors.New("restore dependency_order does not match canonical order")
+	}
+	if !equalMigrationFingerprints(manifest.TargetMigrations, CanonicalTargetMigrations) {
+		return RestoreManifest{}, errors.New("restore target migration manifest does not match canonical 0001-0017")
+	}
+	if !equalOperationalInitialization(manifest.OperationalInitialization, CanonicalOperationalInitialization) {
+		return RestoreManifest{}, errors.New("restore operational initialization manifest is incomplete or non-canonical")
+	}
+	if manifest.Warnings == nil {
+		manifest.Warnings = []string{}
+	}
+	if manifest.Blockers == nil {
+		manifest.Blockers = []string{}
+	}
+	sort.Strings(manifest.Warnings)
+	for index, warning := range manifest.Warnings {
+		if warning == "" || len(warning) > 4<<10 || containsControl(warning) || index > 0 && warning == manifest.Warnings[index-1] {
+			return RestoreManifest{}, errors.New("restore warnings are empty, duplicate, oversized, or unsafe")
+		}
+	}
+	if err := validateRestoreCoverage(manifest.Coverage); err != nil {
+		return RestoreManifest{}, err
+	}
+	sort.Slice(manifest.Coverage, func(i, j int) bool { return manifest.Coverage[i].SourceTable < manifest.Coverage[j].SourceTable })
+
+	byTable := make(map[string][]TableChunk, len(RestoreTableOrder))
+	seenChunks := map[string]bool{}
+	totalRows := 0
+	for _, chunk := range manifest.Tables {
+		if _, ok := restoreSchemas[chunk.Table]; !ok {
+			return RestoreManifest{}, fmt.Errorf("unknown restore target table %q", chunk.Table)
+		}
+		if seenChunks[chunk.ID] {
+			return RestoreManifest{}, fmt.Errorf("duplicate restore chunk id %q", chunk.ID)
+		}
+		seenChunks[chunk.ID] = true
+		validated, err := validateRestoreChunk(chunk)
+		if err != nil {
+			return RestoreManifest{}, err
+		}
+		byTable[chunk.Table] = append(byTable[chunk.Table], validated)
+		totalRows += len(validated.Rows)
+		if totalRows > MaxRows {
+			return RestoreManifest{}, errors.New("restore manifest exceeds total row bound")
+		}
+	}
+	manifest.Tables = nil
+	for _, table := range RestoreTableOrder {
+		chunks := byTable[table]
+		if len(chunks) == 0 {
+			return RestoreManifest{}, fmt.Errorf("missing restore target table chunk %q", table)
+		}
+		sort.Slice(chunks, func(i, j int) bool { return chunks[i].ID < chunks[j].ID })
+		previous := ""
+		seenRows := map[string]bool{}
+		for index, chunk := range chunks {
+			if chunk.ID != fmt.Sprintf("%s/%06d", table, index+1) {
+				return RestoreManifest{}, fmt.Errorf("restore table %q has non-contiguous chunk ids", table)
+			}
+			for _, row := range chunk.Rows {
+				identity, _ := restoreRowIdentity(table, row)
+				if seenRows[identity] || previous != "" && identity <= previous {
+					return RestoreManifest{}, fmt.Errorf("restore table %q has duplicate or unordered primary keys", table)
+				}
+				seenRows[identity] = true
+				previous = identity
+			}
+			manifest.Tables = append(manifest.Tables, chunk)
+		}
+	}
+	if err := validateRestoreRelations(manifest.Tables); err != nil {
+		return RestoreManifest{}, err
+	}
+	if err := validateRestoreCoverageCounts(manifest.Coverage, manifest.Tables); err != nil {
+		return RestoreManifest{}, err
+	}
+	return manifest, nil
+}
+
+func equalMigrationFingerprints(left, right []MigrationFingerprint) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] || validateLowerSHA256(left[index].SHA256) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func equalOperationalInitialization(left, right []OperationalInitialization) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateRestoreCoverage(records []CoverageRecord) error {
+	matrix := RestoreCoverageMatrix()
+	seen := map[string]bool{}
+	for _, record := range records {
+		if !sourceIdentifier(record.SourceTable) || record.Rule == "" || containsControl(record.Rule) || seen[record.SourceTable] {
+			return fmt.Errorf("restore coverage %q is duplicate or unsafe", record.SourceTable)
+		}
+		seen[record.SourceTable] = true
+		if _, err := parseBoundedCount(record.SourceRowCount, MaxRows); err != nil || validateLowerSHA256(record.SourceSHA256) != nil {
+			return fmt.Errorf("restore coverage %q has invalid count or digest", record.SourceTable)
+		}
+		if spec, ok := restoreCoverageSpec(record.SourceTable); ok {
+			if record.Classification != spec.Classification || record.Rule != spec.Rule || !equalStrings(record.TargetTables, spec.TargetTables) {
+				return fmt.Errorf("restore coverage %q does not match executable matrix", record.SourceTable)
+			}
+		} else if record.Classification != Blocked || record.SourceRowCount != "0" {
+			return fmt.Errorf("unknown restore coverage %q must be explicitly blocked and empty", record.SourceTable)
+		}
+	}
+	for _, spec := range matrix {
+		if !seen[spec.SourceTable] {
+			return fmt.Errorf("missing restore coverage record %q", spec.SourceTable)
+		}
+	}
+	return nil
+}
+
+func NewRestoreTableChunks(table string, rows []json.RawMessage) ([]TableChunk, error) {
+	if _, ok := restoreSchemas[table]; !ok {
+		return nil, fmt.Errorf("unknown restore target table %q", table)
+	}
+	if len(rows) > MaxRowsPerTable {
+		return nil, fmt.Errorf("restore target table %q exceeds row bound", table)
+	}
+	if rows == nil {
+		rows = []json.RawMessage{}
+	}
+	canonical := make([]json.RawMessage, 0, len(rows))
+	for _, row := range rows {
+		validated, _, err := validateRestoreRow(table, row)
+		if err != nil {
+			return nil, err
+		}
+		canonical = append(canonical, validated)
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		left, _ := restoreRowIdentity(table, canonical[i])
+		right, _ := restoreRowIdentity(table, canonical[j])
+		return left < right
+	})
+	chunks := []TableChunk{}
+	for start := 0; start < len(canonical); {
+		end, size := start, 0
+		for end < len(canonical) && end-start < MaxRowsPerChunk {
+			rowSize := len(canonical[end]) + 8
+			if rowSize > MaxChunkBytes {
+				return nil, fmt.Errorf("restore target table %q contains an oversized row", table)
+			}
+			if end > start && size+rowSize > MaxChunkBytes {
+				break
+			}
+			size += rowSize
+			end++
+		}
+		rowsCopy := append([]json.RawMessage(nil), canonical[start:end]...)
+		digest, _ := DigestRows(rowsCopy)
+		chunks = append(chunks, TableChunk{Table: table, ID: fmt.Sprintf("%s/%06d", table, len(chunks)+1), RowCount: strconv.Itoa(len(rowsCopy)), SHA256: digest, Rows: rowsCopy})
+		start = end
+	}
+	if len(chunks) == 0 {
+		chunks = append(chunks, TableChunk{Table: table, ID: table + "/000001", RowCount: "0", SHA256: emptyDigest(), Rows: []json.RawMessage{}})
+	}
+	return chunks, nil
+}
+
+func validateRestoreChunk(chunk TableChunk) (TableChunk, error) {
+	count, err := parseBoundedCount(chunk.RowCount, MaxRowsPerChunk)
+	if err != nil || count != len(chunk.Rows) || len(chunk.Rows) > MaxRowsPerChunk || validateLowerSHA256(chunk.SHA256) != nil {
+		return TableChunk{}, fmt.Errorf("restore chunk %q has invalid count or digest", chunk.ID)
+	}
+	canonical := make([]json.RawMessage, 0, len(chunk.Rows))
+	bytesUsed := 0
+	for _, row := range chunk.Rows {
+		validated, _, err := validateRestoreRow(chunk.Table, row)
+		if err != nil {
+			return TableChunk{}, err
+		}
+		bytesUsed += len(validated) + 8
+		canonical = append(canonical, validated)
+	}
+	if bytesUsed > MaxChunkBytes {
+		return TableChunk{}, fmt.Errorf("restore chunk %q exceeds byte bound", chunk.ID)
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		left, _ := restoreRowIdentity(chunk.Table, canonical[i])
+		right, _ := restoreRowIdentity(chunk.Table, canonical[j])
+		return left < right
+	})
+	digest, _ := DigestRows(canonical)
+	if digest != chunk.SHA256 {
+		return TableChunk{}, fmt.Errorf("restore chunk %q sha256 mismatch", chunk.ID)
+	}
+	return TableChunk{Table: chunk.Table, ID: chunk.ID, RowCount: chunk.RowCount, SHA256: digest, Rows: canonical}, nil
+}
+
+func validateRestoreRow(table string, raw json.RawMessage) (json.RawMessage, string, error) {
+	definition, ok := restoreSchemas[table]
+	if !ok || len(raw) == 0 || len(raw) > MaxRowBytes || rejectDuplicateKeys(raw) != nil {
+		return nil, "", fmt.Errorf("restore %s row is invalid", table)
+	}
+	var row map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := decoder.Decode(&row); err != nil || row == nil || ensureEOF(decoder) != nil || len(row) != len(definition.fields) {
+		return nil, "", fmt.Errorf("restore %s row has missing or unknown fields", table)
+	}
+	for name, value := range row {
+		kind, exists := definition.fields[name]
+		if !exists {
+			return nil, "", fmt.Errorf("restore %s row has unknown field %q", table, name)
+		}
+		if err := validateField(table, name, kind, value); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := validateRestoreSemanticFields(table, row); err != nil {
+		return nil, "", err
+	}
+	canonical, err := CanonicalJSON(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	identity, err := restoreRowIdentity(table, canonical)
+	return canonical, identity, err
+}
+
+func validateRestoreSemanticFields(table string, row map[string]json.RawMessage) error {
+	if table == "groups" {
+		multiplier := jsonString(row["rate_multiplier_bps"])
+		if multiplier == "0" || len(multiplier) > 8 {
+			return errors.New("groups.rate_multiplier_bps is outside the canonical positive bound")
+		}
+		return nil
+	}
+	if table != "subscription_plans" && table != "user_subscriptions" {
+		return nil
+	}
+	for _, field := range []string{"original_price_e8_usd", "daily_limit_e8_usd", "weekly_limit_e8_usd", "monthly_limit_e8_usd"} {
+		raw, ok := row[field]
+		if !ok || bytes.Equal(raw, []byte("null")) {
+			continue
+		}
+		if err := validateE8(jsonString(raw), false); err != nil {
+			return fmt.Errorf("%s.%s: %w", table, field, err)
+		}
+	}
+	if table == "subscription_plans" {
+		currency := jsonString(row["currency"])
+		if len(currency) != 3 || strings.ToUpper(currency) != currency || jsonInteger(row["validity_days"]) < 1 || jsonInteger(row["validity_days"]) > 36500 || jsonString(row["validity_unit"]) != "day" || jsonInteger(row["version"]) != 1 {
+			return errors.New("subscription_plans contains unsupported currency, validity, or initialized version")
+		}
+		return nil
+	}
+	if status := jsonString(row["status"]); status != "active" && status != "expired" && status != "suspended" {
+		return errors.New("user_subscriptions.status is unsupported")
+	}
+	for _, field := range []string{"plan_id", "assigned_by"} {
+		if !bytes.Equal(row[field], []byte("null")) && !canonicalUnsignedID(jsonString(row[field])) {
+			return fmt.Errorf("user_subscriptions.%s is not a canonical unsigned identifier", field)
+		}
+	}
+	for _, field := range []string{"weekly_anchor_kind", "monthly_anchor_kind"} {
+		if bytes.Equal(row[field], []byte("null")) {
+			continue
+		}
+		value := jsonString(row[field])
+		if value != "activation" && value != "manual" && value != "legacy_initial" {
+			return fmt.Errorf("user_subscriptions.%s is unsupported", field)
+		}
+	}
+	if jsonInteger(row["version"]) != 1 {
+		return errors.New("user_subscriptions.version must be initialized to 1")
+	}
+	return nil
+}
+
+func restoreRowIdentity(table string, raw json.RawMessage) (string, error) {
+	var row map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return "", err
+	}
+	parts := make([]string, 0, len(restoreSchemas[table].primaryKey))
+	for _, key := range restoreSchemas[table].primaryKey {
+		parts = append(parts, string(row[key]))
+	}
+	return strings.Join(parts, "\x1f"), nil
+}
+
+func validateRestoreRelations(chunks []TableChunk) error {
+	rows := map[string][]map[string]json.RawMessage{}
+	for _, chunk := range chunks {
+		for _, raw := range chunk.Rows {
+			var row map[string]json.RawMessage
+			_ = json.Unmarshal(raw, &row)
+			rows[chunk.Table] = append(rows[chunk.Table], row)
+		}
+	}
+	ids := func(table, field string) map[string]bool {
+		result := map[string]bool{}
+		for _, row := range rows[table] {
+			result[jsonString(row[field])] = true
+		}
+		return result
+	}
+	groups, users := ids("groups", "id"), ids("users", "id")
+	plans, accounts := ids("subscription_plans", "id"), ids("accounts", "id")
+	versions := ids("pricing_versions", "version_id")
+	groupTypes := map[string]string{}
+	liveGroups := map[string]bool{}
+	for _, row := range rows["groups"] {
+		id := jsonString(row["id"])
+		groupTypes[id] = jsonString(row["subscription_type"])
+		liveGroups[id] = bytes.Equal(row["deleted_at"], []byte("null"))
+	}
+	liveUsers := map[string]bool{}
+	adminUsers := map[string]bool{}
+	for _, row := range rows["users"] {
+		id := jsonString(row["id"])
+		liveUsers[id] = bytes.Equal(row["deleted_at"], []byte("null"))
+		adminUsers[id] = liveUsers[id] && jsonString(row["role"]) == "admin"
+	}
+	planGroups := map[string]string{}
+	for _, row := range rows["subscription_plans"] {
+		groupID := jsonString(row["group_id"])
+		if !groups[groupID] || !liveGroups[groupID] || groupTypes[groupID] != "subscription" {
+			return errors.New("subscription_plans contains invalid references or initialized fields")
+		}
+		planGroups[jsonString(row["id"])] = groupID
+	}
+	liveSubscriptions := map[string]bool{}
+	for _, row := range rows["user_subscriptions"] {
+		userID, groupID := jsonString(row["user_id"]), jsonString(row["group_id"])
+		if !users[userID] || !liveUsers[userID] || !groups[groupID] || !liveGroups[groupID] || groupTypes[groupID] != "subscription" {
+			return errors.New("user_subscriptions contains invalid references or version")
+		}
+		if !bytes.Equal(row["plan_id"], []byte("null")) {
+			planID := jsonString(row["plan_id"])
+			if !plans[planID] || planGroups[planID] != groupID {
+				return errors.New("user_subscriptions contains a missing or mismatched plan")
+			}
+		}
+		if !bytes.Equal(row["assigned_by"], []byte("null")) && !adminUsers[jsonString(row["assigned_by"])] {
+			return errors.New("user_subscriptions contains a missing or non-admin assigner")
+		}
+		startsAt, startsErr := time.Parse(time.RFC3339Nano, jsonString(row["starts_at"]))
+		expiresAt, expiresErr := time.Parse(time.RFC3339Nano, jsonString(row["expires_at"]))
+		if startsErr != nil || expiresErr != nil || !startsAt.Before(expiresAt) {
+			return errors.New("user_subscriptions has an invalid active interval")
+		}
+		for window, anchor := range map[string]string{"weekly_window_start": "weekly_anchor_kind", "monthly_window_start": "monthly_anchor_kind"} {
+			if bytes.Equal(row[window], []byte("null")) != bytes.Equal(row[anchor], []byte("null")) {
+				return errors.New("user_subscriptions has inconsistent window anchor provenance")
+			}
+		}
+		if bytes.Equal(row["deleted_at"], []byte("null")) {
+			key := userID + "\x00" + groupID
+			if liveSubscriptions[key] {
+				return errors.New("user_subscriptions contains duplicate live user/group state")
+			}
+			liveSubscriptions[key] = true
+		}
+	}
+	for _, row := range rows["account_groups"] {
+		if !accounts[jsonString(row["account_id"])] || !groups[jsonString(row["group_id"])] {
+			return errors.New("account_groups contains a missing reference")
+		}
+	}
+	for _, row := range rows["api_keys"] {
+		if !users[jsonString(row["user_id"])] || !groups[jsonString(row["group_id"])] {
+			return errors.New("api_keys contains a missing reference")
+		}
+	}
+	for _, row := range rows["pricing_rules"] {
+		if !versions[jsonString(row["version_id"])] {
+			return errors.New("pricing_rules contains a missing version")
+		}
+	}
+	for _, row := range rows["pricing_active_version"] {
+		if !versions[jsonString(row["version_id"])] {
+			return errors.New("pricing_active_version contains a missing version")
+		}
+	}
+	return nil
+}
+
+func validateRestoreCoverageCounts(coverage []CoverageRecord, chunks []TableChunk) error {
+	targetCounts := map[string]int{}
+	for _, chunk := range chunks {
+		targetCounts[chunk.Table] += len(chunk.Rows)
+	}
+	sourceCounts := map[string]int{}
+	for _, record := range coverage {
+		count, _ := parseBoundedCount(record.SourceRowCount, MaxRows)
+		sourceCounts[record.SourceTable] = count
+	}
+	for _, table := range RestoreTableOrder {
+		if sourceCounts[table] != targetCounts[table] {
+			return fmt.Errorf("restore coverage count for %q does not match target rows", table)
+		}
+	}
+	return nil
+}
+
+var restoreLegacySourceColumns = func() map[string][]string {
+	result := make(map[string][]string, len(legacySourceColumns)+2)
+	for table, columns := range legacySourceColumns {
+		result[table] = append([]string(nil), columns...)
+	}
+	result["subscription_plans"] = []string{
+		"id", "group_id", "name", "description", "price", "original_price", "currency",
+		"validity_days", "validity_unit", "features", "product_name", "for_sale", "sort_order",
+		"created_at", "updated_at",
+	}
+	result["user_subscriptions"] = []string{
+		"id", "created_at", "updated_at", "deleted_at", "starts_at", "expires_at", "status",
+		"daily_window_start", "weekly_window_start", "monthly_window_start", "daily_usage_usd",
+		"weekly_usage_usd", "monthly_usage_usd", "assigned_at", "notes", "group_id", "user_id", "assigned_by",
+	}
+	return result
+}()
+
+func restoreExpectedPostgreSQLColumns(table string) ([]string, bool) {
+	if columns, ok := restoreLegacySourceColumns[table]; ok {
+		return append([]string(nil), columns...), true
+	}
+	if _, ok := restoreSchemas[table]; ok {
+		columns := make([]string, 0, len(restoreSchemas[table].fields))
+		for column := range restoreSchemas[table].fields {
+			columns = append(columns, column)
+		}
+		return columns, true
+	}
+	return nil, false
+}
+
+func TransformLegacyRow0017(table string, raw json.RawMessage, credentials CredentialTransformer) (json.RawMessage, error) {
+	if table != "groups" && table != "subscription_plans" && table != "user_subscriptions" {
+		return TransformLegacyRow(table, raw, credentials)
+	}
+	if len(raw) == 0 || len(raw) > MaxRowBytes || rejectDuplicateKeys(raw) != nil {
+		return nil, fmt.Errorf("%s source row is empty, oversized, or invalid", table)
+	}
+	var row map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&row); err != nil || row == nil || ensureEOF(decoder) != nil {
+		return nil, fmt.Errorf("%s source row must be one JSON object", table)
+	}
+	var transformed map[string]any
+	var err error
+	switch table {
+	case "groups":
+		transformed, err = transformLegacyGroup0017(row)
+	case "subscription_plans":
+		transformed, err = transformLegacySubscriptionPlan(row)
+	case "user_subscriptions":
+		transformed, err = transformLegacyUserSubscription(row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(transformed)
+	if err != nil {
+		return nil, err
+	}
+	canonical, _, err := validateRestoreRow(table, encoded)
+	return canonical, err
+}
+
+func transformLegacyGroup0017(row map[string]json.RawMessage) (map[string]any, error) {
+	if err := requireExactColumns("groups", row, restoreLegacySourceColumns["groups"]); err != nil {
+		return nil, err
+	}
+	for _, field := range []string{"description", "duplicate_operation_id", "daily_limit_usd", "weekly_limit_usd", "monthly_limit_usd", "image_price_1k", "image_price_2k", "image_price_4k", "video_price_480p", "video_price_720p", "video_price_1080p", "web_search_price_per_call", "search_price_per_1k", "audio_realtime_price_per_min", "audio_tts_price_per_million_chars", "audio_stt_price_per_hour", "fallback_group_id", "fallback_group_id_on_invalid_request"} {
+		if err := requireNull("groups", row, field); err != nil {
+			return nil, err
+		}
+	}
+	for _, field := range []string{"peak_rate_enabled", "allow_image_generation", "allow_batch_image_generation", "image_rate_independent", "video_rate_independent", "claude_code_only", "model_routing_enabled", "allow_messages_dispatch", "allow_live", "force_openai_fast", "free_openai_fast", "require_oauth_only", "require_privacy_set", "profit_control_enabled"} {
+		if err := requireBoolDefault("groups", row, field, false); err != nil {
+			return nil, err
+		}
+	}
+	for _, field := range []string{"long_context_pricing_enabled", "mcp_xml_inject"} {
+		if err := requireBoolDefault("groups", row, field, true); err != nil {
+			return nil, err
+		}
+	}
+	for field, expected := range map[string]string{"peak_start": "", "peak_end": "", "default_mapped_model": "", "max_reasoning_effort": "", "max_reasoning_effort_over_limit": "downgrade"} {
+		if err := requireStringDefault("groups", row, field, expected); err != nil {
+			return nil, err
+		}
+	}
+	for field, expected := range map[string]string{"peak_rate_multiplier": "1", "image_rate_multiplier": "1", "batch_image_discount_multiplier": "0.5", "batch_image_hold_multiplier": "0.6", "video_rate_multiplier": "1", "profit_min_margin": "0", "profit_safety_buffer": "0"} {
+		if err := requireDecimalDefault("groups", row, field, expected); err != nil {
+			return nil, err
+		}
+	}
+	for field, expected := range map[string]int64{"default_validity_days": 30, "sort_order": 0, "rpm_limit": 0} {
+		if err := requireIntDefault("groups", row, field, expected); err != nil {
+			return nil, err
+		}
+	}
+	for _, field := range []string{"video_model_prices", "model_pricing", "model_routing", "messages_dispatch_model_config", "models_list_config", "codex_models_manifest_config"} {
+		if err := requireNullOrEmptyObject("groups", row, field); err != nil {
+			return nil, err
+		}
+	}
+	if err := requireJSONDefault("groups", row, "reasoning_effort_mappings", `[]`); err != nil {
+		return nil, err
+	}
+	if err := requireJSONDefault("groups", row, "supported_model_scopes", `["claude","gemini_text","gemini_image"]`); err != nil {
+		return nil, err
+	}
+	rate, err := legacyDecimalText(row["rate_multiplier"])
+	if err != nil {
+		return nil, errors.New("groups.rate_multiplier is invalid")
+	}
+	bps, err := decimalToBPS(rate)
+	if err != nil {
+		return nil, fmt.Errorf("groups.rate_multiplier: %w", err)
+	}
+	selected, err := normalizeRestoreSelected("groups", row, []string{"id", "name", "platform", "status", "is_exclusive", "subscription_type", "created_at", "updated_at", "deleted_at"})
+	if err != nil {
+		return nil, err
+	}
+	selected["rate_multiplier_bps"] = bps
+	return selected, nil
+}
+
+func decimalToBPS(value string) (string, error) {
+	ratio, ok := new(big.Rat).SetString(value)
+	if !ok || ratio.Sign() <= 0 {
+		return "", errors.New("multiplier must be a positive exact decimal")
+	}
+	ratio.Mul(ratio, big.NewRat(10_000, 1))
+	if ratio.Denom().Cmp(big.NewInt(1)) != 0 || ratio.Num().BitLen() > 63 || len(ratio.Num().String()) > 8 {
+		return "", errors.New("multiplier cannot be represented as canonical basis points")
+	}
+	return ratio.Num().String(), nil
+}
+
+func transformLegacySubscriptionPlan(row map[string]json.RawMessage) (map[string]any, error) {
+	if err := requireExactColumns("subscription_plans", row, restoreLegacySourceColumns["subscription_plans"]); err != nil {
+		return nil, err
+	}
+	selected, err := normalizeRestoreSelected("subscription_plans", row, []string{"id", "group_id", "name", "description", "currency", "validity_days", "validity_unit", "features", "product_name", "for_sale", "sort_order", "created_at", "updated_at"})
+	if err != nil {
+		return nil, err
+	}
+	selected["price_e8_usd"], err = rawDecimalToE8(row["price"])
+	if err != nil {
+		return nil, fmt.Errorf("subscription_plans.price: %w", err)
+	}
+	selected["original_price_e8_usd"], err = nullableDecimalToE8(row["original_price"])
+	if err != nil {
+		return nil, fmt.Errorf("subscription_plans.original_price: %w", err)
+	}
+	selected["daily_limit_e8_usd"] = nil
+	selected["weekly_limit_e8_usd"] = nil
+	selected["monthly_limit_e8_usd"] = nil
+	selected["version"] = int64(1)
+	selected["deleted_at"] = nil
+	return selected, nil
+}
+
+func transformLegacyUserSubscription(row map[string]json.RawMessage) (map[string]any, error) {
+	if err := requireExactColumns("user_subscriptions", row, restoreLegacySourceColumns["user_subscriptions"]); err != nil {
+		return nil, err
+	}
+	selected, err := normalizeRestoreSelected("user_subscriptions", row, []string{"id", "user_id", "group_id", "starts_at", "expires_at", "status", "daily_window_start", "weekly_window_start", "monthly_window_start", "assigned_at", "created_at", "updated_at", "deleted_at"})
+	if err != nil {
+		return nil, err
+	}
+	if isNull(row["assigned_by"]) {
+		selected["assigned_by"] = nil
+	} else {
+		selected["assigned_by"], err = normalizeLegacyTargetField(unsignedIDField, row["assigned_by"])
+		if err != nil {
+			return nil, fmt.Errorf("user_subscriptions.assigned_by: %w", err)
+		}
+	}
+	for source, target := range map[string]string{"daily_usage_usd": "daily_usage_e8_usd", "weekly_usage_usd": "weekly_usage_e8_usd", "monthly_usage_usd": "monthly_usage_e8_usd"} {
+		selected[target], err = rawDecimalToE8(row[source])
+		if err != nil {
+			return nil, fmt.Errorf("user_subscriptions.%s: %w", source, err)
+		}
+	}
+	notes := ""
+	if !isNull(row["notes"]) {
+		notes, err = legacyString(row["notes"])
+		if err != nil {
+			return nil, errors.New("user_subscriptions.notes is invalid")
+		}
+	}
+	selected["notes"] = notes
+	selected["plan_id"] = nil
+	selected["initial_daily_boundary"] = nil
+	selected["daily_limit_e8_usd"] = nil
+	selected["weekly_limit_e8_usd"] = nil
+	selected["monthly_limit_e8_usd"] = nil
+	selected["weekly_anchor_kind"] = anchorForLegacyWindow(selected["weekly_window_start"])
+	selected["monthly_anchor_kind"] = anchorForLegacyWindow(selected["monthly_window_start"])
+	selected["version"] = int64(1)
+	return selected, nil
+}
+
+func anchorForLegacyWindow(value any) any {
+	if value == nil {
+		return nil
+	}
+	return "legacy_initial"
+}
+
+func nullableDecimalToE8(raw json.RawMessage) (any, error) {
+	if isNull(raw) {
+		return nil, nil
+	}
+	return rawDecimalToE8(raw)
+}
+
+func normalizeRestoreSelected(table string, row map[string]json.RawMessage, fields []string) (map[string]any, error) {
+	result := make(map[string]any, len(fields))
+	for _, field := range fields {
+		kind, ok := restoreSchemas[table].fields[field]
+		if !ok {
+			return nil, fmt.Errorf("%s.%s is not in restore schema", table, field)
+		}
+		raw, ok := row[field]
+		if !ok {
+			return nil, fmt.Errorf("%s source row is missing column %q", table, field)
+		}
+		value, err := normalizeLegacyTargetField(kind, raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: %w", table, field, err)
+		}
+		result[field] = value
+	}
+	return result, nil
+}
+
+func ExportPostgreSQLRestoreSnapshot(ctx context.Context, database *sql.DB, output io.Writer, options PostgreSQLSnapshotOptions) error {
+	if database == nil || output == nil {
+		return errors.New("PostgreSQL database and restore snapshot writer are required")
+	}
+	schemaName := options.Schema
+	if schemaName == "" {
+		schemaName = "public"
+	}
+	if !sourceIdentifier(schemaName) {
+		return errors.New("PostgreSQL restore schema name is unsafe")
+	}
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return errors.New("begin PostgreSQL restore snapshot failed")
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, PostgreSQLReadOnlyTransaction); err != nil {
+		return errors.New("enforce PostgreSQL restore read-only transaction failed")
+	}
+	var isolation, readOnly string
+	if err := tx.QueryRowContext(ctx, "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')").Scan(&isolation, &readOnly); err != nil || isolation != "repeatable read" || readOnly != "on" {
+		return errors.New("PostgreSQL did not confirm restore snapshot isolation")
+	}
+	var snapshotID, serverVersion string
+	var capturedAt time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT txid_current_snapshot()::text, current_setting('server_version_num'), transaction_timestamp()").Scan(&snapshotID, &serverVersion, &capturedAt); err != nil {
+		return errors.New("read PostgreSQL restore fingerprint failed")
+	}
+	migrationRows, err := readMigrationFingerprint(ctx, tx, schemaName)
+	if err != nil {
+		return err
+	}
+	migrationDigest, err := DigestRows(migrationRows)
+	if err != nil {
+		return errors.New("compute PostgreSQL restore migration fingerprint failed")
+	}
+	header := sourceHeader{Type: "source", Format: RestoreSourceFormatVersion, MappingProfile: RestoreMappingProfileVersion,
+		SnapshotID: snapshotID, SchemaName: schemaName, ServerVersion: serverVersion,
+		MigrationCount: strconv.Itoa(len(migrationRows)), MigrationSHA256: migrationDigest,
+		CapturedAt: capturedAt.UTC().Format(time.RFC3339Nano), Complete: true}
+	if err := validateRestoreSourceHeader(header); err != nil {
+		return err
+	}
+	inventory, err := readPostgreSQLInventory(ctx, tx, schemaName)
+	if err != nil {
+		return err
+	}
+	columns, err := readPostgreSQLColumnInventory(ctx, tx, schemaName, inventory)
+	if err != nil {
+		return err
+	}
+	if err := validateRestorePostgreSQLColumns(inventory, columns); err != nil {
+		return err
+	}
+	allTables := map[string]bool{}
+	for _, spec := range RestoreCoverageMatrix() {
+		allTables[spec.SourceTable] = true
+	}
+	for table := range inventory {
+		allTables[table] = true
+	}
+	ordered := make([]string, 0, len(allTables))
+	for table := range allTables {
+		ordered = append(ordered, table)
+	}
+	sort.Strings(ordered)
+	writer := &boundedSnapshotWriter{writer: output, maximum: MaxSnapshotBytes}
+	if err := writeJSONLine(writer, header); err != nil {
+		return err
+	}
+	summaries := make([]snapshotTableSummary, 0, len(ordered))
+	totalRows := 0
+	for _, table := range ordered {
+		present := inventory[table]
+		presentCopy := present
+		if err := writeJSONLine(writer, sourceTableStart{Type: "table", Table: table, Present: &presentCopy}); err != nil {
+			return err
+		}
+		count, digest, err := exportRestorePostgreSQLTable(ctx, tx, schemaName, table, present, options.Credentials, writer)
+		if err != nil {
+			return err
+		}
+		totalRows += count
+		if totalRows > MaxRows {
+			return errors.New("restore snapshot exceeds total row bound")
+		}
+		summary := snapshotTableSummary{Table: table, Present: present, RowCount: strconv.Itoa(count), SHA256: digest}
+		summaries = append(summaries, summary)
+		if err := writeJSONLine(writer, sourceTableEnd{Type: "table_end", Table: table, RowCount: summary.RowCount, SHA256: summary.SHA256}); err != nil {
+			return err
+		}
+	}
+	snapshotSHA, err := snapshotDigest(header, summaries)
+	if err != nil {
+		return err
+	}
+	if err := writeJSONLine(writer, sourceSnapshotEnd{Type: "snapshot_end", TableCount: strconv.Itoa(len(summaries)), RowCount: strconv.Itoa(totalRows), SHA256: snapshotSHA}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.New("commit PostgreSQL restore read-only snapshot failed")
+	}
+	return nil
+}
+
+func validateRestorePostgreSQLColumns(inventory map[string]bool, columns map[string][]string) error {
+	for _, spec := range RestoreCoverageMatrix() {
+		if spec.Classification != Transformed || !inventory[spec.SourceTable] {
+			continue
+		}
+		expected, ok := restoreExpectedPostgreSQLColumns(spec.SourceTable)
+		if !ok {
+			return fmt.Errorf("restore source table %q has no pinned column contract", spec.SourceTable)
+		}
+		actual := append([]string(nil), columns[spec.SourceTable]...)
+		sort.Strings(expected)
+		sort.Strings(actual)
+		if !equalStrings(expected, actual) {
+			return fmt.Errorf("restore source table %q columns differ from %s", spec.SourceTable, RestoreMappingProfileVersion)
+		}
+	}
+	return nil
+}
+
+func exportRestorePostgreSQLTable(ctx context.Context, tx *sql.Tx, schemaName, table string, present bool, credentials CredentialTransformer, output io.Writer) (int, string, error) {
+	accumulator := newStreamingRowDigest()
+	if !present {
+		return 0, accumulator.sum(), nil
+	}
+	spec, known := restoreCoverageSpec(table)
+	if !known || spec.Classification != Transformed {
+		var count int
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quoteIdentifier(schemaName), quoteIdentifier(table))
+		if err := tx.QueryRowContext(ctx, query).Scan(&count); err != nil {
+			return 0, "", fmt.Errorf("count restore source table %q failed", table)
+		}
+		if count != 0 {
+			if !known {
+				return 0, "", fmt.Errorf("unknown restore source table %q is nonempty", table)
+			}
+			return 0, "", fmt.Errorf("%s restore source table %q is nonempty", spec.Classification, table)
+		}
+		return 0, accumulator.sum(), nil
+	}
+	order := postgreSQLRowOrder[table]
+	if table == "subscription_plans" || table == "user_subscriptions" {
+		order = `"id"`
+	}
+	if order == "" {
+		return 0, "", fmt.Errorf("restore source table %q lacks deterministic row order", table)
+	}
+	query := fmt.Sprintf("SELECT row_to_json(source_row)::text FROM %s.%s AS source_row ORDER BY %s", quoteIdentifier(schemaName), quoteIdentifier(table), order)
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return 0, "", fmt.Errorf("read restore source table %q failed", table)
+	}
+	defer func() { _ = rows.Close() }()
+	count := 0
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return 0, "", fmt.Errorf("scan restore source table %q failed", table)
+		}
+		transformed, err := TransformLegacyRow0017(table, raw, credentials)
+		if err != nil {
+			return 0, "", fmt.Errorf("transform restore source table %q row %d: %w", table, count+1, err)
+		}
+		accumulator.add(transformed)
+		if err := writeJSONLine(output, sourceRow{Type: "row", Table: table, Row: transformed}); err != nil {
+			return 0, "", err
+		}
+		count++
+		if count > MaxRowsPerTable {
+			return 0, "", fmt.Errorf("restore source table %q exceeds row bound", table)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, "", fmt.Errorf("read restore source table %q failed", table)
+	}
+	return count, accumulator.sum(), nil
+}
+
+func validateRestoreSourceHeader(header sourceHeader) error {
+	if header.Type != "source" || header.Format != RestoreSourceFormatVersion || header.MappingProfile != RestoreMappingProfileVersion || !header.Complete {
+		return errors.New("restore source must declare the supported format, mapping profile, and complete_inventory=true")
+	}
+	if header.SnapshotID == "" || header.SchemaName == "" || header.ServerVersion == "" || containsControl(header.SnapshotID+header.SchemaName+header.ServerVersion) || !sourceIdentifier(header.SchemaName) {
+		return errors.New("restore source fingerprint is incomplete or unsafe")
+	}
+	if _, err := parseBoundedCount(header.MigrationCount, MaxRows); err != nil || validateLowerSHA256(header.MigrationSHA256) != nil || !canonicalTimestamp(header.CapturedAt) {
+		return errors.New("restore source migration fingerprint is invalid")
+	}
+	return nil
+}
+
+func ExportRestoreJSONL(reader io.Reader) (RestoreBundle, error) {
+	if reader == nil {
+		return RestoreBundle{}, errors.New("restore source JSONL reader is nil")
+	}
+	scanner := bufio.NewScanner(io.LimitReader(reader, MaxSnapshotBytes+1))
+	scanner.Buffer(make([]byte, 64<<10), MaxRowBytes+(64<<10))
+	lineNumber, totalBytes, totalRows := 0, 0, 0
+	var header sourceHeader
+	var active *sourceTableStart
+	activeRows := []json.RawMessage(nil)
+	tables := map[string][]json.RawMessage{}
+	present := map[string]bool{}
+	seen := map[string]bool{}
+	summaries := []snapshotTableSummary{}
+	lastTable, snapshotSHA := "", ""
+	finished := false
+	for scanner.Scan() {
+		lineNumber++
+		line := bytes.TrimSpace(scanner.Bytes())
+		totalBytes += len(scanner.Bytes()) + 1
+		if totalBytes > MaxSnapshotBytes || len(line) == 0 {
+			return RestoreBundle{}, fmt.Errorf("restore source JSONL line %d is empty or exceeds bounds", lineNumber)
+		}
+		if finished {
+			return RestoreBundle{}, errors.New("restore source has records after snapshot_end")
+		}
+		if err := rejectDuplicateKeys(line); err != nil {
+			return RestoreBundle{}, fmt.Errorf("restore source line %d: %w", lineNumber, err)
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(line, &envelope) != nil {
+			return RestoreBundle{}, fmt.Errorf("restore source line %d is invalid JSON", lineNumber)
+		}
+		if lineNumber == 1 {
+			if decodeStrict(line, &header) != nil || validateRestoreSourceHeader(header) != nil {
+				return RestoreBundle{}, errors.New("restore source header is unsupported or invalid")
+			}
+			continue
+		}
+		switch envelope.Type {
+		case "table":
+			var start sourceTableStart
+			if active != nil || decodeStrict(line, &start) != nil || start.Present == nil || !sourceIdentifier(start.Table) || seen[start.Table] || lastTable != "" && start.Table <= lastTable {
+				return RestoreBundle{}, errors.New("restore source table inventory is malformed or unordered")
+			}
+			seen[start.Table], lastTable, active = true, start.Table, &start
+			activeRows = []json.RawMessage{}
+		case "row":
+			if active == nil || !*active.Present {
+				return RestoreBundle{}, errors.New("restore source row occurs outside a present table")
+			}
+			var record sourceRow
+			if decodeStrict(line, &record) != nil || record.Table != active.Table || len(record.Row) == 0 {
+				return RestoreBundle{}, fmt.Errorf("restore source row for %q is malformed", active.Table)
+			}
+			spec, known := restoreCoverageSpec(active.Table)
+			if !known || spec.Classification != Transformed {
+				return RestoreBundle{}, fmt.Errorf("non-mapped restore source table %q is nonempty", active.Table)
+			}
+			canonical, err := CanonicalJSON(record.Row)
+			if err != nil {
+				return RestoreBundle{}, fmt.Errorf("restore source row for %q is invalid: %w", active.Table, err)
+			}
+			activeRows = append(activeRows, canonical)
+			totalRows++
+			if len(activeRows) > MaxRowsPerTable || totalRows > MaxRows {
+				return RestoreBundle{}, errors.New("restore source row capacity exceeded")
+			}
+		case "table_end":
+			var end sourceTableEnd
+			if active == nil || decodeStrict(line, &end) != nil || end.Table != active.Table {
+				return RestoreBundle{}, errors.New("restore source table_end is malformed")
+			}
+			count, err := parseBoundedCount(end.RowCount, MaxRowsPerTable)
+			digest, digestErr := DigestRows(activeRows)
+			if err != nil || count != len(activeRows) || validateLowerSHA256(end.SHA256) != nil || digestErr != nil || digest != end.SHA256 {
+				return RestoreBundle{}, fmt.Errorf("restore source table %q count or digest mismatch", active.Table)
+			}
+			tables[active.Table] = append([]json.RawMessage(nil), activeRows...)
+			present[active.Table] = *active.Present
+			summaries = append(summaries, snapshotTableSummary{Table: active.Table, Present: *active.Present, RowCount: end.RowCount, SHA256: end.SHA256})
+			active, activeRows = nil, nil
+		case "snapshot_end":
+			var end sourceSnapshotEnd
+			if active != nil || decodeStrict(line, &end) != nil {
+				return RestoreBundle{}, errors.New("restore snapshot_end is malformed")
+			}
+			tableCount, tableErr := parseBoundedCount(end.TableCount, len(RestoreCoverageMatrix())+10_000)
+			rowCount, rowErr := parseBoundedCount(end.RowCount, MaxRows)
+			digest, digestErr := snapshotDigest(header, summaries)
+			if tableErr != nil || rowErr != nil || tableCount != len(summaries) || rowCount != totalRows || validateLowerSHA256(end.SHA256) != nil || digestErr != nil || digest != end.SHA256 {
+				return RestoreBundle{}, errors.New("restore snapshot_end count or digest mismatch")
+			}
+			for _, spec := range RestoreCoverageMatrix() {
+				if !seen[spec.SourceTable] {
+					return RestoreBundle{}, fmt.Errorf("restore source inventory is incomplete: missing table %q", spec.SourceTable)
+				}
+			}
+			finished, snapshotSHA = true, end.SHA256
+		default:
+			return RestoreBundle{}, fmt.Errorf("restore source line %d has unknown record type", lineNumber)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return RestoreBundle{}, errors.New("restore source stream is unreadable or has an oversized line")
+	}
+	if lineNumber == 0 || !finished {
+		return RestoreBundle{}, errors.New("restore source is empty, truncated, or missing snapshot_end")
+	}
+	return buildRestoreBundle(header, snapshotSHA, summaries, present, tables)
+}
+
+func buildRestoreBundle(header sourceHeader, snapshotSHA string, inventory []snapshotTableSummary, present map[string]bool, sourceRows map[string][]json.RawMessage) (RestoreBundle, error) {
+	if err := validateSourceMigrationFingerprint(header, present, sourceRows); err != nil {
+		return RestoreBundle{}, err
+	}
+	warnings := []string{}
+	for _, item := range inventory {
+		spec, known := restoreCoverageSpec(item.Table)
+		if !known {
+			warnings = append(warnings, "unknown empty source table explicitly blocked: "+item.Table)
+			continue
+		}
+		if !present[item.Table] {
+			warnings = append(warnings, "known source table absent and represented as empty: "+item.Table)
+		}
+		if spec.Classification != Transformed && len(sourceRows[item.Table]) != 0 {
+			return RestoreBundle{}, fmt.Errorf("%s restore source table %q is nonempty", spec.Classification, item.Table)
+		}
+	}
+	allowedGroups, err := transformAllowedGroups(sourceRows["user_allowed_groups"])
+	if err != nil {
+		return RestoreBundle{}, err
+	}
+	targetRows := make(map[string][]json.RawMessage, len(RestoreTableOrder))
+	for _, table := range RestoreTableOrder {
+		targetRows[table] = []json.RawMessage{}
+	}
+	mappings := []struct{ source, target string }{
+		{"groups", "groups"}, {"users", "users"}, {"subscription_plans", "subscription_plans"},
+		{"user_subscriptions", "user_subscriptions"}, {"pricing_versions", "pricing_versions"},
+		{"pricing_rules", "pricing_rules"}, {"pricing_active_version", "pricing_active_version"},
+		{"accounts", "accounts"}, {"account_groups", "account_groups"}, {"api_keys", "api_keys"},
+		{"model_aliases", "model_aliases"}, {"balance_ledger", "balance_ledger"},
+	}
+	for _, mapping := range mappings {
+		for _, row := range sourceRows[mapping.source] {
+			converted, err := transformRestoreSourceRow(mapping.source, row, allowedGroups)
+			if err != nil {
+				return RestoreBundle{}, fmt.Errorf("transform restore %s row: %w", mapping.source, err)
+			}
+			targetRows[mapping.target] = append(targetRows[mapping.target], converted)
+		}
+	}
+	coverage := make([]CoverageRecord, 0, len(inventory))
+	for _, item := range inventory {
+		rows := sourceRows[item.Table]
+		digest, err := DigestRows(rows)
+		if err != nil {
+			return RestoreBundle{}, err
+		}
+		if spec, known := restoreCoverageSpec(item.Table); known {
+			coverage = append(coverage, CoverageRecord{SourceTable: spec.SourceTable, Classification: spec.Classification,
+				TargetTables: append([]string(nil), spec.TargetTables...), Rule: spec.Rule,
+				SourceRowCount: strconv.Itoa(len(rows)), SourceSHA256: digest})
+		} else {
+			coverage = append(coverage, CoverageRecord{SourceTable: item.Table, Classification: Blocked,
+				TargetTables: []string{}, Rule: "unknown empty table; no mapping", SourceRowCount: "0", SourceSHA256: digest})
+		}
+	}
+	tables := []TableChunk{}
+	for _, table := range RestoreTableOrder {
+		chunks, err := NewRestoreTableChunks(table, targetRows[table])
+		if err != nil {
+			return RestoreBundle{}, err
+		}
+		tables = append(tables, chunks...)
+	}
+	manifest := RestoreManifest{Format: RestoreFormatVersion, TargetSchema: RestoreTargetSchemaVersion,
+		MappingProfile: RestoreMappingProfileVersion,
+		Source: SourceFingerprint{Engine: "postgresql-offline-export", SnapshotID: header.SnapshotID,
+			SchemaName: header.SchemaName, ServerVersion: header.ServerVersion, MigrationCount: header.MigrationCount,
+			MigrationSHA256: header.MigrationSHA256, SnapshotSHA256: snapshotSHA, CapturedAt: header.CapturedAt},
+		Coverage: coverage, DependencyOrder: append([]string(nil), RestoreTableOrder...),
+		TargetMigrations:          append([]MigrationFingerprint(nil), CanonicalTargetMigrations...),
+		OperationalInitialization: append([]OperationalInitialization(nil), CanonicalOperationalInitialization...),
+		Warnings:                  warnings, Blockers: []string{}, Tables: tables}
+	canonical, err := CanonicalizeRestore(manifest)
+	if err != nil {
+		return RestoreBundle{}, fmt.Errorf("restore export failed canonical validation: %w", err)
+	}
+	return RestoreBundle{Manifest: canonical}, nil
+}
+
+func transformRestoreSourceRow(table string, raw json.RawMessage, allowedGroups map[string][]string) (json.RawMessage, error) {
+	var row map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &row); err != nil || row == nil {
+		return nil, errors.New("restore row must be an object")
+	}
+	if table == "users" {
+		id, err := requiredString(row, "id")
+		if err != nil {
+			return nil, err
+		}
+		allowed, _ := json.Marshal(allowedGroups[id])
+		if allowedGroups[id] == nil {
+			allowed = []byte("[]")
+		}
+		row["allowed_group_ids_json"], _ = json.Marshal(string(allowed))
+	}
+	encoded, err := json.Marshal(row)
+	if err != nil {
+		return nil, err
+	}
+	canonical, _, err := validateRestoreRow(table, encoded)
+	return canonical, err
+}
+
+func UpgradeBundleToRestore(bundle Bundle) (RestoreBundle, error) {
+	legacy, err := Canonicalize(bundle.Manifest)
+	if err != nil {
+		return RestoreBundle{}, fmt.Errorf("legacy bundle rejected: %w", err)
+	}
+	coverage := make([]CoverageRecord, len(legacy.Coverage))
+	for index, record := range legacy.Coverage {
+		spec, ok := restoreCoverageSpec(record.SourceTable)
+		if !ok {
+			coverage[index] = record
+			continue
+		}
+		if (record.SourceTable == "subscription_plans" || record.SourceTable == "user_subscriptions") && record.SourceRowCount != "0" {
+			return RestoreBundle{}, fmt.Errorf("legacy bundle cannot upgrade nonempty %s without source rows", record.SourceTable)
+		}
+		record.Classification = spec.Classification
+		record.TargetTables = append([]string(nil), spec.TargetTables...)
+		record.Rule = spec.Rule
+		coverage[index] = record
+	}
+	tables := []TableChunk{}
+	legacyRows := map[string][]json.RawMessage{}
+	for _, chunk := range legacy.Tables {
+		legacyRows[chunk.Table] = append(legacyRows[chunk.Table], chunk.Rows...)
+	}
+	for _, table := range RestoreTableOrder {
+		rows := legacyRows[table]
+		if table == "groups" {
+			upgraded := make([]json.RawMessage, 0, len(rows))
+			for _, raw := range rows {
+				var row map[string]json.RawMessage
+				if json.Unmarshal(raw, &row) != nil {
+					return RestoreBundle{}, errors.New("legacy group row is invalid")
+				}
+				row["rate_multiplier_bps"] = json.RawMessage(`"10000"`)
+				encoded, _ := json.Marshal(row)
+				upgraded = append(upgraded, encoded)
+			}
+			rows = upgraded
+		}
+		chunks, err := NewRestoreTableChunks(table, rows)
+		if err != nil {
+			return RestoreBundle{}, fmt.Errorf("upgrade legacy table %s: %w", table, err)
+		}
+		tables = append(tables, chunks...)
+	}
+	warnings := append([]string(nil), legacy.Warnings...)
+	warnings = append(warnings, "upgraded from canonical 0001-0008 bundle; subscription source tables were proven empty")
+	manifest := RestoreManifest{Format: RestoreFormatVersion, TargetSchema: RestoreTargetSchemaVersion,
+		MappingProfile: RestoreMappingProfileVersion, Source: legacy.Source, Coverage: coverage,
+		DependencyOrder:           append([]string(nil), RestoreTableOrder...),
+		TargetMigrations:          append([]MigrationFingerprint(nil), CanonicalTargetMigrations...),
+		OperationalInitialization: append([]OperationalInitialization(nil), CanonicalOperationalInitialization...),
+		Warnings:                  warnings, Blockers: []string{}, Tables: tables}
+	canonical, err := CanonicalizeRestore(manifest)
+	if err != nil {
+		return RestoreBundle{}, err
+	}
+	return RestoreBundle{Manifest: canonical}, nil
+}
+
+var restoreColumnOrder = func() map[string][]string {
+	result := make(map[string][]string, len(targetColumnOrder)+2)
+	for table, columns := range targetColumnOrder {
+		result[table] = append([]string(nil), columns...)
+	}
+	result["groups"] = append(result["groups"], "rate_multiplier_bps")
+	result["subscription_plans"] = []string{
+		"id", "group_id", "name", "description", "price_e8_usd", "original_price_e8_usd",
+		"daily_limit_e8_usd", "weekly_limit_e8_usd", "monthly_limit_e8_usd", "currency",
+		"validity_days", "validity_unit", "features", "product_name", "for_sale", "sort_order",
+		"version", "created_at", "updated_at", "deleted_at",
+	}
+	result["user_subscriptions"] = []string{
+		"id", "user_id", "group_id", "plan_id", "starts_at", "expires_at", "status",
+		"initial_daily_boundary", "daily_window_start", "weekly_window_start", "monthly_window_start",
+		"weekly_anchor_kind", "monthly_anchor_kind", "daily_limit_e8_usd", "weekly_limit_e8_usd",
+		"monthly_limit_e8_usd", "daily_usage_e8_usd", "weekly_usage_e8_usd", "monthly_usage_e8_usd",
+		"assigned_by", "assigned_at", "notes", "version", "created_at", "updated_at", "deleted_at",
+	}
+	return result
+}()
+
+func BuildRestoreSQLPlan(manifest RestoreManifest) (SQLPlan, error) {
+	canonical, err := CanonicalizeRestore(manifest)
+	if err != nil {
+		return SQLPlan{}, err
+	}
+	bundleBytes, err := json.Marshal(RestoreBundle{Manifest: canonical})
+	if err != nil {
+		return SQLPlan{}, errors.New("encode canonical restore bundle")
+	}
+	digestBytes := sha256.Sum256(bundleBytes)
+	bundleDigest := hex.EncodeToString(digestBytes[:])
+	guardKey := "offline_migration/v4/assert/" + bundleDigest
+	bundleKey := "offline_migration/v4/bundle"
+	resume := fmt.Sprintf(`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"=%s AND "value"=%s)`, SQLLiteral(bundleKey), SQLLiteral(bundleDigest))
+	var plan strings.Builder
+	_, _ = plan.WriteString("-- Generated offline restore plan for canonical D1 migrations 0001-0017.\n")
+	_, _ = plan.WriteString("-- Local execution is transactional; remote whole-file atomicity is not assumed.\n")
+	_, _ = plan.WriteString("PRAGMA defer_foreign_keys = ON;\n")
+	for _, condition := range []struct{ expression, label string }{
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_bridge_schema_version' AND "value"='2026-09-06.v1')`, "0001 bridge schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_e8_money_scale' AND "value"='8')`, "0008 E8 schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_billing_reservation_schema_version' AND "value"='2026-09-09.v3')`, "0009 billing schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_account_runtime')`, "0010 scheduler schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_jobs')`, "0011 job schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_subscription_runtime_schema_version' AND "value"='2026-09-09.v1')`, "0012 subscription schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='oauth_refresh_attempts')`, "0013 OAuth schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_auth_cache_schema_version' AND "value"='2026-09-09.v4')`, "0014 auth cache schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_settings_runtime_schema_version' AND "value"='2026-09-10.v1')`, "0015 settings schema"},
+		{`EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='payment_records')`, "0016 payment schema"},
+		{`EXISTS(SELECT 1 FROM "schema_metadata" WHERE "key"='cloudflare_email_runtime_schema_version' AND "value"='2026-09-10.v4')`, "0017 email schema"},
+	} {
+		writeAssertion(&plan, guardKey, condition.expression, condition.label+" is installed")
+	}
+	for _, initialization := range canonical.OperationalInitialization {
+		if initialization.Mode == "column-default:0" || initialization.Mode == "column-default:1" || initialization.Mode == "column-default:null" {
+			continue
+		}
+		condition := fmt.Sprintf("(%s) OR NOT EXISTS(SELECT 1 FROM %s)", resume, quoteIdentifier(initialization.Entity))
+		writeAssertion(&plan, guardKey, condition, initialization.Entity+" is pristine before first import or this is an identical replay")
+	}
+	tableCounts := map[string]int{}
+	for _, chunk := range canonical.Tables {
+		_, _ = fmt.Fprintf(&plan, "\n-- table %s; chunk %s\n", chunk.Table, chunk.ID)
+		tableCounts[chunk.Table] += len(chunk.Rows)
+		for _, raw := range chunk.Rows {
+			rowSQL, identity, rowDigest, err := restoreRowPlanSQL(chunk.Table, raw, guardKey)
+			if err != nil {
+				return SQLPlan{}, err
+			}
+			_, _ = plan.WriteString(rowSQL)
+			writeProvenance(&plan, guardKey, "offline_migration/v4/row/"+chunk.Table+"/"+identityDigest(identity), rowDigest)
+		}
+		writeProvenance(&plan, guardKey, "offline_migration/v4/chunk/"+chunk.ID, chunk.SHA256)
+	}
+	for _, table := range RestoreTableOrder {
+		expected := strconv.Itoa(tableCounts[table])
+		writeAssertion(&plan, guardKey, fmt.Sprintf("(SELECT COUNT(*) FROM %s)=%s", quoteIdentifier(table), expected), table+" exact row count")
+	}
+	writeAssertion(&plan, guardKey, "NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check)", "foreign keys are valid")
+	writeProvenance(&plan, guardKey, bundleKey, bundleDigest)
+
+	var validation strings.Builder
+	_, _ = validation.WriteString("-- Read-only 0001-0017 post-restore validation. Success returns no rows.\n")
+	_, _ = validation.WriteString("SELECT 'foreign_key' AS failure, \"table\" AS subject, CAST(rowid AS TEXT) AS actual, parent AS expected FROM pragma_foreign_key_check;\n")
+	_, _ = validation.WriteString("SELECT 'quick_check' AS failure, 'database' AS subject, quick_check AS actual, 'ok' AS expected FROM pragma_quick_check WHERE quick_check <> 'ok';\n")
+	for _, table := range RestoreTableOrder {
+		expected := strconv.Itoa(tableCounts[table])
+		_, _ = fmt.Fprintf(&validation, "SELECT 'row_count' AS failure, %s AS subject, CAST(COUNT(*) AS TEXT) AS actual, %s AS expected FROM %s HAVING COUNT(*) <> %s;\n", SQLLiteral(table), SQLLiteral(expected), quoteIdentifier(table), expected)
+	}
+	_, _ = fmt.Fprintf(&validation, "SELECT 'bundle_digest' AS failure, %s AS subject, COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"=%s),'missing') AS actual, %s AS expected WHERE COALESCE((SELECT \"value\" FROM \"schema_metadata\" WHERE \"key\"=%s),'missing') <> %s;\n", SQLLiteral(bundleKey), SQLLiteral(bundleKey), SQLLiteral(bundleDigest), SQLLiteral(bundleKey), SQLLiteral(bundleDigest))
+	_, _ = validation.WriteString("SELECT 'assertion_guard' AS failure, \"key\" AS subject, \"value\" AS actual, 'absent' AS expected FROM \"schema_metadata\" WHERE \"key\" LIKE 'offline_migration/v4/assert/%';\n")
+	return SQLPlan{BundleDigest: bundleDigest, SQL: plan.String(), ValidationSQL: validation.String()}, nil
+}
+
+func restoreRowPlanSQL(table string, raw json.RawMessage, guardKey string) (string, string, string, error) {
+	canonical, identity, err := validateRestoreRow(table, raw)
+	if err != nil {
+		return "", "", "", err
+	}
+	var row map[string]json.RawMessage
+	if json.Unmarshal(canonical, &row) != nil {
+		return "", "", "", errors.New("decode canonical restore row")
+	}
+	columns := restoreColumnOrder[table]
+	values, equality := make([]string, len(columns)), make([]string, len(columns))
+	for index, column := range columns {
+		value, err := sqlValue(row[column])
+		if err != nil {
+			return "", "", "", fmt.Errorf("restore %s.%s: %w", table, column, err)
+		}
+		values[index] = value
+		equality[index] = quoteIdentifier(column) + " IS " + value
+	}
+	primary := make([]string, len(restoreSchemas[table].primaryKey))
+	for index, column := range restoreSchemas[table].primaryKey {
+		value, err := sqlValue(row[column])
+		if err != nil {
+			return "", "", "", err
+		}
+		primary[index] = quoteIdentifier(column) + " IS " + value
+	}
+	var result strings.Builder
+	_, _ = fmt.Fprintf(&result, "INSERT INTO %s(%s) SELECT %s WHERE NOT EXISTS(SELECT 1 FROM %s WHERE %s);\n",
+		quoteIdentifier(table), strings.Join(quoteIdentifiers(columns), ","), strings.Join(values, ","),
+		quoteIdentifier(table), strings.Join(primary, " AND "))
+	writeAssertion(&result, guardKey, "EXISTS(SELECT 1 FROM "+quoteIdentifier(table)+" WHERE "+strings.Join(equality, " AND ")+")", table+" row "+identity+" is identical")
+	hash := sha256.Sum256(canonical)
+	return result.String(), identity, hex.EncodeToString(hash[:]), nil
 }

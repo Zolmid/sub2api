@@ -198,6 +198,9 @@ func displayBalanceFromE8USD(value string) (float64, error) {
 	if !ok {
 		return 0, errors.New("invalid balance_e8_usd")
 	}
+	if coefficient.Cmp(maxPublicBalanceE8USD) > 0 {
+		return 0, errors.New("balance_e8_usd exceeds display ceiling")
+	}
 	balance, _ := new(big.Rat).SetFrac(coefficient, big.NewInt(e8USDPerUSD)).Float64()
 	if math.IsNaN(balance) || math.IsInf(balance, 0) {
 		return 0, errors.New("balance_e8_usd is not representable at the display boundary")

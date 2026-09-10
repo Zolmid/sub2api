@@ -20,7 +20,7 @@ const nextUserID = () =>
 async function createUser(): Promise<string> {
   const userID = nextUserID();
   const stamp = new Date().toISOString();
-  const result = await env.DB.prepare(
+  await env.DB.prepare(
     `INSERT INTO users(
        id,status,role,concurrency,balance_e8_usd,allowed_group_ids_json,
        restrict_public_groups,created_at,updated_at,email,password_hash,
@@ -42,7 +42,11 @@ async function createUser(): Promise<string> {
     "",
     0,
   ).run();
-  expect(result.meta.changes).toBe(1);
+  expect(
+    await env.DB.prepare("SELECT id FROM users WHERE id=?")
+      .bind(userID)
+      .first<string>("id"),
+  ).toBe(userID);
   return userID;
 }
 
@@ -304,7 +308,7 @@ describe("TOTPSecurityDO", () => {
     );
     expect(storedSetup.completed).toBe(0);
     const stamp = new Date().toISOString();
-    const committed = await env.DB.prepare(
+    await env.DB.prepare(
       `UPDATE users
        SET totp_secret_envelope=?,totp_enabled=1,totp_enabled_at=?,
            totp_revision=totp_revision+1,updated_at=?
@@ -316,7 +320,13 @@ describe("TOTPSecurityDO", () => {
       userID,
       storedSetup.base_revision,
     ).run();
-    expect(committed.meta.changes).toBe(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT totp_secret_envelope FROM users WHERE id=? AND totp_enabled=1 AND totp_revision=?",
+      )
+        .bind(userID, storedSetup.base_revision + 1)
+        .first<string>("totp_secret_envelope"),
+    ).toBe(storedSetup.secret_envelope);
 
     const code = await generateTOTPCode(setup.secret, Date.now());
     expect(await stub.completeSetup(userID, setup.setup_token, code!))

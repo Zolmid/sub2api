@@ -270,6 +270,22 @@ export async function getJob(db: D1Database, jobId: string): Promise<JobRecord |
   return row ? jobRecord(row) : null;
 }
 
+/**
+ * Returns the payload only while the caller still owns a running lease. Queue
+ * envelopes intentionally never carry this data.
+ */
+export async function getRunningJobExecution(
+  db: D1Database,
+  input: AuthorityInput,
+): Promise<Readonly<{ job: JobRecord; payloadBody: string }> | null> {
+  assertAuthority(input);
+  const row = await loadJobRow(db, input.jobId);
+  if (!row || row.status !== "running" || !authorityMatches(row, input)) {
+    return null;
+  }
+  return { job: jobRecord(row), payloadBody: row.payload_body };
+}
+
 export function makeQueueEnvelope(jobId: string, route: string, jobVersion: number): QueueEnvelope {
   assertText(jobId, 160, "JOB_ID");
   assertText(route, 96, "ROUTE");
@@ -788,6 +804,23 @@ export async function recoverExpiredJob(
   });
 }
 
+/** Select a bounded, versioned recovery worklist; mutations remain fenced. */
+export async function listExpiredJobs(
+  db: D1Database,
+  nowMs: number,
+  limit = 25,
+): Promise<readonly JobRecord[]> {
+  assertTime(nowMs);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_BATCH) {
+    throw new Error("INVALID_LIMIT");
+  }
+  const result = await db.prepare(`SELECT ${JOB_COLUMNS} FROM background_jobs
+    WHERE status IN ('claimed','running') AND lease_expires_at_ms IS NOT NULL
+      AND lease_expires_at_ms<=?
+    ORDER BY lease_expires_at_ms,job_id LIMIT ?`).bind(nowMs, limit).all<JobRow>();
+  return result.results.map(jobRecord);
+}
+
 export async function replayTerminalJob(
   db: D1Database,
   input: ReplayInput,
@@ -1016,7 +1049,7 @@ export async function releaseOutbox(
 }
 
 export type OutboxPublisher = Readonly<{
-  send(envelope: QueueEnvelope): Promise<void>;
+  send(envelope: QueueEnvelope): Promise<unknown>;
 }>;
 
 export type DrainResult = Readonly<{

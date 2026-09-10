@@ -2,7 +2,15 @@ import type { Completion, UsageEnvelope } from "./contracts";
 import { decryptAPIKeyCredentials, type CredentialRuntime } from "./credentials";
 import { managementControlPlane } from "./management";
 import { privateDataPlane } from "./private-data";
-import { lookupAdmissionPriceCard } from "./pricing";
+import { calculateAdmittedE8Charge, loadAdmittedPriceCard, lookupAdmissionPriceCard, normalizePricingModel } from "./pricing";
+import type { BillingIdentity } from "./billing";
+import {
+  decideSchedulerRuntime,
+  rollbackSchedulerRates,
+  reserveSchedulerResources,
+  settleSchedulerRates,
+} from "./scheduler-runtime";
+import type { SchedulerAccount } from "./scheduler-policy";
 import { isTOTPControlPath, totpControlPlane } from "./totp-control";
 import {
   BRIDGE_VERSION,
@@ -24,6 +32,8 @@ import {
 const PUBLISH_TIMEOUT_MS = 2_000;
 const MAX_OUTBOX_ATTEMPTS = 10;
 const OUTBOX_DRAIN_LIMIT = 25;
+const ADMISSION_RECOVERY_LIMIT = 25;
+const ADMISSION_RECOVERY_AGE_MS = 15 * 60_000;
 
 type RuntimeEnv = Omit<
   Env,
@@ -72,20 +82,6 @@ type Account = {
   extra_json: string;
 };
 
-type LeaseWire = {
-  account_id: string;
-  lease_id: string;
-  request_id: string;
-  owner: string;
-  epoch: string;
-  expires_at: string;
-};
-
-type LeaseEnvelope = {
-  lease: LeaseWire;
-  created: boolean;
-};
-
 type GatewayIdentity = {
   request_id: string;
   api_key_id: string;
@@ -98,8 +94,34 @@ type GatewayIdentity = {
   pricing_version_id: string | null;
   pricing_digest: string | null;
   pricing_rule_pattern: string | null;
+  pricing_model: string | null;
+  pricing_rule_match_kind: "exact" | "family" | null;
+  rate_multiplier_bps: string | null;
   state: string;
 };
+
+type BillingRow = BillingIdentity & {
+  state: "reserved" | "started" | "completed" | "released" | "unknown";
+  version: number;
+  completion_event_id: string | null;
+  completion_payload_hash: string | null;
+  scheduler_release_state: "pending" | "released";
+  scheduler_release_attempts: number;
+};
+
+const billingColumns = "request_id,user_id,api_key_id,group_id,account_id,lease_id,lease_epoch,owner,model,upstream_model,pricing_version_id,pricing_digest,pricing_model,pricing_rule_pattern,pricing_rule_match_kind,rate_multiplier_bps,reservation_e8_usd,charged_e8_usd,usage_present,state,version,completion_event_id,completion_payload_hash,completion_outcome,upstream_request_id,scheduler_release_state,scheduler_release_attempts";
+const billingIdentity = (row: BillingRow): BillingIdentity => ({
+  request_id: row.request_id, user_id: row.user_id, api_key_id: row.api_key_id, group_id: row.group_id,
+  account_id: row.account_id, lease_id: row.lease_id, lease_epoch: row.lease_epoch, owner: row.owner,
+  model: row.model, upstream_model: row.upstream_model, pricing_version_id: row.pricing_version_id,
+  pricing_digest: row.pricing_digest, pricing_model: row.pricing_model, pricing_rule_pattern: row.pricing_rule_pattern,
+  pricing_rule_match_kind: row.pricing_rule_match_kind, rate_multiplier_bps: row.rate_multiplier_bps,
+  reservation_e8_usd: row.reservation_e8_usd,
+});
+
+function billingStub(env: Env, userID: string) {
+  return env.BILLING_PRINCIPAL.getByName(`user:${userID}`);
+}
 
 const hasBridgeVersion = (request: Request): boolean =>
   request.headers.get("X-Sub2API-Bridge-Version") === BRIDGE_VERSION;
@@ -125,12 +147,16 @@ export async function controlPlane(request: Request, env: Env): Promise<Response
         return await touchAPIKey(request, env);
       case "/v1/requests/admit":
         return await admitRequest(request, env);
+      case "/v1/requests/start":
+        return await startRequest(request, env);
       case "/v1/leases/renew":
         return await relayLeaseAction(request, env, "/renew");
       case "/v1/leases/release":
         return await relayLeaseAction(request, env, "/release");
       case "/v1/requests/complete":
         return await completeRequest(request, env);
+      case "/v1/requests/reconcile":
+        return await reconcileRequest(request, env);
       case "/v1/private/auth-users/get":
       case "/v1/private/api-keys/list-by-owner":
       case "/v1/private/api-keys/count-by-owner":
@@ -272,7 +298,11 @@ function isUnexpired(value: string | null): boolean {
   return Number.isFinite(timestamp) && timestamp > Date.now();
 }
 
-function permittedAuth(row: AuthRow, requestedGroup?: string): boolean {
+function permittedAuth(
+  row: AuthRow,
+  requestedGroup?: string,
+  requirePositiveBalance = true,
+): boolean {
   return (
     row.key_status === "active" &&
     row.user_status === "active" &&
@@ -283,7 +313,7 @@ function permittedAuth(row: AuthRow, requestedGroup?: string): boolean {
     isCanonicalPositiveDecimal(row.user_id) &&
     isCanonicalPositiveDecimal(row.group_id) &&
     (requestedGroup === undefined || row.group_id === requestedGroup) &&
-    hasPositiveBalance(row.balance_e8_usd) &&
+    (!requirePositiveBalance || hasPositiveBalance(row.balance_e8_usd)) &&
     isUnexpired(row.expires_at)
   );
 }
@@ -410,40 +440,152 @@ function parseObject(value: string): Record<string, unknown> | null {
   }
 }
 
-function validLeaseEnvelope(
-  value: unknown,
-  expected: { accountID: string; requestID: string; owner: string },
-): value is LeaseEnvelope {
-  if (!value || typeof value !== "object") return false;
-  const envelope = value as Partial<LeaseEnvelope>;
-  const lease = envelope.lease;
-  if (!lease || typeof lease !== "object") return false;
-  return (
-    typeof envelope.created === "boolean" &&
-    lease.account_id === expected.accountID &&
-    lease.request_id === expected.requestID &&
-    lease.owner === expected.owner &&
-    isBoundedString(lease.lease_id, 256) &&
-    isCanonicalPositiveDecimal(lease.epoch) &&
-    lease.epoch.length <= 20 &&
-    isBoundedString(lease.expires_at, 64) &&
-    Number.isFinite(Date.parse(lease.expires_at)) &&
-    Date.parse(lease.expires_at) > Date.now()
-  );
+type SchedulerSemanticIdentity = Pick<
+  BillingIdentity,
+  | "request_id"
+  | "user_id"
+  | "api_key_id"
+  | "group_id"
+  | "account_id"
+  | "owner"
+  | "model"
+  | "upstream_model"
+  | "pricing_version_id"
+  | "pricing_digest"
+  | "pricing_model"
+  | "pricing_rule_pattern"
+  | "pricing_rule_match_kind"
+  | "rate_multiplier_bps"
+  | "reservation_e8_usd"
+>;
+
+function sameSchedulerSemanticIdentity(
+  left: SchedulerSemanticIdentity,
+  right: SchedulerSemanticIdentity,
+): boolean {
+  return left.request_id === right.request_id &&
+    left.user_id === right.user_id &&
+    left.api_key_id === right.api_key_id &&
+    left.group_id === right.group_id &&
+    left.account_id === right.account_id &&
+    left.owner === right.owner &&
+    left.model === right.model &&
+    left.upstream_model === right.upstream_model &&
+    left.pricing_version_id === right.pricing_version_id &&
+    left.pricing_digest === right.pricing_digest &&
+    left.pricing_model === right.pricing_model &&
+    left.pricing_rule_pattern === right.pricing_rule_pattern &&
+    left.pricing_rule_match_kind === right.pricing_rule_match_kind &&
+    left.rate_multiplier_bps === right.rate_multiplier_bps &&
+    left.reservation_e8_usd === right.reservation_e8_usd;
 }
 
-async function releaseNewLease(
-  stub: DurableObjectStub,
-  lease: LeaseWire,
-): Promise<void> {
+async function schedulerFingerprint(value: SchedulerSemanticIdentity): Promise<string> {
+  return sha256(canonical({
+    scheduler_admission_version: 1,
+    request_id: value.request_id,
+    user_id: value.user_id,
+    api_key_id: value.api_key_id,
+    group_id: value.group_id,
+    account_id: value.account_id,
+    owner: value.owner,
+    model: value.model,
+    upstream_model: value.upstream_model,
+    pricing_version_id: value.pricing_version_id,
+    pricing_digest: value.pricing_digest,
+    pricing_model: value.pricing_model,
+    pricing_rule_pattern: value.pricing_rule_pattern,
+    pricing_rule_match_kind: value.pricing_rule_match_kind,
+    rate_multiplier_bps: value.rate_multiplier_bps,
+    reservation_e8_usd: value.reservation_e8_usd,
+  }));
+}
+
+function confirmedRate(
+  account: SchedulerAccount,
+  field: "accountRpmLimit" | "userRpmLimit",
+): number | null {
+  const value = account[field];
+  return value.kind === "confirmed" && Number.isInteger(value.value)
+    ? value.value
+    : null;
+}
+
+async function releaseSchedulerReservation(
+  env: Env,
+  row: BillingRow,
+  rollbackRates = false,
+): Promise<string[]> {
+  if (row.scheduler_release_state === "released") return [];
+  const fingerprint = await schedulerFingerprint(row);
+  const finishRates = rollbackRates ? rollbackSchedulerRates : settleSchedulerRates;
+  let failures: string[];
   try {
-    await stub.fetch("https://lease/release", {
-      method: "POST",
-      body: JSON.stringify(lease),
+    failures = await finishRates(env, {
+      accountId: row.account_id,
+      userId: row.user_id,
+      apiKeyId: row.api_key_id,
+      admissionId: row.request_id,
+      requestId: row.request_id,
+      admissionFingerprint: fingerprint,
     });
   } catch {
-    // Expiry remains the final recovery path if compensation itself fails.
+    failures = ["scheduler_rate_release"];
   }
+  const stub = env.ACCOUNT_LEASE.get(
+    env.ACCOUNT_LEASE.idFromName(`account:${row.account_id}`),
+  );
+  let released = false;
+  for (let attempt = 0; attempt < 2 && !released; attempt += 1) {
+    try {
+      const response = await stub.fetch("https://lease/release", {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: row.account_id,
+          request_id: row.request_id,
+          lease_id: row.lease_id,
+          owner: row.owner,
+          epoch: row.lease_epoch,
+        }),
+      });
+      await response.text();
+      released = response.ok;
+    } catch {
+      // Exact identity makes this bounded retry safe.
+    }
+  }
+  if (!released) failures.push("account_lease_release");
+
+  const attemptedAt = now();
+  try {
+    await env.DB.prepare(
+      `UPDATE billing_reservations
+       SET scheduler_release_attempts=scheduler_release_attempts+1,
+           scheduler_release_last_at=?,
+           scheduler_release_state=CASE WHEN ?=1 THEN 'released' ELSE scheduler_release_state END,
+           scheduler_released_at=CASE
+             WHEN ?=1 THEN COALESCE(scheduler_released_at,?)
+             ELSE scheduler_released_at
+           END
+       WHERE request_id=? AND scheduler_release_state='pending'`,
+    ).bind(
+      attemptedAt,
+      failures.length === 0 ? 1 : 0,
+      failures.length === 0 ? 1 : 0,
+      attemptedAt,
+      row.request_id,
+    ).run();
+    const persisted = await env.DB.prepare(
+      "SELECT scheduler_release_state FROM billing_reservations WHERE request_id=?",
+    ).bind(row.request_id).first<{
+      scheduler_release_state: "pending" | "released";
+    }>();
+    if (persisted?.scheduler_release_state === "released") return [];
+    if (failures.length === 0) failures.push("scheduler_release_persistence");
+  } catch {
+    failures.push("scheduler_release_persistence");
+  }
+  return failures;
 }
 
 async function admitRequest(request: Request, env: Env): Promise<Response> {
@@ -474,18 +616,70 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
   // Re-read all revocable authority at admission time. The earlier auth resolve
   // is not trusted across a disable, expiry, group, or balance change window.
   const auth = await fetchAuthRowByID(body.api_key_id, env);
-  if (!auth || !permittedAuth(auth, body.group_id)) {
+  // D1 reservation, not this preflight snapshot, is the exact monetary
+  // authority. Allow idempotent replays at zero available balance and let the
+  // guarded reserve return the authoritative insufficient-balance outcome.
+  if (!auth || !permittedAuth(auth, body.group_id, false)) {
     return error("ADMISSION_REJECTED", 429);
   }
 
   const mapped = await resolveAlias(body.model, env);
   if (!mapped) return error("ADMISSION_REJECTED", 429);
+  const existingBilling = await env.DB.prepare(
+    `SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`,
+  ).bind(body.request_id).first<BillingRow>();
+  if (existingBilling && (
+    existingBilling.user_id !== auth.user_id ||
+    existingBilling.api_key_id !== body.api_key_id ||
+    existingBilling.group_id !== body.group_id ||
+    existingBilling.owner !== owner ||
+    existingBilling.model !== body.model ||
+    existingBilling.upstream_model !== mapped.upstream_model ||
+    (existingBilling.state !== "reserved" && existingBilling.state !== "started")
+  )) {
+    return error("ADMISSION_REJECTED", 409);
+  }
   let priceCard;
+  const pricingModel = normalizePricingModel(body.model);
+  const rate = await env.DB.prepare("SELECT rate_multiplier_bps FROM groups WHERE id=? AND status='active' AND deleted_at IS NULL")
+    .bind(body.group_id).first<{ rate_multiplier_bps: string }>();
   try {
-    priceCard = await lookupAdmissionPriceCard(env, body.model);
+    priceCard = existingBilling
+      ? await loadAdmittedPriceCard(
+          env,
+          existingBilling.pricing_version_id,
+          existingBilling.pricing_digest,
+          existingBilling.pricing_model,
+          existingBilling.pricing_rule_pattern,
+          existingBilling.pricing_rule_match_kind,
+        )
+      : await lookupAdmissionPriceCard(env, body.model);
   } catch {
     return error("PRICING_UNAVAILABLE", 503);
   }
+  if (!pricingModel || !rate || !isCanonicalPositiveDecimal(rate.rate_multiplier_bps) || rate.rate_multiplier_bps.length > 8) {
+    return error("PRICING_UNAVAILABLE", 503);
+  }
+
+  const scheduling = await decideSchedulerRuntime(env, {
+    nowMs: Date.now(),
+    userId: auth.user_id,
+    apiKeyId: body.api_key_id,
+    requiredGroup: body.group_id,
+    platform: "openai",
+    accountType: "apikey",
+    model: body.model,
+    stickinessKey: body.request_id,
+  });
+  if (!existingBilling && (!scheduling.ready || scheduling.decision.selectedAccountId === null)) {
+    return error("ADMISSION_REJECTED", 429);
+  }
+  const selectedAccountID = existingBilling?.account_id ?? scheduling.decision.selectedAccountId;
+  if (selectedAccountID === null) return error("ADMISSION_REJECTED", 429);
+  const selected = scheduling.snapshot.policyRequest.accounts.find(
+    (candidate) => candidate.accountId === selectedAccountID,
+  );
+  if (!selected) return error("ADMISSION_REJECTED", 429);
 
   const account = await env.DB.prepare(
     `SELECT
@@ -493,16 +687,15 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
        a.credential_envelope,a.extra_json
      FROM accounts a
      JOIN account_groups ag ON ag.account_id=a.id
-     WHERE ag.group_id=?
+     WHERE a.id=? AND ag.group_id=?
        AND a.status='active'
        AND a.schedulable=1
        AND a.deleted_at IS NULL
        AND a.platform='openai'
        AND a.type='apikey'
-     ORDER BY a.priority ASC,a.id ASC
      LIMIT 1`,
   )
-    .bind(body.group_id)
+    .bind(selectedAccountID, body.group_id)
     .first<Account>();
   if (
     !account ||
@@ -518,87 +711,116 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
   const extra = parseObject(account.extra_json);
   if (!credential || !extra) return error("ADMISSION_REJECTED", 429);
 
-  const stub = env.ACCOUNT_LEASE.get(
-    env.ACCOUNT_LEASE.idFromName(`account:${account.id}`),
-  );
-  const acquired = await stub.fetch("https://lease/acquire", {
-    method: "POST",
-    body: JSON.stringify({
-      account_id: account.id,
-      request_id: body.request_id,
-      owner,
-      max_concurrency: account.max_concurrency,
-      ttl_seconds: body.lease_ttl_seconds,
-    }),
-  });
-  if (!acquired.ok) return error("ADMISSION_REJECTED", 429);
-
-  const leaseValue = (await acquired.json()) as unknown;
-  if (
-    !validLeaseEnvelope(leaseValue, {
-      accountID: account.id,
-      requestID: body.request_id,
-      owner,
-    })
-  ) {
+  const accountRpmLimit = confirmedRate(selected, "accountRpmLimit");
+  const userRpmLimit = confirmedRate(selected, "userRpmLimit");
+  const apiKeyRpmLimit = scheduling.snapshot.apiKeyRate.limit.kind === "confirmed"
+    ? scheduling.snapshot.apiKeyRate.limit.value
+    : null;
+  if (accountRpmLimit === null || userRpmLimit === null || apiKeyRpmLimit === null) {
     return error("ADMISSION_REJECTED", 429);
   }
-  const leased = leaseValue;
-
-  let inserted: D1Result;
-  try {
-    inserted = await env.DB.prepare(
-      `INSERT OR IGNORE INTO gateway_requests(
-         request_id,api_key_id,account_id,lease_id,lease_epoch,owner,
-         model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,state,created_at
-       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    )
-      .bind(
-        body.request_id,
-        body.api_key_id,
-        account.id,
-        leased.lease.lease_id,
-        leased.lease.epoch,
-        owner,
-        body.model,
-        mapped.upstream_model,
-        priceCard.version_id,
-        priceCard.digest,
-        priceCard.rule.model_pattern,
-        "admitted",
-        now(),
-      )
-      .run();
-  } catch (cause) {
-    if (leased.created) await releaseNewLease(stub, leased.lease);
-    throw cause;
+  const semantic: SchedulerSemanticIdentity = {
+    request_id: body.request_id,
+    user_id: auth.user_id,
+    api_key_id: body.api_key_id,
+    group_id: body.group_id,
+    account_id: account.id,
+    owner,
+    model: body.model,
+    upstream_model: mapped.upstream_model,
+    pricing_version_id: priceCard.version_id,
+    pricing_digest: priceCard.digest,
+    pricing_model: pricingModel,
+    pricing_rule_pattern: priceCard.rule.model_pattern,
+    pricing_rule_match_kind: priceCard.rule.match_kind,
+    rate_multiplier_bps: existingBilling?.rate_multiplier_bps ?? rate.rate_multiplier_bps,
+    reservation_e8_usd: priceCard.max_reservation_e8_usd,
+  };
+  if (existingBilling && !sameSchedulerSemanticIdentity(existingBilling, semantic)) {
+    return error("ADMISSION_REJECTED", 409);
   }
-
-  if ((inserted.meta.changes ?? 0) === 0) {
-    const existing = await env.DB.prepare(
-      `SELECT request_id,api_key_id,account_id,lease_id,lease_epoch,
-              owner,model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,state
-       FROM gateway_requests WHERE request_id=?`,
-    )
-      .bind(body.request_id)
-      .first<GatewayIdentity>();
-    const same =
-      existing?.request_id === body.request_id &&
-      existing.api_key_id === body.api_key_id &&
-      existing.account_id === account.id &&
-      existing.lease_id === leased.lease.lease_id &&
-      existing.lease_epoch === leased.lease.epoch &&
-      existing.owner === owner &&
-      existing.model === body.model &&
-      existing.upstream_model === mapped.upstream_model &&
-      existing.pricing_version_id === priceCard.version_id &&
-      existing.pricing_digest === priceCard.digest &&
-      existing.pricing_rule_pattern === priceCard.rule.model_pattern &&
-      existing.state === "admitted";
-    if (!same) {
-      if (leased.created) await releaseNewLease(stub, leased.lease);
-      return error("ADMISSION_REJECTED", 429);
+  const fingerprint = await schedulerFingerprint(semantic);
+  const schedulerReservation = await reserveSchedulerResources(env, {
+    accountId: account.id,
+    userId: auth.user_id,
+    apiKeyId: body.api_key_id,
+    admissionId: body.request_id,
+    requestId: body.request_id,
+    owner,
+    maxConcurrency: account.max_concurrency,
+    accountRpmLimit,
+    userRpmLimit,
+    apiKeyRpmLimit,
+    leaseTtlSeconds: Number(body.lease_ttl_seconds),
+    reservationTtlSeconds: Math.min(Number(body.lease_ttl_seconds), 60),
+    admissionFingerprint: fingerprint,
+  }, {
+    reserve: async (lease) => {
+      const identity: BillingIdentity = {
+        ...semantic,
+        lease_id: lease.lease_id,
+        lease_epoch: lease.epoch,
+      };
+      let reservation;
+      try {
+        reservation = await billingStub(env, auth.user_id).reserve({
+          ...identity,
+          operation_id: `${body.request_id}:reserve`,
+        });
+      } catch {
+        // The scheduler owns compensation for this unknown-authority outcome.
+        throw new Error("billing reservation authority unknown");
+      }
+      if (reservation.kind !== "ok" ||
+          (reservation.state !== "reserved" && reservation.state !== "started")) {
+        if (reservation.kind === "stale_pricing") {
+          return { ok: false, status: 503, failedStep: "billing_stale_pricing" };
+        }
+        if (reservation.kind === "insufficient") {
+          return { ok: false, status: 402, failedStep: "billing_insufficient" };
+        }
+        return {
+          ok: false,
+          status: reservation.kind === "unavailable" ? 503 : 409,
+          failedStep: reservation.kind === "unavailable"
+            ? "billing_unavailable"
+            : "billing_conflict",
+          authorityUnknown: reservation.kind === "unavailable",
+        };
+      }
+      return { ok: true };
+    },
+    release: async (lease) => {
+      const identity: BillingIdentity = {
+        ...semantic,
+        lease_id: lease.lease_id,
+        lease_epoch: lease.epoch,
+      };
+      try {
+        const released = await billingStub(env, auth.user_id).release({
+          ...identity,
+          operation_id: `${body.request_id}:admission-compensate`,
+        });
+        return released.kind === "ok";
+      } catch {
+        return false;
+      }
+    },
+  });
+  if (!schedulerReservation.ok) {
+    if (schedulerReservation.compensationFailures.length > 0) {
+      return error("ADMISSION_RECONCILIATION_REQUIRED", 503);
     }
+    if (schedulerReservation.failedStep === "billing_insufficient") {
+      return error("INSUFFICIENT_BALANCE", 402);
+    }
+    if (schedulerReservation.failedStep === "billing_stale_pricing") {
+      return error("PRICING_UNAVAILABLE", 503);
+    }
+    if (schedulerReservation.status === 409) return error("ADMISSION_REJECTED", 409);
+    return schedulerReservation.status === 503
+      ? error("ADMISSION_UNAVAILABLE", 503)
+      : error("ADMISSION_REJECTED", 429);
   }
 
   return json({
@@ -613,7 +835,7 @@ async function admitRequest(request: Request, env: Env): Promise<Response> {
     },
     upstream_model: mapped.upstream_model,
     price_card: priceCard,
-    lease: leased.lease,
+    lease: schedulerReservation.lease,
   });
 }
 
@@ -642,12 +864,86 @@ async function relayLeaseAction(
     return error("LEASE_IDENTITY_REJECTED", 409);
   }
 
+  if (path === "/release") {
+    let billing = await env.DB.prepare(`SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`)
+      .bind(data.request_id).first<BillingRow>();
+    if (!billing || billing.account_id !== data.account_id || billing.lease_id !== data.lease_id ||
+      billing.lease_epoch !== data.epoch || billing.owner !== owner) {
+      return error("LEASE_IDENTITY_REJECTED", 409);
+    }
+    const expireStarted = async (row: BillingRow) => billingStub(env, row.user_id).expire({
+      ...billingIdentity(row),
+      operation_id: `${row.request_id}:release-started:${row.version}`,
+      expected_reservation_version: String(row.version),
+      reason: "crash",
+      evidence_digest: await sha256(canonical({
+        scheduler_release_version: 1,
+        request_id: row.request_id,
+        reservation_version: String(row.version),
+        reason: "request-release",
+      })),
+    });
+    let released = billing.state === "started"
+      ? await expireStarted(billing)
+      : await billingStub(env, billing.user_id).release({
+          ...billingIdentity(billing),
+          operation_id: `${billing.request_id}:release`,
+        });
+    if (released.kind === "out_of_order") {
+      const current = await env.DB.prepare(
+        `SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`,
+      ).bind(data.request_id).first<BillingRow>();
+      if (current && current.state === "started" &&
+          sameSchedulerSemanticIdentity(current, billing) &&
+          current.lease_id === billing.lease_id && current.lease_epoch === billing.lease_epoch) {
+        billing = current;
+        released = await expireStarted(current);
+      }
+    }
+    if (released.kind !== "ok") return error("RESERVATION_TRANSITION_REJECTED", 409);
+    const failures = await releaseSchedulerReservation(
+      env,
+      billing,
+      billing.state === "reserved" || billing.state === "released",
+    );
+    return failures.length === 0
+      ? json({ released: true })
+      : error("ADMISSION_RECONCILIATION_REQUIRED", 503);
+  }
+
   return env.ACCOUNT_LEASE.get(
     env.ACCOUNT_LEASE.idFromName(`account:${data.account_id}`),
   ).fetch(`https://lease${path}`, {
     method: "POST",
     body: JSON.stringify(data),
   });
+}
+
+async function startRequest(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<Record<string, unknown>>(request);
+  const owner = request.headers.get("X-Sub2API-Container-Id");
+  if (!body || !isBoundedString(body.request_id, 256) ||
+    !isCanonicalPositiveDecimal(body.api_key_id) || !isCanonicalPositiveDecimal(body.account_id) ||
+    !isBoundedString(body.lease_id, 256) || !isCanonicalPositiveDecimal(body.lease_epoch) ||
+    !isBoundedString(body.model, 256) || !isBoundedString(body.upstream_model, 256) ||
+    !isBoundedString(owner, 256)) return error("INVALID_REQUEST");
+  const billing = await env.DB.prepare(`SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`)
+    .bind(body.request_id).first<BillingRow>();
+  const gateway = await env.DB.prepare("SELECT model,upstream_model FROM gateway_requests WHERE request_id=?")
+    .bind(body.request_id).first<{model:string;upstream_model:string}>();
+  if (!billing || !gateway || billing.api_key_id !== body.api_key_id ||
+    billing.account_id !== body.account_id || billing.lease_id !== body.lease_id ||
+    billing.lease_epoch !== body.lease_epoch || billing.owner !== owner ||
+    gateway.model !== body.model || gateway.upstream_model !== body.upstream_model) {
+    return error("REQUEST_IDENTITY_MISMATCH", 409);
+  }
+  const result = await billingStub(env, billing.user_id).start({
+    ...billingIdentity(billing),
+    operation_id: `${billing.request_id}:start`,
+  });
+  return result.kind === "ok"
+    ? new Response(null, { status: 204 })
+    : error(result.kind === "out_of_order" ? "REQUEST_OUT_OF_ORDER" : "REQUEST_IDENTITY_MISMATCH", 409);
 }
 
 const completionKeys = new Set([
@@ -662,8 +958,15 @@ const completionKeys = new Set([
   "outcome",
   "usage_state",
   "input_tokens",
+  "image_input_tokens",
   "output_tokens",
+  "image_output_tokens",
+  "cache_creation_tokens",
+  "cache_creation_5m_tokens",
+  "cache_creation_1h_tokens",
   "cache_read_tokens",
+  "service_tier",
+  "reasoning_effort",
   "model",
   "upstream_model",
   "upstream_request_id",
@@ -678,7 +981,7 @@ export function validCompletion(value: unknown): value is Completion {
     body.schema_version === USAGE_SCHEMA_VERSION &&
     body.event_type === USAGE_EVENT_TYPE &&
     isBoundedString(body.request_id, 256) &&
-    body.event_id === `${body.request_id}:usage:v1` &&
+    body.event_id === `${body.request_id}:usage:v2` &&
     isCanonicalPositiveDecimal(body.api_key_id) &&
     body.api_key_id.length <= 20 &&
     isCanonicalPositiveDecimal(body.account_id) &&
@@ -690,10 +993,22 @@ export function validCompletion(value: unknown): value is Completion {
     (body.usage_state === "confirmed" || body.usage_state === "unknown") &&
     isCanonicalUnsignedDecimal(body.input_tokens) &&
     body.input_tokens.length <= 20 &&
+    isCanonicalUnsignedDecimal(body.image_input_tokens) &&
+    body.image_input_tokens.length <= 20 &&
     isCanonicalUnsignedDecimal(body.output_tokens) &&
     body.output_tokens.length <= 20 &&
+    isCanonicalUnsignedDecimal(body.image_output_tokens) &&
+    body.image_output_tokens.length <= 20 &&
+    isCanonicalUnsignedDecimal(body.cache_creation_tokens) &&
+    body.cache_creation_tokens.length <= 20 &&
+    isCanonicalUnsignedDecimal(body.cache_creation_5m_tokens) &&
+    body.cache_creation_5m_tokens.length <= 20 &&
+    isCanonicalUnsignedDecimal(body.cache_creation_1h_tokens) &&
+    body.cache_creation_1h_tokens.length <= 20 &&
     isCanonicalUnsignedDecimal(body.cache_read_tokens) &&
     body.cache_read_tokens.length <= 20 &&
+    isBoundedString(body.service_tier, 32, 0) &&
+    isBoundedString(body.reasoning_effort, 32, 0) &&
     isCanonicalUnsignedDecimal(body.duration_ms) &&
     body.duration_ms.length <= 20 &&
     isBoundedString(body.model, 256) &&
@@ -725,101 +1040,178 @@ async function completeRequest(request: Request, env: Env): Promise<Response> {
   if (!validCompletion(body) || !isBoundedString(owner, 256)) {
     return error("INVALID_REQUEST");
   }
+  if (body.usage_state === "unknown" && (body.input_tokens !== "0" || body.image_input_tokens !== "0" || body.output_tokens !== "0" || body.image_output_tokens !== "0" || body.cache_creation_tokens !== "0" || body.cache_creation_5m_tokens !== "0" || body.cache_creation_1h_tokens !== "0" || body.cache_read_tokens !== "0")) return error("INVALID_USAGE", 409);
 
-  const payload = canonical(body);
-  const payloadHash = await sha256(payload);
-  const prior = await env.DB.prepare(
-    "SELECT payload_hash FROM outbox_events WHERE event_id=?",
-  )
-    .bind(body.event_id)
-    .first<{ payload_hash: string }>();
-  if (prior) {
-    if (prior.payload_hash === payloadHash) return new Response(null, { status: 204 });
-    await recordConflict(
-      env,
-      "completion",
-      body.event_id,
-      prior.payload_hash,
-      payloadHash,
-    );
-    return error("EVENT_CONFLICT", 409);
-  }
-
-  const completedAt = now();
-  const completionNonce = crypto.randomUUID();
-  const results = await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE gateway_requests
-       SET state=?,event_id=?,completed_at=?,completion_nonce=?
-       WHERE request_id=? AND api_key_id=? AND account_id=?
-         AND lease_id=? AND lease_epoch=? AND owner=? AND state='admitted'`,
-    ).bind(
-      body.outcome,
-      body.event_id,
-      completedAt,
-      completionNonce,
-      body.request_id,
-      body.api_key_id,
-      body.account_id,
-      body.lease_id,
-      body.lease_epoch,
-      owner,
-    ),
-    env.DB.prepare(
-      `INSERT INTO outbox_events(
-         event_id,request_id,payload_json,payload_hash,state,
-         attempts,created_at
-       )
-       SELECT ?,?,?,?,?,0,?
-       FROM gateway_requests
-       WHERE request_id=? AND completion_nonce=? AND event_id=?`,
-    ).bind(
-      body.event_id,
-      body.request_id,
-      payload,
-      payloadHash,
-      "pending",
-      completedAt,
-      body.request_id,
-      completionNonce,
-      body.event_id,
-    ),
-  ]);
-
-  if (
-    (results[0].meta.changes ?? 0) !== 1 ||
-    (results[1].meta.changes ?? 0) !== 1
-  ) {
-    const raced = await env.DB.prepare(
-      "SELECT payload_hash FROM outbox_events WHERE event_id=?",
-    )
-      .bind(body.event_id)
-      .first<{ payload_hash: string }>();
-    if (raced?.payload_hash === payloadHash) {
-      return new Response(null, { status: 204 });
-    }
-    if (raced) {
-      await recordConflict(
-        env,
-        "completion",
-        body.event_id,
-        raced.payload_hash,
-        payloadHash,
-      );
-      return error("EVENT_CONFLICT", 409);
-    }
+  const gatewayIdentity = await env.DB.prepare(
+    `SELECT request_id,api_key_id,account_id,lease_id,lease_epoch,owner,
+            model,upstream_model,pricing_version_id,pricing_digest,
+            pricing_rule_pattern,state
+     FROM gateway_requests WHERE request_id=?`,
+  ).bind(body.request_id).first<GatewayIdentity>();
+  if (!gatewayIdentity || gatewayIdentity.api_key_id !== body.api_key_id ||
+    gatewayIdentity.account_id !== body.account_id || gatewayIdentity.lease_id !== body.lease_id ||
+    gatewayIdentity.lease_epoch !== body.lease_epoch || gatewayIdentity.owner !== owner ||
+    gatewayIdentity.model !== body.model || gatewayIdentity.upstream_model !== body.upstream_model) {
     return error("REQUEST_IDENTITY_MISMATCH", 409);
   }
 
-  try {
-    await withTimeout(
-      publish(env, body.event_id, payload, payloadHash),
-      PUBLISH_TIMEOUT_MS,
-    );
-  } catch {
-    await recordPublishFailure(env, body.event_id).catch(() => undefined);
+  const payload = canonical(body);
+  const payloadHash = await sha256(payload);
+  const billing = await env.DB.prepare(`SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`)
+    .bind(body.request_id).first<BillingRow>();
+  if (!billing || billing.api_key_id !== body.api_key_id ||
+    billing.account_id !== body.account_id || billing.lease_id !== body.lease_id ||
+    billing.lease_epoch !== body.lease_epoch || billing.owner !== owner) {
+    return error("REQUEST_IDENTITY_MISMATCH", 409);
+  }
+  if (billing.completion_event_id !== null || billing.completion_payload_hash !== null) {
+    if (billing.completion_event_id !== body.event_id || billing.completion_payload_hash !== payloadHash) {
+      await recordConflict(env, "completion", body.event_id, billing.completion_payload_hash ?? "missing", payloadHash);
+      return error("EVENT_CONFLICT", 409);
+    }
+    if (billing.state === "completed" || billing.state === "unknown") {
+      await releaseSchedulerReservation(env, billing);
+      return new Response(null, { status: 204 });
+    }
+  }
+  let chargedE8USD = "0";
+  if (body.usage_state === "confirmed") {
+    try {
+      const card = await loadAdmittedPriceCard(
+        env, billing.pricing_version_id, billing.pricing_digest, billing.pricing_model, billing.pricing_rule_pattern, billing.pricing_rule_match_kind,
+      );
+      const charge = calculateAdmittedE8Charge(card, {
+        input_tokens: body.input_tokens, image_input_tokens: body.image_input_tokens ?? "0",
+        output_tokens: body.output_tokens, image_output_tokens: body.image_output_tokens ?? "0",
+        cache_creation_tokens: body.cache_creation_tokens ?? "0", cache_creation_5m_tokens: body.cache_creation_5m_tokens ?? "0",
+        cache_creation_1h_tokens: body.cache_creation_1h_tokens ?? "0", cache_read_tokens: body.cache_read_tokens,
+        service_tier: body.service_tier ?? "", reasoning_effort: body.reasoning_effort ?? "", rate_multiplier_bps: billing.rate_multiplier_bps,
+      });
+      // The reservation schema deliberately bounds monetary fields. An exact
+      // over-cap calculation is preserved in the immutable usage payload; a
+      // bounded one-unit-over sentinel drives the reservation to unknown for
+      // explicit reconciliation without truncating or charging it.
+      chargedE8USD = charge.exceeds_reservation_cap
+        ? (BigInt(billing.reservation_e8_usd) + 1n).toString()
+        : charge.total_e8_usd;
+    } catch {
+      return error("INVALID_USAGE", 409);
+    }
+  }
+  const settlement = await billingStub(env, billing.user_id).complete({
+    ...billingIdentity(billing),
+    operation_id: `${billing.request_id}:complete`,
+    final: true,
+    usage_present: body.usage_state === "confirmed",
+    charged_e8_usd: chargedE8USD,
+    event_id: body.event_id,
+    payload_hash: payloadHash,
+    payload_json: payload,
+    outcome: body.outcome,
+    upstream_request_id: body.upstream_request_id,
+  });
+  if (settlement.kind !== "ok") {
+    return error(settlement.kind === "out_of_order" ? "REQUEST_OUT_OF_ORDER" : "REQUEST_IDENTITY_MISMATCH", 409);
+  }
+  await releaseSchedulerReservation(env, billing);
+
+  if (!settlement.replayed) {
+    try {
+      await withTimeout(
+        publish(env, body.event_id, payload, payloadHash),
+        PUBLISH_TIMEOUT_MS,
+      );
+    } catch {
+      await recordPublishFailure(env, body.event_id).catch(() => undefined);
+    }
   }
   return new Response(null, { status: 204 });
+}
+
+async function reconcileRequest(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<Record<string, unknown>>(request);
+  const owner = request.headers.get("X-Sub2API-Container-Id");
+  if (!body || Object.keys(body).some((key) => !["request_id", "operation_id", "actor_id", "expected_reservation_version", "decision", "charged_e8_usd", "evidence_digest"].includes(key)) ||
+    !isBoundedString(body.request_id, 256) || !isBoundedString(body.operation_id, 300) ||
+    !isBoundedString(body.actor_id, 256) || !isCanonicalPositiveDecimal(body.expected_reservation_version) ||
+    (body.decision !== "charge" && body.decision !== "refund") ||
+    typeof body.evidence_digest !== "string" || !/^[0-9a-f]{64}$/.test(body.evidence_digest) ||
+    !isBoundedString(owner, 256) ||
+    (body.decision === "charge" && (!isCanonicalUnsignedDecimal(body.charged_e8_usd) || body.charged_e8_usd.length > 18)) ||
+    (body.decision === "refund" && body.charged_e8_usd !== undefined)) return error("INVALID_RECONCILIATION", 409);
+  const billing = await env.DB.prepare(`SELECT ${billingColumns} FROM billing_reservations WHERE request_id=?`).bind(body.request_id).first<BillingRow>();
+  if (!billing || billing.owner !== owner || billing.state !== "unknown") return error("REQUEST_OUT_OF_ORDER", 409);
+  const result = await billingStub(env, billing.user_id).reconcile({
+    ...billingIdentity(billing), operation_id: body.operation_id, actor_id: body.actor_id,
+    expected_reservation_version: body.expected_reservation_version, decision: body.decision,
+    ...(body.decision === "charge" ? { charged_e8_usd: body.charged_e8_usd } : {}), evidence_digest: body.evidence_digest,
+  });
+  if (result.kind !== "ok") {
+    return error(result.kind === "out_of_order" ? "REQUEST_OUT_OF_ORDER" : "RECONCILIATION_REJECTED", 409);
+  }
+  const schedulerFailures = await releaseSchedulerReservation(env, billing);
+  return schedulerFailures.length === 0
+    ? new Response(null, { status: 204 })
+    : error("ADMISSION_RECONCILIATION_REQUIRED", 503);
+}
+
+export async function recoverStaleAdmissions(
+  env: Env,
+  timeMs = Date.now(),
+): Promise<void> {
+  const cutoff = new Date(timeMs - ADMISSION_RECOVERY_AGE_MS).toISOString();
+  const rows = (await env.DB.prepare(
+    `SELECT ${billingColumns}
+     FROM billing_reservations AS reservation
+     WHERE reservation.scheduler_release_state='pending'
+       AND (
+         (
+           reservation.state IN ('reserved','started')
+           AND COALESCE(reservation.started_at,reservation.created_at)<=?
+         )
+         OR reservation.state IN ('completed','released','unknown')
+       )
+     ORDER BY
+       CASE WHEN reservation.state IN ('reserved','started') THEN 0 ELSE 1 END,
+       reservation.created_at,reservation.request_id
+     LIMIT ?`,
+  ).bind(cutoff, ADMISSION_RECOVERY_LIMIT).all<BillingRow>()).results;
+  let failures = 0;
+  for (const row of rows) {
+    try {
+      if (row.state === "reserved" || row.state === "started") {
+        const evidenceDigest = await sha256(canonical({
+          scheduler_recovery_version: 1,
+          request_id: row.request_id,
+          reservation_version: String(row.version),
+          reason: "crash",
+        }));
+        const result = await billingStub(env, row.user_id).expire({
+          ...billingIdentity(row),
+          operation_id: `${row.request_id}:scheduler-recovery:${row.version}`,
+          expected_reservation_version: String(row.version),
+          reason: "crash",
+          evidence_digest: evidenceDigest,
+        });
+        if (result.kind !== "ok") {
+          if (result.kind === "unavailable") failures += 1;
+          continue;
+        }
+      }
+      const schedulerFailures = await releaseSchedulerReservation(
+        env,
+        row,
+        row.state === "reserved" || row.state === "released",
+      );
+      if (schedulerFailures.length > 0) failures += 1;
+    } catch {
+      // A later scheduled delivery retries the same bounded, idempotent work.
+      failures += 1;
+    }
+  }
+  if (failures > 0) {
+    throw new Error(`scheduler admission recovery incomplete: ${failures}`);
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {

@@ -1,6 +1,8 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
+  calculateUsageChargeE8USD,
+  loadAdmittedPriceCard,
   lookupAdmissionPriceCard,
   pricingDigest,
   PricingUnavailableError,
@@ -110,5 +112,16 @@ describe("admission pricing", () => {
     const second = rule(versionID, "a-model", "exact");
     expect(await pricingDigest(versionID, "100", [first, second]))
       .toBe(await pricingDigest(versionID, "100", [second, first]));
+  });
+
+  it("loads one admitted rule from the complete immutable snapshot and rounds exact E8 totals", async () => {
+    const seeded = await seed([
+      rule("", "gpt-a", "exact", "500000"),
+      rule("", "gpt-b", "exact", "900000"),
+    ]);
+    const card = await loadAdmittedPriceCard(testEnv, seeded.versionID, seeded.digest, "gpt-a");
+    expect(card.rule.model_pattern).toBe("gpt-a");
+    expect(calculateUsageChargeE8USD(card, "1", "0", "0")).toBe("1");
+    expect(calculateUsageChargeE8USD(card, "0", "0", "0")).toBe("0");
   });
 });

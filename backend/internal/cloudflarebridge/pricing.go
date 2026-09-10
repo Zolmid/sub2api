@@ -190,6 +190,9 @@ func normalizeCacheCreation(tokens E8Usage) (int64, int64, error) {
 	if tokens.CacheCreationTokens < 0 || tokens.CacheCreation5mTokens < 0 || tokens.CacheCreation1hTokens < 0 {
 		return 0, 0, ErrInvalidE8Usage
 	}
+	if tokens.CacheCreationTokens == 0 && (tokens.CacheCreation5mTokens != 0 || tokens.CacheCreation1hTokens != 0) {
+		return 0, 0, ErrInvalidE8Usage
+	}
 	if tokens.CacheCreationTokens <= 0 || (tokens.CacheCreation5mTokens <= tokens.CacheCreationTokens && tokens.CacheCreation1hTokens <= tokens.CacheCreationTokens-tokens.CacheCreation5mTokens) {
 		return tokens.CacheCreation5mTokens, tokens.CacheCreation1hTokens, nil
 	}
@@ -273,7 +276,8 @@ func CalculateAdmittedE8Charge(card AdmittedPriceCard, usage E8Usage) (*E8Charge
 	input, output, read, write := p(card.Rule.InputE8PerMillion), p(card.Rule.OutputE8PerMillion), p(card.Rule.CacheReadE8PerMillion), p(card.Rule.CacheWriteE8PerMillion)
 	tier := strings.ToLower(strings.TrimSpace(usage.ServiceTier))
 	multiplier := big.NewInt(10_000)
-	if tier == "fast" || tier == "priority" {
+	switch tier {
+	case "fast", "priority":
 		fast := p(card.Rule.FastMultiplierBPS)
 		if fast.Sign() > 0 {
 			multiplier = fast
@@ -282,7 +286,7 @@ func CalculateAdmittedE8Charge(card AdmittedPriceCard, usage E8Usage) (*E8Charge
 		} else {
 			multiplier = big.NewInt(20_000)
 		}
-	} else if tier == "flex" {
+	case "flex":
 		if configured := p(card.Rule.FlexMultiplierBPS); configured.Sign() > 0 {
 			multiplier = configured
 		} else {

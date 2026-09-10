@@ -1,6 +1,7 @@
 package cloudflarebridge
 
 import (
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
@@ -147,5 +148,12 @@ func TestCalculateAdmittedE8ChargeNormalizesContradictoryCacheDetails(t *testing
 	// the remainder to 1h: 60*250 + 40*500 e8 per million.
 	if got.CacheWriteE8USD != "35000" || got.TotalE8USD != "35000" {
 		t.Fatalf("normalized cache charge = %+v", got)
+	}
+}
+
+func TestCalculateAdmittedE8ChargeRejectsDetailWithoutCacheCreationTotal(t *testing.T) {
+	_, err := CalculateAdmittedE8Charge(testAdmittedCard(), E8Usage{CacheCreation5mTokens: 1})
+	if !errors.Is(err, ErrInvalidE8Usage) {
+		t.Fatalf("error = %v, want ErrInvalidE8Usage", err)
 	}
 }

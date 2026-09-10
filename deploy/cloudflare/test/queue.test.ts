@@ -2,10 +2,13 @@ import { env } from "cloudflare:test";
 import {
   createExecutionContext,
   createMessageBatch,
+  createScheduledController,
   getQueueResult,
+  waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { drainOutbox } from "../src/control-plane";
+import type { BillingIdentity } from "../src/billing";
 import {
   USAGE_EVENT_TYPE,
   USAGE_SCHEMA_VERSION,
@@ -15,11 +18,16 @@ import {
   type UsageEnvelope,
 } from "../src/contracts";
 import worker from "../src/index";
+import {
+  createAndEnqueueJob,
+  getJob,
+  type QueueEnvelope,
+} from "../src/job-runtime";
 
 const completion = (requestID: string, outputTokens = "4"): Completion => ({
   schema_version: USAGE_SCHEMA_VERSION,
   event_type: USAGE_EVENT_TYPE,
-  event_id: `${requestID}:usage:v1`,
+  event_id: `${requestID}:usage:v2`,
   request_id: requestID,
   api_key_id: "3001",
   account_id: "4001",
@@ -28,8 +36,15 @@ const completion = (requestID: string, outputTokens = "4"): Completion => ({
   outcome: "succeeded",
   usage_state: "confirmed",
   input_tokens: "11",
+  image_input_tokens: "0",
   output_tokens: outputTokens,
+  image_output_tokens: "0",
+  cache_creation_tokens: "0",
+  cache_creation_5m_tokens: "0",
+  cache_creation_1h_tokens: "0",
   cache_read_tokens: "0",
+  service_tier: "",
+  reasoning_effort: "",
   model: "fixture-model",
   upstream_model: "mock-upstream-model",
   upstream_request_id: "fixture-completion",
@@ -48,7 +63,6 @@ const envelopeFor = async (value: Completion): Promise<UsageEnvelope> => {
 const insertRequest = async (
   value: Completion,
   state: "admitted" | "succeeded" = "succeeded",
-  withOutbox = state === "succeeded",
 ): Promise<void> => {
   const pricing = await env.DB.prepare(
     `SELECT a.version_id,v.digest,r.model_pattern
@@ -58,49 +72,84 @@ const insertRequest = async (
      WHERE r.model_pattern='fixture-model'`,
   ).first<{ version_id: string; digest: string; model_pattern: string }>();
   if (!pricing) throw new Error("fixture pricing is unavailable");
-  await env.DB.prepare(
-    `INSERT INTO gateway_requests(
-       request_id,api_key_id,account_id,lease_id,lease_epoch,owner,
-       model,upstream_model,pricing_version_id,pricing_digest,pricing_rule_pattern,
-       state,event_id,completed_at,created_at
-     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-  )
-    .bind(
-      value.request_id,
-      value.api_key_id,
-      value.account_id,
-      value.lease_id,
-      value.lease_epoch,
-      "container-queue-test",
-      value.model,
-      value.upstream_model,
-      pricing.version_id,
-      pricing.digest,
-      pricing.model_pattern,
-      state,
-      state === "succeeded" ? value.event_id : null,
-      state === "succeeded" ? "2026-09-06T00:00:01Z" : null,
-      "2026-09-06T00:00:00Z",
-    )
-    .run();
-  if (withOutbox) {
+  const identity: BillingIdentity = {
+    request_id: value.request_id,
+    user_id: "1001",
+    api_key_id: value.api_key_id,
+    group_id: "2001",
+    account_id: value.account_id,
+    lease_id: value.lease_id,
+    lease_epoch: value.lease_epoch,
+    owner: "container-queue-test",
+    model: value.model,
+    upstream_model: value.upstream_model,
+    pricing_version_id: pricing.version_id,
+    pricing_digest: pricing.digest,
+    pricing_model: value.model,
+    pricing_rule_pattern: pricing.model_pattern,
+    pricing_rule_match_kind: "exact",
+    rate_multiplier_bps: "10000",
+    reservation_e8_usd: "100000000000",
+  };
+  const billing = env.BILLING_PRINCIPAL.getByName("user:1001");
+  const reserved = await billing.reserve({
+    ...identity,
+    operation_id: `${value.request_id}:reserve`,
+  });
+  if (reserved.kind !== "ok" || reserved.state !== "reserved") {
+    throw new Error(`failed to reserve billing for ${value.request_id}`);
+  }
+  const started = await billing.start({
+    ...identity,
+    operation_id: `${value.request_id}:start`,
+  });
+  if (started.kind !== "ok" || started.state !== "started") {
+    throw new Error(`failed to start billing for ${value.request_id}`);
+  }
+  if (state === "succeeded") {
     const envelope = await envelopeFor(value);
-    await env.DB.prepare(
-      `INSERT INTO outbox_events(
-         event_id,request_id,payload_json,payload_hash,state,attempts,
-         published_at,created_at
-       ) VALUES(?,?,?,?,?,0,?,?)`,
-    )
-      .bind(
-        value.event_id,
-        value.request_id,
-        envelope.payload,
-        envelope.payload_hash,
-        "published",
-        "2026-09-06T00:00:02Z",
-        "2026-09-06T00:00:01Z",
-      )
-      .run();
+    const charged = (
+      BigInt(value.input_tokens) * 125n +
+      BigInt(value.output_tokens) * 1000n
+    ).toString();
+    const settled = await billing.complete({
+      ...identity,
+      operation_id: `${value.request_id}:complete`,
+      final: true,
+      usage_present: true,
+      charged_e8_usd: charged,
+      event_id: value.event_id,
+      payload_hash: envelope.payload_hash,
+      payload_json: envelope.payload,
+      outcome: value.outcome,
+      upstream_request_id: value.upstream_request_id,
+    });
+    if (settled.kind !== "ok" || settled.state !== "completed") {
+      throw new Error(`failed to settle billing for ${value.request_id}`);
+    }
+    const authoritative = await env.DB.prepare(
+      `SELECT g.state AS request_state,g.event_id,o.request_id AS outbox_request_id,
+              o.payload_json,o.payload_hash
+       FROM gateway_requests g
+       JOIN outbox_events o ON o.event_id=g.event_id
+       WHERE g.request_id=?`,
+    ).bind(value.request_id).first<{
+      request_state: string;
+      event_id: string;
+      outbox_request_id: string;
+      payload_json: string;
+      payload_hash: string;
+    }>();
+    if (
+      !authoritative ||
+      authoritative.request_state !== value.outcome ||
+      authoritative.event_id !== value.event_id ||
+      authoritative.outbox_request_id !== value.request_id ||
+      authoritative.payload_json !== envelope.payload ||
+      authoritative.payload_hash !== envelope.payload_hash
+    ) {
+      throw new Error(`billing did not create authoritative usage for ${value.request_id}`);
+    }
   }
 };
 
@@ -120,6 +169,99 @@ const deliver = async (envelopes: UsageEnvelope[]) => {
 };
 
 describe("usage Queue consumer", () => {
+  it("publishes pending background jobs through the configured scheduled path", async () => {
+    const suffix = crypto.randomUUID();
+    const jobId = `scheduled-job-${suffix}`;
+    const created = await createAndEnqueueJob(env.DB, {
+      jobId,
+      operationId: `scheduled-create-${suffix}`,
+      route: "scheduled.test.v1",
+      jobType: "scheduled-test",
+      idempotencyKey: `scheduled-idem-${suffix}`,
+      payloadCodec: "json",
+      payloadBody: "{}",
+      payloadDigest: `sha256:${suffix}`,
+      maxAttempts: 1,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      nowMs: 1_000,
+      actor: "scheduled-path-test",
+    });
+    expect(created.kind).toBe("applied");
+    expect(
+      await env.DB.prepare(
+        "SELECT state FROM background_job_outbox WHERE job_id=?",
+      ).bind(jobId).first("state"),
+    ).toBe("pending");
+
+    const ctx = createExecutionContext();
+    await worker.scheduled(
+      createScheduledController({
+        scheduledTime: new Date(),
+        cron: "*/1 * * * *",
+      }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(
+      await env.DB.prepare(
+        "SELECT state FROM background_job_outbox WHERE job_id=?",
+      ).bind(jobId).first("state"),
+    ).toBe("published");
+  });
+
+  it("rejects an unknown Queue instead of treating it as usage", async () => {
+    const value = completion(`request-unknown-queue-${crypto.randomUUID()}`);
+    const envelope = await envelopeFor(value);
+    const batch = createMessageBatch<UsageEnvelope>("unexpected-queue", [{
+      id: `unexpected-${crypto.randomUUID()}`,
+      timestamp: new Date(),
+      attempts: 1,
+      body: envelope,
+    }]);
+
+    await expect(worker.queue(batch, env)).rejects.toThrow("UNEXPECTED_QUEUE");
+    expect((await getQueueResult(batch, createExecutionContext())).explicitAcks).toHaveLength(0);
+  });
+
+  it("keeps usage handling isolated when the Worker also receives a background-job Queue batch", async () => {
+    const suffix = crypto.randomUUID();
+    const created = await createAndEnqueueJob(env.DB, {
+      jobId: `queue-isolation-${suffix}`,
+      operationId: `queue-isolation-create-${suffix}`,
+      route: "unregistered.v1",
+      jobType: "queue-isolation",
+      idempotencyKey: `queue-isolation-idem-${suffix}`,
+      payloadCodec: "json",
+      payloadBody: "{}",
+      payloadDigest: `sha256:${suffix}`,
+      maxAttempts: 1,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      nowMs: 1_000,
+      actor: "queue-isolation-test",
+    });
+    if (!created.job) throw new Error("background job was not created");
+    const batch = createMessageBatch<UsageEnvelope | QueueEnvelope>(
+      "sub2api-background-jobs",
+      [{
+        id: `background-${suffix}`,
+        timestamp: new Date(),
+        attempts: 1,
+        body: { v: 1, jobId: created.job.jobId, route: "unregistered.v1", jobVersion: 1 },
+      }],
+    );
+    await worker.queue(batch, env);
+
+    expect((await getQueueResult(batch, createExecutionContext())).explicitAcks).toHaveLength(1);
+    expect(await getJob(env.DB, created.job.jobId)).toMatchObject({
+      status: "manual_review",
+      errorCode: "unknown_route",
+    });
+  });
+
   it("atomically applies ten identical deliveries once", async () => {
     const value = completion("request-queue-ten");
     await insertRequest(value);
@@ -227,22 +369,12 @@ describe("usage Queue consumer", () => {
 
   it("recovers a pending outbox row without waking the Container", async () => {
     const value = completion("request-outbox-recovery");
-    await insertRequest(value, "succeeded", false);
-    const envelope = await envelopeFor(value);
-    await env.DB.prepare(
-      `INSERT INTO outbox_events(
-         event_id,request_id,payload_json,payload_hash,state,attempts,created_at
-       ) VALUES(?,?,?,?,?,0,?)`,
-    )
-      .bind(
-        value.event_id,
-        value.request_id,
-        envelope.payload,
-        envelope.payload_hash,
-        "pending",
-        "2026-09-06T00:00:02Z",
-      )
-      .run();
+    await insertRequest(value);
+    expect(
+      await env.DB.prepare("SELECT state FROM outbox_events WHERE event_id=?")
+        .bind(value.event_id)
+        .first("state"),
+    ).toBe("pending");
 
     await drainOutbox(env);
     expect(

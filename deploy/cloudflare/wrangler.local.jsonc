@@ -24,6 +24,9 @@
     "bindings": [
       { "name": "SUB2API_CONTAINER", "class_name": "Sub2APIContainer" },
       { "name": "ACCOUNT_LEASE", "class_name": "AccountLeaseDO" },
+      { "name": "USER_RATE_LIMIT", "class_name": "UserRateLimitDO" },
+      { "name": "API_KEY_RATE_LIMIT", "class_name": "APIKeyRateLimitDO" },
+      { "name": "BILLING_PRINCIPAL", "class_name": "BillingPrincipalDO" },
       { "name": "AUTH_LOGIN_ADMISSION", "class_name": "AuthLoginAdmissionDO" },
       { "name": "TOTP_SECURITY", "class_name": "TOTPSecurityDO" }
     ]
@@ -40,6 +43,14 @@
     {
       "tag": "v3-totp-security",
       "new_sqlite_classes": ["TOTPSecurityDO"]
+    },
+    {
+      "tag": "v4-billing-principal",
+      "new_sqlite_classes": ["BillingPrincipalDO"]
+    },
+    {
+      "tag": "v5-scheduler-rate-limits",
+      "new_sqlite_classes": ["UserRateLimitDO", "APIKeyRateLimitDO"]
     }
   ],
   "d1_databases": [
@@ -52,7 +63,10 @@
   ],
   "kv_namespaces": [{ "binding": "CONFIG_CACHE", "id": "local" }],
   "queues": {
-    "producers": [{ "binding": "USAGE_QUEUE", "queue": "usage-local" }],
+    "producers": [
+      { "binding": "USAGE_QUEUE", "queue": "usage-local" },
+      { "binding": "JOB_QUEUE", "queue": "sub2api-background-jobs" }
+    ],
     "consumers": [
       {
         "queue": "usage-local",
@@ -60,6 +74,13 @@
         "max_batch_timeout": 1,
         "max_retries": 5,
         "dead_letter_queue": "usage-local-dlq"
+      },
+      {
+        "queue": "sub2api-background-jobs",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "sub2api-background-jobs-dlq"
       }
     ]
   },

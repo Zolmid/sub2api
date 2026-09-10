@@ -11,7 +11,7 @@ go run ./cmd/cloudflare-loadcheck --path /api/v1/status --requests 100 --concurr
 For explicitly authorized staging, use a non-sensitive fixture route and name the target directly:
 
 ```sh
-go run ./cmd/cloudflare-loadcheck --base-url https://staging.example.invalid --path /healthz --requests 50 --concurrency 5 --timeout 3s --authorized-remote-target
+go run ./cmd/cloudflare-loadcheck --base-url https://staging.example.invalid --path /health --requests 50 --concurrency 5 --timeout 3s --authorized-remote-target
 ```
 
 The command accepts `--path`, `--requests`, `--concurrency`, `--method`, `--body`, repeatable `--header`, `--timeout`, `--max-response-bytes`, `--cancel-after`, and `--authorized-remote-target`. The default target must be localhost or another loopback address. Any non-loopback target is rejected before any request is created or sent unless `--authorized-remote-target` is present. That flag records only the operator's explicit authorization for the test target; it is not a substitute for the environment owner's permission.

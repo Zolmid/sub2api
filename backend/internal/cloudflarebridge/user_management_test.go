@@ -112,6 +112,7 @@ func (*adminUserControlStub) Renew(context.Context, RenewRequest) (*Lease, error
 func (*adminUserControlStub) Complete(context.Context, CompletionRequest) error {
 	return ErrNotMigrated
 }
+func (*adminUserControlStub) Start(context.Context, StartRequest) error { return nil }
 
 func (*adminUserControlStub) Release(context.Context, ReleaseRequest) error { return ErrNotMigrated }
 

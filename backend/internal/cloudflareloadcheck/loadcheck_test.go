@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -512,6 +513,149 @@ func TestPercentilesUseDeterministicNearestRank(t *testing.T) {
 	want := Percentiles{Count: 5, P50: 20, P95: 100, P99: 100}
 	if got != want {
 		t.Fatalf("percentiles = %+v, want %+v", got, want)
+	}
+}
+
+func TestRunReportsTTFBAsResponseHeaderLatency(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	cfg.BaseURL = server.URL
+	report, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.TTFBLatency != report.ResponseHeaderLatency || report.TTFBLatency.Count != 1 || report.EndToEndLatency.Count != 1 {
+		t.Fatalf("report timing fields = %+v, want explicit TTFB/header and end-to-end samples", report)
+	}
+}
+
+func TestRunMatrixCoversVariantsModesAndConcurrency(t *testing.T) {
+	var mu sync.Mutex
+	requestsByPathAndMode := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mode := "warm"
+		if r.Close {
+			mode = "cold"
+		}
+		mu.Lock()
+		requestsByPathAndMode[r.URL.Path+":"+mode]++
+		mu.Unlock()
+		if r.URL.Path == "/stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Error("streaming test server does not support flushing")
+				return
+			}
+			flusher.Flush()
+			time.Sleep(time.Millisecond)
+			_, _ = w.Write([]byte("data: ready\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer server.Close()
+
+	cfg := DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Requests = 10
+	cfg.Timeout = time.Second
+	matrix, err := RunMatrix(context.Background(), MatrixConfig{
+		Config:             cfg,
+		BodyPath:           "/body",
+		StreamPath:         "/stream",
+		PlatformOperations: map[string]int64{"d1.reads": 2, "queue.ops": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(matrix.Rows), 12; got != want {
+		t.Fatalf("matrix rows = %d, want %d", got, want)
+	}
+	if got, want := matrix.ConcurrencyMatrix, []int{1, 3, 10}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("concurrency matrix = %v, want %v", got, want)
+	}
+	for _, row := range matrix.Rows {
+		if row.Report.Completed != 10 || row.Report.TTFBLatency.Count != 10 || row.Report.EndToEndLatency.Count != 10 {
+			t.Fatalf("row %s/%s report = %+v, want ten timing samples", row.Variant, row.ConnectionMode, row.Report)
+		}
+		if row.Report.TTFBLatency.P50 > row.Report.TTFBLatency.P95 || row.Report.TTFBLatency.P95 > row.Report.TTFBLatency.P99 {
+			t.Fatalf("row %s/%s has invalid TTFB percentiles: %+v", row.Variant, row.ConnectionMode, row.Report.TTFBLatency)
+		}
+		if row.PlatformOperations == nil || row.PlatformOperations.EstimatedForCompletedRequests["d1.reads"] != 20 || row.PlatformOperations.EstimatedForCompletedRequests["queue.ops"] != 10 {
+			t.Fatalf("row %s/%s operations = %+v, want transparent completed-request estimates", row.Variant, row.ConnectionMode, row.PlatformOperations)
+		}
+		if row.ConnectionMode == ConnectionCold && !strings.Contains(row.ModeSemantics, "not a Cloudflare Worker cold-start") {
+			t.Fatalf("cold semantics = %q", row.ModeSemantics)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range []string{"/body", "/stream"} {
+		if requestsByPathAndMode[path+":cold"] != 30 || requestsByPathAndMode[path+":warm"] != 30 {
+			t.Fatalf("requests by path/mode = %+v, want thirty per path and connection mode", requestsByPathAndMode)
+		}
+	}
+	if strings.Contains(strings.ToLower(matrix.ResourceMetricsNote), "measured") {
+		t.Fatalf("resource note must not imply RSS/CPU were measured: %q", matrix.ResourceMetricsNote)
+	}
+}
+
+func TestRunMatrixRequiresBothVariantsAndTenRequests(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Requests = 9
+	_, err := RunMatrix(context.Background(), MatrixConfig{Config: cfg, BodyPath: "/body", StreamPath: "/stream"})
+	if err == nil || !strings.Contains(err.Error(), "at least 10") {
+		t.Fatalf("RunMatrix() error = %v, want requests guard", err)
+	}
+	cfg.Requests = 10
+	_, err = RunMatrix(context.Background(), MatrixConfig{Config: cfg, BodyPath: "/body"})
+	if err == nil || !strings.Contains(err.Error(), "both body-path and stream-path") {
+		t.Fatalf("RunMatrix() error = %v, want both variants guard", err)
+	}
+}
+
+func TestRunCLIConcurrencyMatrixPassesOnlyValidatedInputs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	calledSingle := false
+	var got MatrixConfig
+	code := runCLIWithMatrix([]string{
+		"--concurrency-matrix", "--requests", "10", "--body-path", "/body", "--stream-path", "/stream",
+		"--platform-operation", "d1.reads=2", "--platform-operation", "queue.ops=1",
+	}, &stdout, &stderr, func(context.Context, Config) (Report, error) {
+		calledSingle = true
+		return Report{}, nil
+	}, func(_ context.Context, cfg MatrixConfig) (MatrixReport, error) {
+		got = cfg
+		return MatrixReport{SchemaVersion: SchemaVersion, ConcurrencyMatrix: []int{1, 3, 10}}, nil
+	})
+	if code != 0 || calledSingle {
+		t.Fatalf("exit code = %d, single execute = %t; stdout=%s stderr=%s", code, calledSingle, stdout.String(), stderr.String())
+	}
+	if got.BodyPath != "/body" || got.StreamPath != "/stream" || got.PlatformOperations["d1.reads"] != 2 || got.PlatformOperations["queue.ops"] != 1 {
+		t.Fatalf("matrix config = %+v, want validated variants and operation counts", got)
+	}
+	var report MatrixReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.SchemaVersion != SchemaVersion {
+		t.Fatalf("matrix JSON = %q, unmarshal error = %v", stdout.String(), err)
+	}
+}
+
+func TestRunCLIRejectsMatrixOnlyFlagsWithoutMatrix(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+	code := runCLI([]string{"--platform-operation", "d1.reads=2"}, &stdout, &stderr, func(context.Context, Config) (Report, error) {
+		called = true
+		return Report{}, nil
+	})
+	if code != 2 || called || !strings.Contains(stdout.String(), "matrix options require") {
+		t.Fatalf("exit=%d called=%t stdout=%q, want rejected matrix-only flag", code, called, stdout.String())
 	}
 }
 

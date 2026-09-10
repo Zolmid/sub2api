@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { controlPlane } from "../src/control-plane";
+import { controlPlane, recoverStaleAdmissions } from "../src/control-plane";
 import {
   BRIDGE_VERSION,
   D1_BASE_SCHEMA_VERSION,
@@ -82,13 +82,29 @@ const release = (admission: Admission, targetEnv: Env = env) =>
     admission.lease.owner,
   );
 
+const start = (admission: Admission, targetEnv: Env = env) =>
+  call(
+    "/v1/requests/start",
+    {
+      request_id: admission.lease.request_id,
+      api_key_id: "3001",
+      account_id: admission.account.id,
+      lease_id: admission.lease.lease_id,
+      lease_epoch: admission.lease.epoch,
+      model: "fixture-model",
+      upstream_model: admission.upstream_model,
+    },
+    targetEnv,
+    admission.lease.owner,
+  );
+
 const completionFor = (
   admission: Admission,
   overrides: Partial<Completion> = {},
 ): Completion => ({
   schema_version: USAGE_SCHEMA_VERSION,
   event_type: USAGE_EVENT_TYPE,
-  event_id: `${admission.lease.request_id}:usage:v1`,
+  event_id: `${admission.lease.request_id}:usage:v2`,
   request_id: admission.lease.request_id,
   api_key_id: "3001",
   account_id: admission.account.id,
@@ -97,8 +113,15 @@ const completionFor = (
   outcome: "succeeded",
   usage_state: "confirmed",
   input_tokens: "11",
+  image_input_tokens: "0",
   output_tokens: "4",
+  image_output_tokens: "0",
+  cache_creation_tokens: "0",
+  cache_creation_5m_tokens: "0",
+  cache_creation_1h_tokens: "0",
   cache_read_tokens: "0",
+  service_tier: "",
+  reasoning_effort: "",
   model: "fixture-model",
   upstream_model: admission.upstream_model,
   upstream_request_id: "fixture-completion",
@@ -124,6 +147,47 @@ const failingQueueEnv = (): Env =>
       },
     } as unknown as Queue,
   });
+
+async function seedAccountScheduler(accountID: string): Promise<void> {
+  const observedAt = Date.now();
+  const freshUntil = observedAt + 4 * 60_000;
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO scheduler_account_runtime(account_id,capabilities_json,capabilities_evidence,capabilities_source,capabilities_observed_at_ms,capabilities_fresh_until_ms,quota_exhausted,quota_remaining_bps,quota_evidence,quota_source,quota_observed_at_ms,quota_fresh_until_ms,version,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ).bind(
+      accountID,
+      '{"platforms":["openai"],"accountTypes":["apikey"],"models":["fixture-model"]}',
+      "confirmed", "test.fixture", observedAt, freshUntil, 0, 10000,
+      "confirmed", "test.fixture", observedAt, freshUntil, 1, observedAt,
+    ),
+    env.DB.prepare(
+      "INSERT INTO scheduler_principal_limits(scope,principal_id,rpm_limit,evidence,source,observed_at_ms,fresh_until_ms,version,updated_at_ms) VALUES('account',?,100,'confirmed','test.fixture',?,?,1,?)",
+    ).bind(accountID, observedAt, freshUntil, observedAt),
+  ]);
+  const stub = env.ACCOUNT_LEASE.get(
+    env.ACCOUNT_LEASE.idFromName(`account:${accountID}`),
+  );
+  for (const [kind, value] of [
+    ["health_bps", 10000],
+    ["cooldown_until_ms", null],
+    ["temporary_until_ms", null],
+  ] as const) {
+    const response = await stub.fetch("https://lease/state/update", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: accountID,
+        kind,
+        value,
+        evidence: "confirmed",
+        source: "test.fixture",
+        observed_at_ms: observedAt,
+        fresh_until_ms: freshUntil,
+        version: 1,
+      }),
+    });
+    expect(response.status).toBe(200);
+  }
+}
 
 describe("D1-backed private control plane", () => {
   it("installs the schema with canonical decimal constraints", async () => {
@@ -241,6 +305,48 @@ describe("D1-backed private control plane", () => {
     expect((await release(admission)).status).toBe(200);
   });
 
+  it("replays bounded scheduled expiry without double-refunding or retaining a lease", async () => {
+    const admission = await admit("request-scheduled-recovery");
+    await env.DB.prepare(
+      "UPDATE billing_reservations SET created_at='2000-01-01T00:00:00Z' WHERE request_id=?",
+    ).bind(admission.lease.request_id).run();
+    await recoverStaleAdmissions(env);
+    await recoverStaleAdmissions(env);
+    expect(await env.DB.prepare(
+      "SELECT state FROM billing_reservations WHERE request_id=?",
+    ).bind(admission.lease.request_id).first("state")).toBe("released");
+    const inspected = await env.ACCOUNT_LEASE.getByName("account:4001").fetch(
+      "https://lease/inspect",
+      { method: "POST", body: JSON.stringify({ account_id: "4001" }) },
+    );
+    expect(await inspected.json()).toMatchObject({ in_flight: 0 });
+  });
+
+  it("returns one admission for ten retries and conflicts a changed semantic owner", async () => {
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () => call("/v1/requests/admit", {
+        request_id: "request-ten-retries",
+        api_key_id: "3001",
+        group_id: "2001",
+        model: "fixture-model",
+        lease_ttl_seconds: 30,
+      })),
+    );
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    const admissions = await Promise.all(
+      responses.map((response) => response.json<Admission>()),
+    );
+    expect(new Set(admissions.map((value) => value.lease.lease_id)).size).toBe(1);
+    expect((await call("/v1/requests/admit", {
+      request_id: "request-ten-retries",
+      api_key_id: "3001",
+      group_id: "2001",
+      model: "fixture-model",
+      lease_ttl_seconds: 30,
+    }, env, "container-test-b")).status).toBe(409);
+    expect((await release(admissions[0])).status).toBe(200);
+  });
+
   it("fails closed before leasing when the active price snapshot is unavailable", async () => {
     await env.DB.prepare("DELETE FROM pricing_active_version").run();
     const noLeaseEnv = overrideEnv({
@@ -309,6 +415,7 @@ describe("D1-backed private control plane", () => {
   it("chooses the smallest group-account priority and excludes deleted rows", async () => {
     await env.DB.prepare("INSERT INTO accounts(id,name,platform,type,status,schedulable,priority,max_concurrency,credential_envelope,extra_json,created_at,updated_at) VALUES('4002','lower priority','openai','apikey','active',1,1,1,'fixture:v1:mock-upstream','{}','now','now')").run();
     await env.DB.prepare("INSERT INTO account_groups(account_id,group_id) VALUES('4002','2001')").run();
+    await seedAccountScheduler("4002");
     const selected = await admit("request-priority-smallest");
     expect(selected.account.id).toBe("4002");
     await release(selected);
@@ -324,6 +431,7 @@ describe("D1-backed private control plane", () => {
     const targetEnv = failingQueueEnv();
     const admission = await admit("request-completion-idempotent", targetEnv);
     const completion = completionFor(admission);
+    expect((await start(admission, targetEnv)).status).toBe(204);
 
     expect(
       (
@@ -389,6 +497,7 @@ describe("D1-backed private control plane", () => {
 
   it("does not create an outbox row when completion identity mismatches", async () => {
     const admission = await admit("request-completion-mismatch");
+    expect((await start(admission)).status).toBe(204);
     const completion = completionFor(admission, { lease_epoch: "999" });
     const response = await call(
       "/v1/requests/complete",

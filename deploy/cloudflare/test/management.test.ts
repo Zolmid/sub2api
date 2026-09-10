@@ -40,6 +40,62 @@ async function createScope(tag: string) {
   return { userID, groupID, keyID, accountID };
 }
 
+async function confirmSchedulerAuthority(scope: Awaited<ReturnType<typeof createScope>>) {
+  const observedAt = Date.now();
+  const freshUntil = observedAt + 60_000;
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO scheduler_account_runtime(
+         account_id,capabilities_json,capabilities_evidence,capabilities_source,
+         capabilities_observed_at_ms,capabilities_fresh_until_ms,
+         quota_exhausted,quota_remaining_bps,quota_evidence,quota_source,
+         quota_observed_at_ms,quota_fresh_until_ms,version,updated_at_ms
+       ) VALUES(?,?,'confirmed','management-test',?,?,0,10000,'confirmed',
+                'management-test',?,?,1,?)`,
+    ).bind(
+      scope.accountID,
+      '{"platforms":["openai"],"accountTypes":["apikey"],"models":["fixture-model"]}',
+      observedAt,
+      freshUntil,
+      observedAt,
+      freshUntil,
+      observedAt,
+    ),
+    ...([
+      ["account", scope.accountID],
+      ["user", scope.userID],
+      ["api_key", scope.keyID],
+    ] as const).map(([rateScope, principalID]) => env.DB.prepare(
+      `INSERT INTO scheduler_principal_limits(
+         scope,principal_id,rpm_limit,evidence,source,observed_at_ms,
+         fresh_until_ms,version,updated_at_ms
+       ) VALUES(?,?,100,'confirmed','management-test',?,?,1,?)`,
+    ).bind(rateScope, principalID, observedAt, freshUntil, observedAt)),
+  ]);
+  const account = env.ACCOUNT_LEASE.getByName(`account:${scope.accountID}`);
+  for (const [kind, value] of [
+    ["health_bps", 10_000],
+    ["cooldown_until_ms", null],
+    ["temporary_until_ms", null],
+  ] as const) {
+    const response = await account.fetch("https://lease/state/update", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: scope.accountID,
+        kind,
+        value,
+        evidence: "confirmed",
+        source: "management-test",
+        observed_at_ms: observedAt,
+        fresh_until_ms: freshUntil,
+        version: 1,
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+  }
+}
+
 const userCreateBody = (
   operationID: string,
   userID: string,
@@ -317,6 +373,8 @@ describe("Stage C private management control plane", () => {
     expect(JSON.stringify(accountListRead)).not.toContain("credential_envelope");
     const encrypted = await env.DB.prepare("SELECT credential_envelope FROM accounts WHERE id=?").bind(scope.accountID).first("credential_envelope") as string;
     expect(encrypted).toMatch(/^aes-gcm:v1:/); expect(encrypted).not.toContain(upstreamKey); expect(encrypted).not.toContain(baseURL);
+    await confirmSchedulerAuthority(scope);
+    await env.DB.prepare("UPDATE users SET balance_e8_usd='100000000000',balance_version=balance_version+1 WHERE id=?").bind(scope.userID).run();
     const admission = await call("/v1/requests/admit", { request_id: "managed-admission-" + id(), api_key_id: scope.keyID, group_id: scope.groupID, model: "fixture-model", lease_ttl_seconds: 30 });
     expect(admission.status).toBe(200); expect(await admission.json()).toMatchObject({ account: { id: scope.accountID, credentials: { api_key: upstreamKey, base_url: baseURL } } });
     const rows = await env.DB.prepare("SELECT response_json FROM management_operations").all<{ response_json: string }>();
@@ -502,6 +560,8 @@ describe("Stage C private management control plane", () => {
     expect(replacementEnvelope).not.toBe(originalEnvelope);
     expect(replacementEnvelope).not.toContain(replacementSecret);
 
+    await confirmSchedulerAuthority(scope);
+    await env.DB.prepare("UPDATE users SET balance_e8_usd='100000000000',balance_version=balance_version+1 WHERE id=?").bind(scope.userID).run();
     const admission = await call("/v1/requests/admit", {
       request_id: "replacement-admission-" + id(),
       api_key_id: scope.keyID,

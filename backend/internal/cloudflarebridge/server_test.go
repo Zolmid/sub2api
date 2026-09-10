@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,19 +19,27 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type fakeControlPlane struct {
 	disabledTOTPControlPlane
-	mu          sync.Mutex
-	key         *service.APIKey
-	account     *service.Account
-	touchCount  int
-	completion  *CompletionRequest
-	release     *ReleaseRequest
-	renewCount  int
-	renewErr    error
-	leaseExpiry time.Time
+	mu            sync.Mutex
+	key           *service.APIKey
+	account       *service.Account
+	touchCount    int
+	admitCount    int
+	admitErr      error
+	startCount    int
+	start         *StartRequest
+	startErr      error
+	completion    *CompletionRequest
+	completionErr error
+	release       *ReleaseRequest
+	releaseCount  int
+	renewCount    int
+	renewErr      error
+	leaseExpiry   time.Time
 }
 
 func (f *fakeControlPlane) ResolveAPIKey(_ context.Context, key string) (*service.APIKey, error) {
@@ -48,6 +57,13 @@ func (f *fakeControlPlane) TouchAPIKey(context.Context, int64, time.Time) error 
 }
 
 func (f *fakeControlPlane) Admit(_ context.Context, request AdmissionRequest) (*Admission, error) {
+	f.mu.Lock()
+	f.admitCount++
+	admitErr := f.admitErr
+	f.mu.Unlock()
+	if admitErr != nil {
+		return nil, admitErr
+	}
 	expiresAt := f.leaseExpiry
 	if expiresAt.IsZero() {
 		expiresAt = time.Now().Add(time.Minute)
@@ -89,12 +105,22 @@ func (f *fakeControlPlane) Complete(_ context.Context, request CompletionRequest
 	defer f.mu.Unlock()
 	copy := request
 	f.completion = &copy
-	return nil
+	return f.completionErr
+}
+
+func (f *fakeControlPlane) Start(_ context.Context, request StartRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCount++
+	copy := request
+	f.start = &copy
+	return f.startErr
 }
 
 func (f *fakeControlPlane) Release(_ context.Context, request ReleaseRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.releaseCount++
 	copy := request
 	f.release = &copy
 	return nil
@@ -106,11 +132,18 @@ type fakeHTTPUpstream struct {
 	authorization  string
 	body           []byte
 	requestContext context.Context
+	responseBody   string
+	contentType    string
+	networkCalls   int
+	beforeNetwork  func()
 }
 
 type blockingHTTPUpstream struct{}
 
 func (blockingHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		return nil, err
+	}
 	<-req.Context().Done()
 	return nil, req.Context().Err()
 }
@@ -124,6 +157,9 @@ type delayedSSEHTTPUpstream struct {
 }
 
 func (d delayedSSEHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		return nil, err
+	}
 	reader, writer := io.Pipe()
 	go func() {
 		select {
@@ -152,19 +188,37 @@ func (d delayedSSEHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, ac
 }
 
 func (f *fakeHTTPUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	// The production HTTPUpstream invokes the same marker immediately before
+	// its transport round trip. Keep this fake at that boundary so bridge unit
+	// tests can prove a failed marker dispatches zero upstream bytes.
+	if err := service.MarkCloudflareUpstreamStarted(req.Context()); err != nil {
+		return nil, err
+	}
+	if f.beforeNetwork != nil {
+		f.beforeNetwork()
+	}
 	f.mu.Lock()
+	f.networkCalls++
 	f.requestURL = req.URL.String()
 	f.authorization = req.Header.Get("Authorization")
 	f.body, _ = io.ReadAll(req.Body)
 	f.requestContext = req.Context()
+	responseBody := f.responseBody
+	contentType := f.contentType
 	f.mu.Unlock()
+	if responseBody == "" {
+		responseBody = `{"id":"chatcmpl_cf","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`
+	}
+	if contentType == "" {
+		contentType = "application/json"
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header: http.Header{
-			"Content-Type": []string{"application/json"},
+			"Content-Type": []string{contentType},
 			"X-Request-Id": []string{"upstream-unit-test"},
 		},
-		Body: io.NopCloser(strings.NewReader(`{"id":"chatcmpl_cf","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)),
+		Body: io.NopCloser(strings.NewReader(responseBody)),
 	}, nil
 }
 
@@ -226,6 +280,28 @@ func testControlPlane() *fakeControlPlane {
 	}
 }
 
+func serveGatewayRequest(t *testing.T, handler http.Handler, path, apiKey, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	return res
+}
+
+func openAIResponsesSSE(id, model, text string, inputTokens, outputTokens int) string {
+	return strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"` + id + `","object":"response","status":"in_progress","model":"` + model + `","output":[]}}`,
+		`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"` + text + `"}`,
+		`data: {"type":"response.completed","response":{"id":"` + id + `","object":"response","status":"completed","model":"` + model + `","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"` + text + `"}]}],"usage":{"input_tokens":` + strconv.Itoa(inputTokens) + `,"output_tokens":` + strconv.Itoa(outputTokens) + `,"total_tokens":` + strconv.Itoa(inputTokens+outputTokens) + `}}}`,
+		"data: [DONE]",
+		"",
+	}, "\n\n")
+}
+
 func TestCloudflareHandlerUsesBaselineAuthAndOpenAIForwarder(t *testing.T) {
 	control := testControlPlane()
 	upstream := &fakeHTTPUpstream{}
@@ -250,6 +326,14 @@ func TestCloudflareHandlerUsesBaselineAuthAndOpenAIForwarder(t *testing.T) {
 	control.mu.Lock()
 	defer control.mu.Unlock()
 	require.Equal(t, 1, control.touchCount)
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.start)
+	require.Equal(t, "4001", control.start.APIKeyID)
+	require.Equal(t, "3001", control.start.AccountID)
+	require.Equal(t, "lease-unit-test", control.start.LeaseID)
+	require.Equal(t, "1", control.start.LeaseEpoch)
+	require.Equal(t, "test-model", control.start.Model)
+	require.Equal(t, "mock-upstream-model", control.start.UpstreamModel)
 	require.NotNil(t, control.completion)
 	require.Equal(t, UsageSchemaVersion, control.completion.SchemaVersion)
 	require.Equal(t, UsageEventType, control.completion.EventType)
@@ -258,8 +342,485 @@ func TestCloudflareHandlerUsesBaselineAuthAndOpenAIForwarder(t *testing.T) {
 	require.Equal(t, "3", control.completion.InputTokens)
 	require.Equal(t, "2", control.completion.OutputTokens)
 	require.Equal(t, "upstream-unit-test", control.completion.UpstreamID)
+	require.Nil(t, control.release)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerResponsesNonStreamUsesMappedModelAndLifecycle(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	upstream := &fakeHTTPUpstream{
+		responseBody: `{"id":"resp_cf","object":"response","status":"completed","model":"mock-upstream-model","service_tier":"priority","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"response ok"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`,
+	}
+	startBeforeNetwork := false
+	upstream.beforeNetwork = func() {
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		startBeforeNetwork = control.startCount == 1
+	}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/responses", "sk-cloudflare-unit-test", `{"model":"client-responses-model","input":"hello","stream":false,"service_tier":"priority","reasoning":{"effort":"high"}}`)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	require.Equal(t, "resp_cf", gjson.Get(res.Body.String(), "id").String())
+	require.True(t, startBeforeNetwork)
+	upstream.mu.Lock()
+	require.Equal(t, 1, upstream.networkCalls)
+	require.Equal(t, "https://mock.upstream/v1/responses", upstream.requestURL)
+	require.Equal(t, "mock-upstream-model", gjson.GetBytes(upstream.body, "model").String())
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.completion)
+	require.Equal(t, "client-responses-model", control.completion.Model)
+	require.Equal(t, "mock-upstream-model", control.completion.UpstreamModel)
+	require.Equal(t, "7", control.completion.InputTokens)
+	require.Equal(t, "3", control.completion.OutputTokens)
+	require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	require.Equal(t, "priority", control.completion.ServiceTier)
+	require.Equal(t, "high", control.completion.ReasoningEffort)
+	require.Equal(t, "upstream-unit-test", control.completion.UpstreamID)
+	require.Equal(t, control.completion.RequestID+":usage:v2", control.completion.EventID)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerMessagesNonStreamUsesMappedModelAndLifecycle(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	upstream := &fakeHTTPUpstream{
+		contentType:  "text/event-stream",
+		responseBody: openAIResponsesSSE("resp_messages", "mock-upstream-model", "message ok", 5, 2),
+	}
+	startBeforeNetwork := false
+	upstream.beforeNetwork = func() {
+		control.mu.Lock()
+		defer control.mu.Unlock()
+		startBeforeNetwork = control.startCount == 1
+	}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/messages", "sk-cloudflare-unit-test", `{"model":"client-messages-model","max_tokens":32,"messages":[{"role":"user","content":"hello"}],"output_config":{"effort":"high"},"stream":false}`)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	require.Equal(t, "message ok", gjson.Get(res.Body.String(), "content.0.text").String())
+	require.True(t, startBeforeNetwork)
+	upstream.mu.Lock()
+	require.Equal(t, 1, upstream.networkCalls)
+	require.Equal(t, "https://mock.upstream/v1/responses", upstream.requestURL)
+	require.Equal(t, "mock-upstream-model", gjson.GetBytes(upstream.body, "model").String())
+	require.True(t, gjson.GetBytes(upstream.body, "stream").Bool())
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.NotNil(t, control.completion)
+	require.Equal(t, "client-messages-model", control.completion.Model)
+	require.Equal(t, "mock-upstream-model", control.completion.UpstreamModel)
+	require.Equal(t, "5", control.completion.InputTokens)
+	require.Equal(t, "2", control.completion.OutputTokens)
+	require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	require.Equal(t, "high", control.completion.ReasoningEffort)
+	require.Equal(t, "upstream-unit-test", control.completion.UpstreamID)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerNewProtocolsStreamAndPersistUsage(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		wantOutput string
+	}{
+		{
+			name:       "responses",
+			path:       "/v1/responses",
+			body:       `{"model":"client-stream-model","input":"hello","stream":true}`,
+			wantOutput: "response.completed",
+		},
+		{
+			name:       "messages",
+			path:       "/v1/messages",
+			body:       `{"model":"client-stream-model","max_tokens":32,"messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			wantOutput: "message_stop",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+			upstream := &fakeHTTPUpstream{
+				contentType:  "text/event-stream",
+				responseBody: openAIResponsesSSE("resp_stream", "mock-upstream-model", "stream ok", 11, 4),
+			}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, tt.path, "sk-cloudflare-unit-test", tt.body)
+
+			require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+			require.Contains(t, res.Body.String(), tt.wantOutput)
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, 1, control.admitCount)
+			require.Equal(t, 1, control.startCount)
+			require.NotNil(t, control.completion)
+			require.Equal(t, OutcomeSucceeded, control.completion.Outcome)
+			require.Equal(t, UsageConfirmed, control.completion.UsageState)
+			require.Equal(t, "11", control.completion.InputTokens)
+			require.Equal(t, "4", control.completion.OutputTokens)
+			require.Zero(t, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareHandlerNewProtocolsDoNotFabricateUsage(t *testing.T) {
+	tests := []struct {
+		name           string
+		path           string
+		requestBody    string
+		responseBody   string
+		contentType    string
+		expectedState  string
+		expectedStatus int
+	}{
+		{
+			name:           "responses explicit all-zero usage",
+			path:           "/v1/responses",
+			requestBody:    `{"model":"client-model","input":"hello","stream":false}`,
+			responseBody:   `{"id":"resp_zero","object":"response","status":"completed","model":"mock-upstream-model","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`,
+			contentType:    "application/json",
+			expectedState:  UsageConfirmed,
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "responses missing usage",
+			path:           "/v1/responses",
+			requestBody:    `{"model":"client-model","input":"hello","stream":false}`,
+			responseBody:   `{"id":"resp_unknown","object":"response","status":"completed","model":"mock-upstream-model","output":[]}`,
+			contentType:    "application/json",
+			expectedState:  UsageUnknown,
+			expectedStatus: http.StatusBadGateway,
+		},
+		{
+			name:           "messages explicit all-zero usage",
+			path:           "/v1/messages",
+			requestBody:    `{"model":"client-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}`,
+			responseBody:   openAIResponsesSSE("resp_messages_zero", "mock-upstream-model", "ok", 0, 0),
+			contentType:    "text/event-stream",
+			expectedState:  UsageConfirmed,
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:        "messages missing usage",
+			path:        "/v1/messages",
+			requestBody: `{"model":"client-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}`,
+			responseBody: strings.Join([]string{
+				`data: {"type":"response.completed","response":{"id":"resp_messages_unknown","object":"response","status":"completed","model":"mock-upstream-model","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}}`,
+				"data: [DONE]",
+				"",
+			}, "\n\n"),
+			contentType:    "text/event-stream",
+			expectedState:  UsageUnknown,
+			expectedStatus: http.StatusOK,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+			upstream := &fakeHTTPUpstream{responseBody: tt.responseBody, contentType: tt.contentType}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, tt.path, "sk-cloudflare-unit-test", tt.requestBody)
+
+			require.Equal(t, tt.expectedStatus, res.Code, res.Body.String())
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.NotNil(t, control.completion)
+			require.Equal(t, tt.expectedState, control.completion.UsageState)
+			require.Equal(t, "0", control.completion.InputTokens)
+			require.Equal(t, "0", control.completion.OutputTokens)
+		})
+	}
+}
+
+func TestCloudflareHandlerNewProtocolsBufferUntilSettlement(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		requestBody  string
+		upstreamBody string
+		contentType  string
+		privateValue string
+		wantError    string
+	}{
+		{
+			name:         "responses",
+			path:         "/v1/responses",
+			requestBody:  `{"model":"client-model","input":"hello","stream":false}`,
+			upstreamBody: `{"id":"resp_private","object":"response","status":"completed","model":"mock-upstream-model","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+			contentType:  "application/json",
+			privateValue: "resp_private",
+			wantError:    "BILLING_COMMIT_FAILED",
+		},
+		{
+			name:         "messages",
+			path:         "/v1/messages",
+			requestBody:  `{"model":"client-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}`,
+			upstreamBody: openAIResponsesSSE("resp_private_messages", "mock-upstream-model", "private message", 1, 1),
+			contentType:  "text/event-stream",
+			privateValue: "private message",
+			wantError:    `"type":"api_error"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+			control.completionErr = errors.New("injected completion failure")
+			upstream := &fakeHTTPUpstream{responseBody: tt.upstreamBody, contentType: tt.contentType}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, tt.path, "sk-cloudflare-unit-test", tt.requestBody)
+
+			require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+			require.Contains(t, res.Body.String(), tt.wantError)
+			require.NotContains(t, res.Body.String(), tt.privateValue)
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.NotNil(t, control.completion)
+			require.Equal(t, 1, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareHandlerStreamingSettlementFailureDoesNotAppendProtocolError(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	control.completionErr = errors.New("injected completion failure")
+	upstream := &fakeHTTPUpstream{
+		contentType:  "text/event-stream",
+		responseBody: openAIResponsesSSE("resp_visible", "mock-upstream-model", "visible", 2, 1),
+	}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	res := serveGatewayRequest(t, handler, "/v1/responses", "sk-cloudflare-unit-test", `{"model":"client-model","input":"hello","stream":true}`)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	require.Contains(t, res.Body.String(), "resp_visible")
+	require.NotContains(t, res.Body.String(), "BILLING_COMMIT_FAILED")
+	require.NotContains(t, res.Body.String(), "UPSTREAM_ERROR")
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.NotNil(t, control.completion)
+	require.Equal(t, 1, control.releaseCount)
+}
+
+func TestCloudflareHandlerNewProtocolsRejectBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		body         string
+		apiKey       string
+		admissionErr error
+		wantAdmits   int
+		wantStatus   int
+	}{
+		{name: "responses authentication", path: "/v1/responses", body: `{"model":"test-model","input":"hello"}`, apiKey: "wrong-key", wantStatus: http.StatusUnauthorized},
+		{name: "responses admission", path: "/v1/responses", body: `{"model":"test-model","input":"hello"}`, apiKey: "sk-cloudflare-unit-test", admissionErr: ErrAdmissionRejected, wantAdmits: 1, wantStatus: http.StatusTooManyRequests},
+		{name: "messages authentication", path: "/v1/messages", body: `{"model":"test-model","max_tokens":16,"messages":[]}`, apiKey: "wrong-key", wantStatus: http.StatusUnauthorized},
+		{name: "messages admission", path: "/v1/messages", body: `{"model":"test-model","max_tokens":16,"messages":[]}`, apiKey: "sk-cloudflare-unit-test", admissionErr: ErrAdmissionRejected, wantAdmits: 1, wantStatus: http.StatusTooManyRequests},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			control.admitErr = tt.admissionErr
+			upstream := &fakeHTTPUpstream{}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			res := serveGatewayRequest(t, handler, tt.path, tt.apiKey, tt.body)
+
+			require.Equal(t, tt.wantStatus, res.Code, res.Body.String())
+			upstream.mu.Lock()
+			require.Zero(t, upstream.networkCalls)
+			upstream.mu.Unlock()
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.Equal(t, tt.wantAdmits, control.admitCount)
+			require.Zero(t, control.startCount)
+			require.Nil(t, control.completion)
+			require.Zero(t, control.releaseCount)
+		})
+	}
+}
+
+func TestCloudflareResponsesLeaseLossCancelsUpstreamAndSettlesOnce(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	control.leaseExpiry = time.Now().Add(100 * time.Millisecond)
+	control.renewErr = errors.New("injected renewal failure")
+	runtime := testRuntimeConfig(t)
+	runtime.LeaseTTLSeconds = 3
+	handler, err := NewHandler(runtime, control, blockingHTTPUpstream{})
+	require.NoError(t, err)
+
+	started := time.Now()
+	res := serveGatewayRequest(t, handler, "/v1/responses", "sk-cloudflare-unit-test", `{"model":"test-model","input":"hello","stream":false}`)
+
+	require.Less(t, time.Since(started), 2500*time.Millisecond)
+	require.Equal(t, http.StatusServiceUnavailable, res.Code, res.Body.String())
+	require.Contains(t, res.Body.String(), "ACCOUNT_LEASE_LOST")
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.admitCount)
+	require.Equal(t, 1, control.startCount)
+	require.GreaterOrEqual(t, control.renewCount, 1)
+	require.NotNil(t, control.completion)
+	require.Equal(t, OutcomeFailed, control.completion.Outcome)
+	require.Equal(t, UsageUnknown, control.completion.UsageState)
+	require.Zero(t, control.releaseCount)
+}
+
+func TestCloudflareHandlerBlocksNetworkWhenStartMarkerFails(t *testing.T) {
+	control := testControlPlane()
+	control.startErr = errors.New("injected start marker failure")
+	upstream := &fakeHTTPUpstream{}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+	upstream.mu.Lock()
+	require.Zero(t, upstream.networkCalls)
+	upstream.mu.Unlock()
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.Equal(t, 1, control.startCount)
+	require.Nil(t, control.completion)
 	require.NotNil(t, control.release)
-	require.Equal(t, "lease-unit-test", control.release.LeaseID)
+	require.Equal(t, 1, control.releaseCount)
+}
+
+func TestCloudflareHandlerDoesNotReleaseBufferedSuccessWhenCompletionCommitFails(t *testing.T) {
+	control := testControlPlane()
+	control.completionErr = errors.New("injected completion commit failure")
+	upstream := &fakeHTTPUpstream{}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":false}`),
+	)
+	req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	require.Equal(t, http.StatusBadGateway, res.Code, res.Body.String())
+	require.Contains(t, res.Body.String(), "BILLING_COMMIT_FAILED")
+	require.NotContains(t, res.Body.String(), "chatcmpl_cf")
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.NotNil(t, control.completion)
+	require.NotNil(t, control.release)
+	require.Equal(t, 1, control.releaseCount)
+}
+
+func TestCloudflareHandlerSeparatesUsagePresenceFromZeroCounters(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseBody  string
+		expectedState string
+	}{
+		{
+			name:          "present all zero",
+			responseBody:  `{"id":"chatcmpl_zero","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+			expectedState: UsageConfirmed,
+		},
+		{
+			name:          "usage absent",
+			responseBody:  `{"id":"chatcmpl_absent","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+			expectedState: UsageUnknown,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			control := testControlPlane()
+			upstream := &fakeHTTPUpstream{responseBody: tt.responseBody}
+			handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+			require.NoError(t, err)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":false}`))
+			req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+			req.Header.Set("Content-Type", "application/json")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+
+			require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+			control.mu.Lock()
+			defer control.mu.Unlock()
+			require.NotNil(t, control.completion)
+			require.Equal(t, tt.expectedState, control.completion.UsageState)
+			require.Equal(t, "0", control.completion.InputTokens)
+			require.Equal(t, "0", control.completion.OutputTokens)
+			require.Equal(t, "0", control.completion.CacheReadTokens)
+		})
+	}
+}
+
+func TestUpstreamStartMarkerIsNoopForTraditionalContext(t *testing.T) {
+	upstream := &fakeHTTPUpstream{}
+	req := httptest.NewRequest(http.MethodPost, "https://mock.upstream/v1/chat/completions", strings.NewReader(`{}`))
+	resp, err := upstream.Do(req, "", 1, 1)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NoError(t, resp.Body.Close())
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	require.Equal(t, 1, upstream.networkCalls)
+}
+
+func TestCloudflareHandlerConfirmsAllZeroResponsesUsage(t *testing.T) {
+	control := testControlPlane()
+	control.account.Extra = map[string]any{openai_compat.ExtraKeyResponsesSupported: true}
+	upstream := &fakeHTTPUpstream{
+		contentType: "text/event-stream",
+		responseBody: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_zero\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"mock-upstream-model\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n" +
+			"data: [DONE]\n\n",
+	}
+	handler, err := NewHandler(testRuntimeConfig(t), control, upstream)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer sk-cloudflare-unit-test")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	require.Equal(t, http.StatusOK, res.Code, res.Body.String())
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	require.NotNil(t, control.completion)
+	require.Equal(t, UsageConfirmed, control.completion.UsageState)
+	require.Equal(t, "0", control.completion.InputTokens)
+	require.Equal(t, "0", control.completion.OutputTokens)
 }
 
 func TestCloudflareHandlerRejectsUnknownAPIKeyBeforeAdmission(t *testing.T) {
@@ -329,7 +890,8 @@ func TestLeaseExpiryCancelsActiveUpstreamRequest(t *testing.T) {
 	require.NotNil(t, control.completion)
 	require.Equal(t, OutcomeFailed, control.completion.Outcome)
 	require.Equal(t, UsageUnknown, control.completion.UsageState)
-	require.NotNil(t, control.release)
+	require.Nil(t, control.release)
+	require.Zero(t, control.releaseCount)
 }
 
 func TestLongSilentSSEStreamRenewsLeaseAndPersistsUsage(t *testing.T) {
@@ -362,5 +924,6 @@ func TestLongSilentSSEStreamRenewsLeaseAndPersistsUsage(t *testing.T) {
 	require.Equal(t, "11", control.completion.InputTokens)
 	require.Equal(t, "4", control.completion.OutputTokens)
 	require.Equal(t, "upstream-sse-unit-test", control.completion.UpstreamID)
-	require.NotNil(t, control.release)
+	require.Nil(t, control.release)
+	require.Zero(t, control.releaseCount)
 }

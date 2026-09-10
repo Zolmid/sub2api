@@ -92,8 +92,9 @@ func (r *ManagedUserReader) GetByID(ctx context.Context, id int64) (*service.Use
 }
 
 // ManagedGroupReader adapts the private Worker protocol to APIKeyService's
-// narrow group dependency. Only standard OpenAI groups are admitted until the
-// remaining group fields and subscription entitlement model are migrated.
+// narrow group dependency. Standard and subscription OpenAI groups use the
+// same non-secret group projection; subscription limits remain authoritative
+// in the live subscription snapshot, never in Group.
 type ManagedGroupReader struct {
 	control ControlPlane
 }
@@ -360,7 +361,8 @@ func decodeManagedAccount(wire managedAccountWire) (*ManagedAccount, bool, error
 }
 
 func ensureManagedGroupInCurrentSlice(group *service.Group) error {
-	if group == nil || group.Platform != service.PlatformOpenAI || group.SubscriptionType != service.SubscriptionTypeStandard {
+	if group == nil || group.Platform != service.PlatformOpenAI ||
+		(group.SubscriptionType != service.SubscriptionTypeStandard && group.SubscriptionType != service.SubscriptionTypeSubscription) {
 		return ErrNotMigrated
 	}
 	return nil

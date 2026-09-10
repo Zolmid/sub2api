@@ -163,15 +163,21 @@ func TestHTTPControlPlaneListActiveManagedGroupsPaginatesAndFilters(t *testing.T
 	require.Equal(t, int32(2), calls.Load())
 }
 
-func TestHTTPControlPlaneManagedGroupFailsClosedOutsideCurrentSlice(t *testing.T) {
+func TestHTTPControlPlaneManagedGroupPermitsSubscriptionGroupsWithoutInventingLimits(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"group":{"id":"42","name":"subscription","platform":"openai","status":"active","is_exclusive":false,"subscription_type":"subscription","created_at":"2026-09-06T01:02:03Z","updated_at":"2026-09-06T02:03:04Z","deleted_at":null}}`)
 	}))
 	defer server.Close()
 	client, err := NewHTTPControlPlane(server.URL, server.Client())
 	require.NoError(t, err)
-	_, err = client.GetManagedGroup(context.Background(), 42)
-	require.ErrorIs(t, err, ErrNotMigrated)
+	group, err := client.GetManagedGroup(context.Background(), 42)
+	require.NoError(t, err)
+	require.Equal(t, service.SubscriptionTypeSubscription, group.SubscriptionType)
+	// Group remains identity/authorization metadata. Subscription E8 limits are
+	// intentionally only available on the live subscription snapshot.
+	require.Nil(t, group.DailyLimitUSD)
+	require.Nil(t, group.WeeklyLimitUSD)
+	require.Nil(t, group.MonthlyLimitUSD)
 }
 
 func TestHTTPControlPlaneManagedGroupListRejectsNonAdvancingCursor(t *testing.T) {

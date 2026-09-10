@@ -37,6 +37,23 @@ type ControlPlane interface {
 	Release(ctx context.Context, request ReleaseRequest) error
 }
 
+// SubscriptionControlPlane is the private, authoritative subscription runtime
+// contract.  It intentionally exposes Worker records and cursor pagination,
+// rather than the traditional PostgreSQL repository contract.
+type SubscriptionControlPlane interface {
+	GetSubscription(context.Context, SubscriptionGetRequest) (*Subscription, error)
+	ListSubscriptions(context.Context, SubscriptionListRequest) (*SubscriptionPage, error)
+	AssignOrExtendSubscription(context.Context, SubscriptionAssignOrExtendRequest) (*SubscriptionMutationResult, error)
+	RevokeSubscription(context.Context, SubscriptionRevokeRequest) (*Subscription, error)
+	RestoreSubscription(context.Context, SubscriptionRestoreRequest) (*Subscription, error)
+	ExtendSubscription(context.Context, SubscriptionExtendRequest) (*Subscription, error)
+	ActivateSubscriptionWindows(context.Context, SubscriptionActivateWindowsRequest) (*Subscription, error)
+	MaintainSubscriptionWindows(context.Context, SubscriptionMaintainWindowsRequest) (*Subscription, error)
+	ResetSubscriptionWindows(context.Context, SubscriptionResetWindowsRequest) (*Subscription, error)
+	ReserveSubscriptionUsage(context.Context, SubscriptionReserveUsageRequest) (*Subscription, error)
+	SweepExpiredSubscriptions(context.Context, SubscriptionSweepExpiredRequest) (*SubscriptionSweepResult, error)
+}
+
 // AdmissionRequest uses decimal strings for all persistent identifiers so the
 // Go int64 -> JSON -> JavaScript -> D1 boundary never relies on IEEE-754 safe
 // integer coercion.

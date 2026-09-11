@@ -294,6 +294,7 @@ func TestGatewayServiceRecordUsage_EmptyImageSizeDefaultsBeforeBillingAndPersist
 
 func TestGatewayServiceRecordUsage_PeakRateAffectsTokenModeImageOutputTokens(t *testing.T) {
 	groupID := int64(902)
+	pricingAt := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
 	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
 	userRepo := &openAIRecordUsageUserRepoStub{}
 	svc := newGatewayRecordUsageServiceForTest(usageRepo, userRepo, &openAIRecordUsageSubRepoStub{})
@@ -324,8 +325,9 @@ func TestGatewayServiceRecordUsage_PeakRateAffectsTokenModeImageOutputTokens(t *
 				PeakRateMultiplier: 3.0,
 			},
 		},
-		User:    &User{ID: 602},
-		Account: &Account{ID: 702},
+		User:      &User{ID: 602},
+		Account:   &Account{ID: 702},
+		PricingAt: pricingAt,
 	})
 
 	require.NoError(t, err)

@@ -61,7 +61,7 @@ func parseGeminiGatewayRequest(c *gin.Context, body []byte) (geminiGatewayReques
 
 func (f *geminiGatewayForwarder) Forward(ctx context.Context, c *gin.Context, account *service.Account, body []byte, model, mappedModel string) (*service.OpenAIForwardResult, error) {
 	if f == nil || f.responses == nil {
-		return nil, errors.New("Gemini gateway forwarder is unavailable")
+		return nil, errors.New("gemini gateway forwarder is unavailable")
 	}
 	request, err := cloudflareprotocol.DecodeRequestWithOptions(cloudflareprotocol.Gemini, body, cloudflareprotocol.DecodeOptions{Model: model})
 	if err != nil {
@@ -106,7 +106,7 @@ func (f *geminiGatewayForwarder) Forward(ctx context.Context, c *gin.Context, ac
 
 func encodeGeminiAsResponsesRequest(request cloudflareprotocol.Request, stream bool) ([]byte, error) {
 	if len(request.StopSequences) != 0 {
-		return nil, errors.New("Gemini generationConfig.stopSequences is not supported by the Cloudflare Responses bridge")
+		return nil, errors.New("gemini generationConfig.stopSequences is not supported by the Cloudflare Responses bridge")
 	}
 	input := make([]any, 0, len(request.Messages))
 	for _, message := range request.Messages {
@@ -116,7 +116,7 @@ func encodeGeminiAsResponsesRequest(request cloudflareprotocol.Request, stream b
 			role = "assistant"
 		case cloudflareprotocol.RoleSystem, cloudflareprotocol.RoleDeveloper, cloudflareprotocol.RoleUser:
 		default:
-			return nil, fmt.Errorf("Gemini message role %q is not supported", message.Role)
+			return nil, fmt.Errorf("gemini message role %q is not supported", message.Role)
 		}
 		content := make([]any, 0, len(message.Parts))
 		for _, part := range message.Parts {

@@ -1231,6 +1231,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					}
 					return s.handleErrorResponse(ctx, compactResp, c, account, body, resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel))
 				}
+				var failoverErr *UpstreamFailoverError
+				if errors.As(err, &failoverErr) {
+					// A streaming handler may return partial usage together with a
+					// failover error. The handler must see a nil result so it can
+					// retry the account; returning the partial result would make the
+					// failed attempt look successful and can double-count usage.
+					return nil, err
+				}
 				if streamResult == nil {
 					return nil, err
 				}

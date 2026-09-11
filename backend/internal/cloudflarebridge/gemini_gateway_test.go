@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -166,6 +167,49 @@ func TestGeminiStreamBoundsUnfinishedFrameBuffer(t *testing.T) {
 
 	require.ErrorContains(t, err, "unfinished upstream SSE frame")
 	require.Error(t, context.Cause(ctx))
+}
+
+func TestGeminiStreamFramesLFAndCRLFAcrossArbitraryWrites(t *testing.T) {
+	lfPayload := geminiTerminalSSE("response.completed", "completed", "split text")
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "LF", payload: lfPayload},
+		{name: "CRLF", payload: strings.ReplaceAll(lfPayload, "\n", "\r\n")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for split := 1; split < len(tt.payload); split++ {
+				t.Run(fmt.Sprintf("split_%d", split), func(t *testing.T) {
+					assertGeminiStreamChunks(t, tt.payload[:split], tt.payload[split:])
+				})
+			}
+			t.Run("byte_by_byte", func(t *testing.T) {
+				chunks := make([]string, 0, len(tt.payload))
+				for i := range tt.payload {
+					chunks = append(chunks, tt.payload[i:i+1])
+				}
+				assertGeminiStreamChunks(t, chunks...)
+			})
+		})
+	}
+}
+
+func assertGeminiStreamChunks(t *testing.T, chunks ...string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	relay := newGeminiStreamResponseWriter(c.Writer, ctx, cancel)
+	for _, chunk := range chunks {
+		_, err := relay.Write([]byte(chunk))
+		require.NoError(t, err)
+	}
+	require.NoError(t, relay.finish())
+	require.Contains(t, recorder.Body.String(), `"text":"split text"`)
+	require.Contains(t, recorder.Body.String(), `"finishReason":"STOP"`)
+	require.Contains(t, recorder.Body.String(), `"promptTokenCount":2`)
 }
 
 func geminiTerminalSSE(eventType, status, text string) string {

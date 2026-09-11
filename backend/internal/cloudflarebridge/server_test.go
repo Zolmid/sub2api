@@ -1146,8 +1146,10 @@ func TestCloudflareGeminiRejectsInvalidRoutesAndRequestsBeforeUpstream(t *testin
 		{name: "stream without sse", path: "/v1beta/models/gemini:streamGenerateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
 		{name: "generate query", path: "/v1beta/models/gemini:generateContent?alt=sse", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}]}`},
 		{name: "inline data", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"AA"}}]}]}`},
-		{name: "tools", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}],"tools":[]}`},
-		{name: "tool config", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}],"toolConfig":{}}`},
+		{name: "stop sequences", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}],"generationConfig":{"stopSequences":["stop"]}}`},
+		{name: "file data", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"fileData":{"mimeType":"image/png","fileUri":"https://example.com/image.png"}}]}]}`},
+		{name: "tools", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}}]}]}`},
+		{name: "tool config", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"parts":[{"text":"x"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}}}`},
 		{name: "function call", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]}]}`},
 		{name: "function response", path: "/v1beta/models/gemini:generateContent", apiKey: "sk-cloudflare-unit-test", body: `{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"value":"x"}}}]}]}`},
 	}

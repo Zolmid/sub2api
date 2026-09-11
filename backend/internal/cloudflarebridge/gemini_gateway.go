@@ -58,63 +58,39 @@ func parseGeminiGatewayRequest(c *gin.Context, body []byte) (geminiGatewayReques
 	default:
 		return geminiGatewayRequest{}, errors.New("unsupported Gemini action")
 	}
-	if err := rejectUnsupportedGeminiBridgeFeatures(body); err != nil {
-		return geminiGatewayRequest{}, err
-	}
-	if _, err := cloudflareprotocol.DecodeRequestWithOptions(cloudflareprotocol.Gemini, body, cloudflareprotocol.DecodeOptions{Model: model}); err != nil {
+	request, err := cloudflareprotocol.DecodeRequestWithOptions(cloudflareprotocol.Gemini, body, cloudflareprotocol.DecodeOptions{Model: model})
+	if err != nil {
 		return geminiGatewayRequest{}, fmt.Errorf("invalid Gemini request: %w", err)
+	}
+	if err := rejectUnsupportedGeminiBridgeFeatures(request); err != nil {
+		return geminiGatewayRequest{}, err
 	}
 	return geminiGatewayRequest{model: model, stream: stream}, nil
 }
 
-func rejectUnsupportedGeminiBridgeFeatures(body []byte) error {
-	var value any
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		// The strict protocol decoder below owns malformed-request reporting.
-		return nil
+func rejectUnsupportedGeminiBridgeFeatures(request cloudflareprotocol.Request) error {
+	if len(request.StopSequences) != 0 {
+		return errors.New("gemini generationConfig.stopSequences is not supported by the Cloudflare Responses bridge")
 	}
-	root, ok := value.(map[string]any)
-	if !ok {
-		return nil
-	}
-	if _, exists := root["tools"]; exists {
+	if len(request.Tools) != 0 {
 		return errors.New("gemini tools are not supported by the Cloudflare Responses bridge")
 	}
-	if _, exists := root["toolConfig"]; exists {
+	if request.ToolChoice.Mode != "" {
 		return errors.New("gemini toolConfig is not supported by the Cloudflare Responses bridge")
 	}
-	for _, field := range [...]string{"systemInstruction", "contents"} {
-		if jsonValueContainsKey(root[field], "functionCall") {
-			return errors.New("gemini functionCall is not supported by the Cloudflare Responses bridge")
-		}
-		if jsonValueContainsKey(root[field], "functionResponse") {
-			return errors.New("gemini functionResponse is not supported by the Cloudflare Responses bridge")
+	for _, message := range request.Messages {
+		for _, part := range message.Parts {
+			switch part.Kind {
+			case cloudflareprotocol.PartMediaRef:
+				return errors.New("gemini fileData media references are not supported by the Cloudflare Responses bridge")
+			case cloudflareprotocol.PartToolCall:
+				return errors.New("gemini functionCall is not supported by the Cloudflare Responses bridge")
+			case cloudflareprotocol.PartToolResult:
+				return errors.New("gemini functionResponse is not supported by the Cloudflare Responses bridge")
+			}
 		}
 	}
 	return nil
-}
-
-func jsonValueContainsKey(value any, key string) bool {
-	switch typed := value.(type) {
-	case []any:
-		for _, item := range typed {
-			if jsonValueContainsKey(item, key) {
-				return true
-			}
-		}
-	case map[string]any:
-		if _, exists := typed[key]; exists {
-			return true
-		}
-		for _, item := range typed {
-			if jsonValueContainsKey(item, key) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (f *geminiGatewayForwarder) Forward(ctx context.Context, c *gin.Context, account *service.Account, body []byte, model, mappedModel string) (*service.OpenAIForwardResult, error) {
@@ -200,11 +176,8 @@ func (f *geminiGatewayForwarder) Forward(ctx context.Context, c *gin.Context, ac
 }
 
 func encodeGeminiAsResponsesRequest(request cloudflareprotocol.Request, stream bool) ([]byte, error) {
-	if len(request.StopSequences) != 0 {
-		return nil, errors.New("gemini generationConfig.stopSequences is not supported by the Cloudflare Responses bridge")
-	}
-	if len(request.Tools) != 0 || request.ToolChoice.Mode != "" {
-		return nil, errors.New("gemini tools are not supported by the Cloudflare Responses bridge")
+	if err := rejectUnsupportedGeminiBridgeFeatures(request); err != nil {
+		return nil, err
 	}
 	input := make([]any, 0, len(request.Messages))
 	for _, message := range request.Messages {

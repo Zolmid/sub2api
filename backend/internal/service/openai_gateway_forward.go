@@ -1231,7 +1231,26 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					}
 					return s.handleErrorResponse(ctx, compactResp, c, account, body, resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel))
 				}
-				return nil, err
+				if streamResult == nil {
+					return nil, err
+				}
+				partialResult := &OpenAIForwardResult{
+					RequestID:       resp.Header.Get("x-request-id"),
+					UpstreamHeaders: resp.Header,
+					ResponseID:      strings.TrimSpace(streamResult.responseID),
+					Model:           originalModel,
+					BillingModel:    billingModel,
+					UpstreamModel:   upstreamModel,
+					ServiceTier:     resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+					ReasoningEffort: reasoningEffort,
+					Stream:          true,
+					Duration:        time.Since(startTime),
+					FirstTokenMs:    streamResult.firstTokenMs,
+				}
+				if streamResult.usage != nil {
+					partialResult.Usage = *streamResult.usage
+				}
+				return partialResult, err
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
